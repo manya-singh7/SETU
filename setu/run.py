@@ -28,7 +28,14 @@ import scipy.signal as signal
 
 from setu.motion import track_motion
 from setu.segment import get_segmenter
-from setu.spectrum import RELIABILITY_THRESHOLD_SNR_DB, compute_welch_peaks, is_peak_reliable
+from setu.spectrum import (
+    LOCAL_PROMINENCE_THRESHOLD_DB,
+    MIN_BG_RATIO,
+    RELIABILITY_THRESHOLD_SNR_DB,
+    compute_welch_peaks,
+    extract_background_residual_motion,
+    is_peak_reliable,
+)
 from setu.types import MotionResult, SegmentResult
 
 
@@ -138,22 +145,30 @@ def main() -> None:
     bg_box = args.bbox_background or seg_output.background_bbox
 
     target_mask = np.zeros((height, width), dtype=bool)
-    bg_mask = np.zeros((height, width), dtype=bool)
     tx, ty, tw, th = target_box
-    bx, by, bw, bh = bg_box
     target_mask[ty : ty + th, tx : tx + tw] = True
-    bg_mask[by : by + bh, bx : bx + bw] = True
+
+    has_background = bg_box is not None and bg_box[2] > 0 and bg_box[3] > 0
+    bg_masks = []
+    if has_background:
+        bg_mask = np.zeros((height, width), dtype=bool)
+        bx, by, bw, bh = bg_box
+        bg_mask[by : by + bh, bx : bx + bw] = True
+        bg_masks.append(bg_mask)
 
     seg_result = SegmentResult(
         target_masks=[target_mask],
-        background_masks=[bg_mask],
+        background_masks=bg_masks,
         fps=fps,
         method=seg_method,
     )
 
     print(f"  Segmentation Method: {seg_result.method}")
     print(f"  Target Prompt:       '{args.target}' -> BBox: {target_box}")
-    print(f"  Background Prompt:   '{args.background}' -> BBox: {bg_box}")
+    if has_background:
+        print(f"  Background Prompt:   '{args.background}' -> BBox: {bg_box}")
+    else:
+        print(f"  Background Prompt:   '{args.background}' -> None (no stationary background in frame)")
 
     # 3. Extract subpixel motion via setu/motion.py
     print(f"\n[Step 2] Tracking Subpixel Motion & Compensating Micro-Jitter...")
@@ -162,30 +177,51 @@ def main() -> None:
         video_path=video_path,
         segment_result=seg_result,
         target_bbox=target_box,
-        background_bbox=bg_box,
+        background_bbox=bg_box if has_background else None,
         method=args.method,
     )
 
     disp = motion_result.displacement
     qual = motion_result.quality
 
+    # Check whether stationary background was present
+    has_bg_verified = qual.get("has_background", True) and has_background
+
+    if has_bg_verified and bg_box is not None:
+        bg_disp = extract_background_residual_motion(video_path, bg_box)
+    else:
+        bg_disp = None
+        print("  Warning: No stationary background in frame; skipping camera stabilisation.")
+
     # 4. Compute Welch Power Spectral Density
     print(f"\n[Step 3] Computing Spectral Modal Frequency Peaks...")
-    peaks = compute_welch_peaks(disp, fps=fps, min_freq_hz=0.5, top_k=3)
+    peaks = compute_welch_peaks(
+        disp,
+        fps=fps,
+        min_freq_hz=0.5,
+        top_k=3,
+        background_displacement=bg_disp,
+        has_background=has_bg_verified,
+    )
 
-    is_reliable = bool(peaks and is_peak_reliable(peaks[0]))
-    confidence_status = "HIGH CONFIDENCE" if is_reliable else "LOW CONFIDENCE"
+    if not has_bg_verified:
+        is_reliable = False
+        confidence_status = "Unverified: no stationary background in frame"
+    else:
+        is_reliable = bool(peaks and is_peak_reliable(peaks[0]))
+        confidence_status = "HIGH CONFIDENCE" if is_reliable else "LOW CONFIDENCE"
 
     qual_warnings = list(qual.get("warnings", []))
-    if not peaks:
+    if not has_bg_verified:
+        if "Unverified: no stationary background in frame" not in qual_warnings:
+            qual_warnings.append("Unverified: no stationary background in frame")
+    elif not peaks:
         qual_warnings.append("Low confidence: No prominent modal frequency peaks detected above 0.5 Hz.")
     elif not is_reliable:
-        top_snr = peaks[0].snr
-        qual_warnings.append(
-            f"Low confidence: Top peak SNR ({top_snr:.1f} dB) below {RELIABILITY_THRESHOLD_SNR_DB:.1f} dB reliability threshold."
-        )
+        for f in getattr(peaks[0], "flags", []):
+            qual_warnings.append(f"Low confidence: {f}")
     qual["warnings"] = qual_warnings
-    qual["confidence"] = confidence_status.lower()
+    qual["confidence"] = confidence_status
 
     # Step 4: Quality Diagnostics Report
     print(f"\n[Step 4] Quality Diagnostics Report:")
@@ -204,19 +240,32 @@ def main() -> None:
         print("  Warnings:                 None (Clean Tracking)")
 
     # Spectral Peak Telemetry
-    print("\n" + "-" * 75)
-    print(f"{'Rank':<6} | {'Frequency':<14} | {'Relative Power':<18} | {'Peak SNR':<12} | {'Confidence'}")
-    print("-" * 75)
+    print("\n" + "-" * 105)
+    print(f"{'Rank':<5} | {'Frequency':<13} | {'Rel Power':<11} | {'Peak SNR':<10} | {'BG Ratio':<12} | {'Local Prom':<12} | {'Verdict'}")
+    print("-" * 105)
     for idx, p in enumerate(peaks, 1):
-        p_conf = "High" if is_peak_reliable(p) else "Low Confidence"
-        print(f"{idx:<6} | {p.freq_hz:>6.3f} Hz       | {p.rel_power * 100:>8.2f} %         | {p.snr:>6.1f} dB    | {p_conf}")
-    print("-" * 75)
+        bg_r = getattr(p, "bg_ratio", None)
+        if bg_r is None:
+            bg_r_str = "N/A (no BG)"
+        elif bg_r < 1e7:
+            bg_r_str = f"{bg_r:8.1f}"
+        else:
+            bg_r_str = ">1e7"
 
-    if peaks:
-        conf_suffix = "" if is_reliable else " [LOW CONFIDENCE - Modal peak below 10.0 dB threshold]"
-        print(f"\nDominant Fundamental Structural Mode (f1): {peaks[0].freq_hz:.3f} Hz{conf_suffix}")
+        loc_prom = getattr(p, "local_prom_db", 0.0)
+        p_verdict = getattr(p, "verdict", "Reliable" if getattr(p, "is_reliable", False) else "Low Confidence")
+        print(f"{idx:<5} | {p.freq_hz:>6.3f} Hz     | {p.rel_power * 100:>6.2f} %   | {p.snr:>6.1f} dB  | {bg_r_str:>12} | {loc_prom:>6.1f} dB    | {p_verdict}")
+    print("-" * 105)
+
+    if peaks and is_reliable:
+        print(f"\nDominant Fundamental Structural Mode (f1): {peaks[0].freq_hz:.3f} Hz")
+    elif peaks:
+        print("\nNo reliable frequency detected. Unverified candidates:")
+        for i, p in enumerate(peaks, 1):
+            reasons = ", ".join(getattr(p, "flags", [])) or "unverified"
+            print(f"  Candidate #{i}: {p.freq_hz:.3f} Hz ({p.rel_power*100:.1f}% rel power, {p.snr:.1f} dB SNR) - [{reasons}]")
     else:
-        print("\nNo prominent spectral peaks identified above 0.5 Hz [LOW CONFIDENCE].")
+        print("\nNo reliable frequency detected. No spectral peaks identified above 0.5 Hz.")
 
     # 5. Save Plots Next to Video
     video_dir = os.path.dirname(video_path)

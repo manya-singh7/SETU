@@ -11,18 +11,32 @@ with a temporal bandpass filter centred on the structural natural frequency (±0
 and an amplification factor (default 50x).
 Supports target mask spatial confinement with smooth edge blending, CPU optimization via
 target region cropping, and side-by-side MP4 output rendering with telemetry overlay.
+Writes H.264 (yuv420p, +faststart) using PyAV or imageio-ffmpeg for browser compatibility
+(Chrome and Safari), with OpenCV VideoWriter fallback.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 import os
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
+
 import cv2
 import numpy as np
 import numpy.typing as npt
 from scipy.signal import butter, filtfilt
+
+logger = logging.getLogger(__name__)
+
+# Spatial Riesz transform derivative kernels (Wadhwa et al. 2014)
+_RIESZ_KX = np.array(
+    [[0.0, 0.0, 0.0], [0.5, 0.0, -0.5], [0.0, 0.0, 0.0]], dtype=np.float64
+)
+_RIESZ_KY = np.array(
+    [[0.0, 0.5, 0.0], [0.0, 0.0, 0.0], [0.0, -0.5, 0.0]], dtype=np.float64
+)
 
 
 @dataclass
@@ -49,21 +63,11 @@ class EVMDisplayConfig:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-def _compute_riesz_filters(width: int, height: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Precompute 2D Riesz transform frequency response filters."""
-    u = np.fft.fftfreq(width)
-    v = np.fft.fftfreq(height)
-    u_grid, v_grid = np.meshgrid(u, v)
-
-    denom = np.sqrt(u_grid**2 + v_grid**2)
-    denom[0, 0] = 1.0  # Avoid zero division at DC
-
-    rx_filter = -1j * u_grid / denom
-    ry_filter = -1j * v_grid / denom
-
-    rx_filter[0, 0] = 0.0
-    ry_filter[0, 0] = 0.0
-    return rx_filter, ry_filter
+def _compute_riesz_transform(subband: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute 2D Riesz transform components (Rx, Ry) using compact spatial linear filters."""
+    rx = cv2.filter2D(subband, -1, _RIESZ_KX, borderType=cv2.BORDER_REFLECT)
+    ry = cv2.filter2D(subband, -1, _RIESZ_KY, borderType=cv2.BORDER_REFLECT)
+    return rx, ry
 
 
 def _build_laplacian_pyramid(image: np.ndarray, levels: int) -> List[np.ndarray]:
@@ -93,7 +97,7 @@ def _temporal_bandpass(
     fps: float,
     center_freq: float,
     bandwidth: float = 0.3,
-    order: int = 2,
+    order: int = 1,
 ) -> np.ndarray:
     """Apply zero-phase Butterworth bandpass filter across the time axis (axis 0)."""
     low = max(0.05, center_freq - bandwidth)
@@ -114,6 +118,10 @@ def magnify_phase_riesz(
     levels: int = 3,
 ) -> np.ndarray:
     """Apply Riesz pyramid phase-based video magnification (Wadhwa et al. 2014).
+
+    Uses quaternion formulation with frame-to-frame conjugate product phase difference,
+    temporal accumulation (phase unwrapping), zero-phase Butterworth temporal filtering,
+    amplitude-weighted spatial Gaussian denoising, and coefficient phase rotation.
 
     Args:
         luminance_sequence: 3D array of grayscale / Y channel frames (T, H, W).
@@ -136,6 +144,15 @@ def magnify_phase_riesz(
         for t in range(num_frames)
     ]
 
+    # 2. Compute spatial Riesz transform components (Rx, Ry) for all bandpass levels
+    riesz_x = [[None] * levels for _ in range(num_frames)]
+    riesz_y = [[None] * levels for _ in range(num_frames)]
+    for t in range(num_frames):
+        for lvl in range(levels):
+            rx, ry = _compute_riesz_transform(frame_pyramids[t][lvl])
+            riesz_x[t][lvl] = rx
+            riesz_y[t][lvl] = ry
+
     magnified_pyramids: List[List[Any]] = [
         [None] * (levels + 1) for _ in range(num_frames)
     ]
@@ -143,55 +160,188 @@ def magnify_phase_riesz(
     for t in range(num_frames):
         magnified_pyramids[t][levels] = frame_pyramids[t][levels]
 
-    # 2. Process each spatial bandpass level with Riesz transform
+    # 3. Process each spatial bandpass level
     for lvl in range(levels):
-        subbands = np.array([frame_pyramids[t][lvl] for t in range(num_frames)], dtype=np.float64)
-        lvl_h, lvl_w = subbands.shape[1], subbands.shape[2]
+        lvl_h, lvl_w = frame_pyramids[0][lvl].shape
 
-        rx_filt, ry_filt = _compute_riesz_filters(lvl_w, lvl_h)
+        phase_cos = np.zeros((num_frames, lvl_h, lvl_w), dtype=np.float64)
+        phase_sin = np.zeros((num_frames, lvl_h, lvl_w), dtype=np.float64)
+        amplitudes = np.zeros((num_frames, lvl_h, lvl_w), dtype=np.float64)
 
-        # 2D Riesz transform in frequency domain across frames
-        fft_subbands = np.fft.fft2(subbands, axes=(-2, -1))
-        rx = np.real(np.fft.ifft2(fft_subbands * rx_filt, axes=(-2, -1)))
-        ry = np.real(np.fft.ifft2(fft_subbands * ry_filt, axes=(-2, -1)))
+        # Compute quaternionic phase difference between consecutive frames (t and t-1)
+        # and unwrap phase by accumulation (Wadhwa et al. 2014 pseudocode)
+        for t in range(1, num_frames):
+            curr_real = frame_pyramids[t][lvl]
+            curr_x = riesz_x[t][lvl]
+            curr_y = riesz_y[t][lvl]
 
-        # Reference subband (frame 0)
-        l0 = subbands[0]
-        rx0 = rx[0]
-        ry0 = ry[0]
-        a0_sq = l0**2 + rx0**2 + ry0**2 + 1e-2
+            prev_real = frame_pyramids[t - 1][lvl]
+            prev_x = riesz_x[t - 1][lvl]
+            prev_y = riesz_y[t - 1][lvl]
 
-        # Instantaneous spatial phase differences (Wadhwa et al. 2014 eq. 4 & 5)
-        dphi_x = (l0 * rx - rx0 * subbands) / a0_sq
-        dphi_y = (l0 * ry - ry0 * subbands) / a0_sq
+            # Quaternion conjugate product: q_curr * conjugate(q_prev)
+            q_real = curr_real * prev_real + curr_x * prev_x + curr_y * prev_y
+            q_x = -curr_real * prev_x + prev_real * curr_x
+            q_y = -curr_real * prev_y + prev_real * curr_y
 
-        # Temporal bandpass filter around target resonant frequency
-        filt_dphi_x = _temporal_bandpass(dphi_x, fps, target_freq_hz, bandwidth_hz)
-        filt_dphi_y = _temporal_bandpass(dphi_y, fps, target_freq_hz, bandwidth_hz)
+            q_amp = np.sqrt(q_real**2 + q_x**2 + q_y**2)
+            safe_q_amp = np.maximum(q_amp, 1e-12)
 
-        # Amplify phase variations
-        amp_phase_x = alpha * filt_dphi_x
-        amp_phase_y = alpha * filt_dphi_y
+            cos_arg = np.clip(q_real / safe_q_amp, -1.0, 1.0)
+            p_diff = np.arccos(cos_arg)
 
-        amp_magnitude = np.sqrt(amp_phase_x**2 + amp_phase_y**2)
-        safe_magnitude = np.maximum(amp_magnitude, 1e-8)
-        norm_x = amp_phase_x / safe_magnitude
-        norm_y = amp_phase_y / safe_magnitude
+            xy_mag = np.sqrt(q_x**2 + q_y**2)
+            safe_xy = np.maximum(xy_mag, 1e-12)
+            cos_theta = q_x / safe_xy
+            sin_theta = q_y / safe_xy
 
-        # Reconstruct phase-shifted subband (Wadhwa et al. 2014 eq. 9)
-        mag_subbands = np.cos(amp_magnitude) * subbands - np.sin(amp_magnitude) * (
-            norm_x * rx + norm_y * ry
-        )
+            p_diff_cos = p_diff * cos_theta
+            p_diff_sin = p_diff * sin_theta
 
+            # Accumulate phase difference (temporal phase unwrapping)
+            phase_cos[t] = phase_cos[t - 1] + p_diff_cos
+            phase_sin[t] = phase_sin[t - 1] + p_diff_sin
+            amplitudes[t] = np.sqrt(q_amp)
+
+        amplitudes[0] = amplitudes[1]
+
+        # Temporal bandpass filter around resonant frequency
+        filt_cos = _temporal_bandpass(phase_cos, fps, target_freq_hz, bandwidth_hz)
+        filt_sin = _temporal_bandpass(phase_sin, fps, target_freq_hz, bandwidth_hz)
+
+        # Amplitude-weighted spatial Gaussian denoising (Wadhwa et al. Eq. 23)
+        # Prevents phase-wrapping discontinuities and ringing artifacts
+        smooth_cos = np.zeros_like(filt_cos)
+        smooth_sin = np.zeros_like(filt_sin)
+        ksize = 9
+        sigma = 2.0
         for t in range(num_frames):
-            magnified_pyramids[t][lvl] = mag_subbands[t]
+            amp = amplitudes[t]
+            den = cv2.GaussianBlur(amp, (ksize, ksize), sigma) + 1e-6
+            num_c = cv2.GaussianBlur(filt_cos[t] * amp, (ksize, ksize), sigma)
+            num_s = cv2.GaussianBlur(filt_sin[t] * amp, (ksize, ksize), sigma)
+            smooth_cos[t] = num_c / den
+            smooth_sin[t] = num_s / den
 
-    # 3. Collapse pyramids to synthesize magnified frames
+        # Magnify phase variations
+        mag_phase_cos = alpha * smooth_cos
+        mag_phase_sin = alpha * smooth_sin
+
+        # Reconstruct phase-shifted coefficient real part (Wadhwa et al. Eq. 11 & 12)
+        for t in range(num_frames):
+            p_mag = np.sqrt(mag_phase_cos[t] ** 2 + mag_phase_sin[t] ** 2)
+            exp_real = np.cos(p_mag)
+            safe_pmag = np.maximum(p_mag, 1e-12)
+            exp_x = (mag_phase_cos[t] / safe_pmag) * np.sin(p_mag)
+            exp_y = (mag_phase_sin[t] / safe_pmag) * np.sin(p_mag)
+
+            mag_res = (
+                exp_real * frame_pyramids[t][lvl]
+                - exp_x * riesz_x[t][lvl]
+                - exp_y * riesz_y[t][lvl]
+            )
+            magnified_pyramids[t][lvl] = mag_res
+
+    # 4. Collapse pyramids to synthesize magnified frames
     magnified_sequence = np.array(
         [_collapse_laplacian_pyramid(magnified_pyramids[t]) for t in range(num_frames)],
         dtype=np.float64,
     )
     return magnified_sequence
+
+
+def _write_mp4_video(
+    output_path: str,
+    frames: List[np.ndarray],
+    fps: float,
+) -> None:
+    """Write video frames to MP4 with H.264 (yuv420p, +faststart) for Chrome/Safari compatibility.
+
+    Tries PyAV first, falls back to imageio-ffmpeg, and only falls back to OpenCV VideoWriter
+    with a warning if both libraries are unavailable or fail.
+    """
+    if not frames:
+        raise ValueError("No frames provided to write.")
+
+    h, w = frames[0].shape[:2]
+
+    # 1. Primary: PyAV (libx264, yuv420p, movflags=+faststart)
+    try:
+        import av
+
+        container = av.open(output_path, mode="w", options={"movflags": "+faststart"})
+        stream = container.add_stream("libx264", rate=int(round(fps)))
+        stream.width = w
+        stream.height = h
+        stream.pix_fmt = "yuv420p"
+        stream.options = {"crf": "18", "preset": "fast"}
+
+        for frame in frames:
+            av_frame = av.VideoFrame.from_ndarray(frame, format="bgr24")
+            for packet in stream.encode(av_frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+        container.close()
+        return
+    except Exception as exc_pyav:
+        logger.debug(f"PyAV H.264 write attempt failed: {exc_pyav}")
+
+    # 2. Secondary: imageio-ffmpeg (libx264, yuv420p, movflags=+faststart)
+    try:
+        import imageio_ffmpeg
+
+        writer = imageio_ffmpeg.write_frames(
+            output_path,
+            size=(w, h),
+            fps=float(fps),
+            codec="libx264",
+            pix_fmt_in="bgr24",
+            output_params=[
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-crf",
+                "18",
+                "-preset",
+                "fast",
+            ],
+        )
+        writer.send(None)
+        for frame in frames:
+            writer.send(frame.tobytes())
+        writer.close()
+        return
+    except Exception as exc_iio:
+        logger.debug(f"imageio-ffmpeg H.264 write attempt failed: {exc_iio}")
+
+    # 3. Fallback: OpenCV VideoWriter (log explicit warning)
+    logger.warning(
+        "Both PyAV and imageio-ffmpeg failed; falling back to OpenCV VideoWriter. "
+        "The generated MP4 may not play natively in Chrome or Safari."
+    )
+    writer_cv2: Optional[cv2.VideoWriter] = None
+    for codec in ["avc1", "H264", "mp4v"]:
+        try:
+            fourcc = cv2.VideoWriter_fourcc(*codec)
+            candidate = cv2.VideoWriter(output_path, fourcc, float(fps), (w, h))
+            if candidate.isOpened():
+                writer_cv2 = candidate
+                break
+        except Exception:
+            continue
+
+    if writer_cv2 is None or not writer_cv2.isOpened():
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer_cv2 = cv2.VideoWriter(output_path, fourcc, float(fps), (w, h))
+
+    if not writer_cv2.isOpened():
+        raise RuntimeError(f"Could not initialize VideoWriter for '{output_path}'")
+
+    for frame in frames:
+        writer_cv2.write(frame)
+    writer_cv2.release()
 
 
 class EulerianDisplayMagnifier:
@@ -241,7 +391,9 @@ class EulerianDisplayMagnifier:
         orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        max_frames = int(round(fps * max_duration_sec)) if max_duration_sec else total_frames
+        max_frames = (
+            int(round(fps * max_duration_sec)) if max_duration_sec else total_frames
+        )
         if max_frames <= 0:
             max_frames = 1800
 
@@ -259,7 +411,11 @@ class EulerianDisplayMagnifier:
             raise ValueError(f"No frames could be decoded from {input_video_path}")
 
         freq_center = float(target_frequency_hz or 3.7)
-        alpha = float(amplification_factor if amplification_factor is not None else self.config.amplification_factor)
+        alpha = float(
+            amplification_factor
+            if amplification_factor is not None
+            else self.config.amplification_factor
+        )
 
         # Determine target bounding box for localized CPU processing
         tx, ty, tw, th = (0, 0, orig_w, orig_h)
@@ -267,7 +423,9 @@ class EulerianDisplayMagnifier:
             tx, ty, tw, th = target_bbox
         elif target_mask is not None:
             contours, _ = cv2.findContours(
-                (target_mask > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                (target_mask > 0).astype(np.uint8),
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE,
             )
             if contours:
                 tx, ty, tw, th = cv2.boundingRect(max(contours, key=cv2.contourArea))
@@ -295,7 +453,9 @@ class EulerianDisplayMagnifier:
         crops = np.array([raw_frames[t][cy0:cy1, cx0:cx1] for t in range(n_frames)])
 
         # Convert to YUV for separate luminance processing (prevents color artifacts)
-        yuv_crops = np.array([cv2.cvtColor(c, cv2.COLOR_BGR2YUV) for c in crops], dtype=np.float64)
+        yuv_crops = np.array(
+            [cv2.cvtColor(c, cv2.COLOR_BGR2YUV) for c in crops], dtype=np.float64
+        )
         lum_seq = yuv_crops[:, :, :, 0]
 
         # Downscale crop if it exceeds max_crop_dimension to keep CPU runtime minimal
@@ -308,7 +468,10 @@ class EulerianDisplayMagnifier:
             proc_w -= proc_w % modulo
             proc_h -= proc_h % modulo
             proc_lum = np.array(
-                [cv2.resize(lum_seq[t], (proc_w, proc_h), interpolation=cv2.INTER_AREA) for t in range(n_frames)]
+                [
+                    cv2.resize(lum_seq[t], (proc_w, proc_h), interpolation=cv2.INTER_AREA)
+                    for t in range(n_frames)
+                ]
             )
             downscaled = True
         else:
@@ -328,34 +491,34 @@ class EulerianDisplayMagnifier:
 
         if downscaled:
             mag_lum = np.array(
-                [cv2.resize(mag_lum_proc[t], (crop_w, crop_h), interpolation=cv2.INTER_LINEAR) for t in range(n_frames)]
+                [
+                    cv2.resize(mag_lum_proc[t], (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
+                    for t in range(n_frames)
+                ]
             )
         else:
             mag_lum = mag_lum_proc
 
         # Spatial blending mask: magnify strictly inside target, smooth transition at borders
-        rel_tx = max(0, tx - cx0)
-        rel_ty = max(0, ty - cy0)
-        rel_tw = min(tw, crop_w - rel_tx)
-        rel_th = min(th, crop_h - rel_ty)
-
-        target_matte = np.zeros((crop_h, crop_w), dtype=np.float32)
         if target_mask is not None:
             sub_mask = target_mask[cy0:cy1, cx0:cx1]
             if np.issubdtype(sub_mask.dtype, np.floating):
-                target_matte = np.clip(sub_mask, 0.0, 1.0).astype(np.float32)
+                base_mask = (sub_mask > 0.5).astype(np.uint8)
             else:
-                target_matte = (sub_mask > 0).astype(np.float32)
-        elif target_bbox is not None:
-            target_matte[rel_ty : rel_ty + rel_th, rel_tx : rel_tx + rel_tw] = 1.0
+                base_mask = (sub_mask > 0).astype(np.uint8)
+            # Dilate mask slightly to accommodate magnified motion range without clipping
+            dilated_mask = cv2.dilate(
+                base_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+            )
+            target_matte = cv2.GaussianBlur(dilated_mask.astype(np.float32), (21, 21), 5.0)
+            matte_weight = np.clip(target_matte, 0.0, 1.0)
         else:
-            target_matte[:, :] = 1.0
-
-        # Smooth edges with Gaussian blur for seamless blending transition
-        k_w = min(15, max(3, (crop_w // 4) * 2 + 1))
-        k_h = min(15, max(3, (crop_h // 4) * 2 + 1))
-        matte_blur = cv2.GaussianBlur(target_matte, (k_w, k_h), 3.0)
-        matte_weight = np.clip(matte_blur, 0.0, 1.0)
+            # Feather smoothly near the outer margins of the cropped ROI
+            fade = min(12, max(4, margin // 2))
+            target_matte = np.zeros((crop_h, crop_w), dtype=np.float32)
+            target_matte[fade : crop_h - fade, fade : crop_w - fade] = 1.0
+            matte_blur = cv2.GaussianBlur(target_matte, (17, 17), 5.0)
+            matte_weight = np.clip(matte_blur, 0.0, 1.0)
 
         # Blend magnified luminance with original luminance
         blended_lum = matte_weight * mag_lum + (1.0 - matte_weight) * lum_seq
@@ -374,28 +537,10 @@ class EulerianDisplayMagnifier:
         out_w = orig_w * 2
         out_h = orig_h
 
-        # Codec selection: try mp4v first (robust on Windows/Linux without external DLLs), fallback to avc1/H264
-        writer: Optional[cv2.VideoWriter] = None
-        for codec in ["mp4v", "avc1", "H264"]:
-            try:
-                fourcc = cv2.VideoWriter_fourcc(*codec)
-                test_writer = cv2.VideoWriter(output_video_path, fourcc, float(fps), (out_w, out_h))
-                if test_writer.isOpened():
-                    writer = test_writer
-                    break
-            except Exception:
-                continue
-
-        if writer is None or not writer.isOpened():
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(output_video_path, fourcc, float(fps), (out_w, out_h))
-
-        if not writer.isOpened():
-            raise RuntimeError(f"Could not initialize VideoWriter for '{output_video_path}'")
-
         font = cv2.FONT_HERSHEY_SIMPLEX
         label_text = f"{freq_center:.1f} Hz | {int(round(alpha))}x magnified"
 
+        composite_frames: List[np.ndarray] = []
         for t in range(n_frames):
             orig_f = raw_frames[t]
             mag_f = mag_full_frames[t]
@@ -406,7 +551,9 @@ class EulerianDisplayMagnifier:
 
             # Left overlay: "Original"
             cv2.rectangle(sbs, (16, 14), (160, 48), (15, 23, 42), -1)
-            cv2.putText(sbs, "Original", (24, 38), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(
+                sbs, "Original", (24, 38), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA
+            )
 
             # Right overlay: frequency + "50x magnified"
             cv2.rectangle(sbs, (orig_w + 16, 14), (orig_w + 350, 48), (15, 23, 42), -1)
@@ -421,13 +568,17 @@ class EulerianDisplayMagnifier:
                 cv2.LINE_AA,
             )
 
-            writer.write(sbs)
+            composite_frames.append(sbs)
 
-        writer.release()
+        # Write H.264 MP4 (yuv420p, +faststart) using PyAV or imageio-ffmpeg
+        _write_mp4_video(output_video_path, composite_frames, fps)
 
         elapsed = time.time() - start_time
         fps_proc = n_frames / elapsed if elapsed > 0 else 0
-        print(f"[EVM] Phase-based Riesz magnification completed in {elapsed:.2f}s ({fps_proc:.1f} fps) for {n_frames} frames.")
+        print(
+            f"[EVM] Phase-based Riesz magnification completed in {elapsed:.2f}s "
+            f"({fps_proc:.1f} fps) for {n_frames} frames."
+        )
 
         return output_video_path
 

@@ -59,24 +59,30 @@ class SegmentationOutput:
 
     Attributes:
         target_mask: Binary mask of shape (H, W) for structural region of interest.
-        background_mask: Binary mask of shape (H, W) for stationary reference anchor.
+        background_mask: Binary mask of shape (H, W) for stationary reference anchor (or None if not found).
         target_bbox: Bounding box tuple (x, y, w, h) around structural target.
-        background_bbox: Bounding box tuple (x, y, w, h) around stationary background.
+        background_bbox: Bounding box tuple (x, y, w, h) around stationary background (or None if not found).
         target_prompt: Text prompt used (e.g. "corner of concrete pillar").
         background_prompt: Reference prompt used (e.g. "stationary ground reference").
-        confidence: Optional confidence score reported by SAM, or None if fallback.
+        confidence: Optional confidence score reported by SAM, or None.
         method: Method used to generate segmentation ("sam", "manual", or "fallback").
+        target_source: Provenance of target mask ("sam", "manual", "fallback", or "none").
+        background_source: Provenance of background mask ("sam", "manual", "fallback", or "none").
+        warnings: List of diagnostic warnings.
         metadata: Model, instance candidates, and execution details.
     """
 
     target_mask: npt.NDArray[np.bool_]
-    background_mask: npt.NDArray[np.bool_]
-    target_bbox: Tuple[int, int, int, int]
-    background_bbox: Tuple[int, int, int, int]
+    background_mask: Optional[npt.NDArray[np.bool_]] = None
+    target_bbox: Tuple[int, int, int, int] = (0, 0, 0, 0)
+    background_bbox: Optional[Tuple[int, int, int, int]] = None
     target_prompt: str = "corner of concrete pillar"
     background_prompt: str = "stationary ground reference"
     confidence: Optional[float] = None
     method: Literal["sam", "manual", "fallback"] = "fallback"
+    target_source: Literal["sam", "manual", "fallback", "none"] = "fallback"
+    background_source: Literal["sam", "manual", "fallback", "none"] = "none"
+    warnings: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -162,8 +168,10 @@ def compute_mask_centroid(mask: npt.NDArray[np.bool_]) -> Optional[Tuple[float, 
     return (float(np.mean(x_indices)), float(np.mean(y_indices)))
 
 
-def compute_mask_area(mask: npt.NDArray[np.bool_]) -> int:
-    """Return total active pixel count of a binary mask."""
+def compute_mask_area(mask: Optional[npt.NDArray[np.bool_]]) -> int:
+    """Return total active pixel count of a binary mask, or 0 if None."""
+    if mask is None:
+        return 0
     return int(np.sum(mask))
 
 
@@ -178,13 +186,13 @@ def compute_mask_iou(mask1: npt.NDArray[np.bool_], mask2: npt.NDArray[np.bool_])
 
 def extract_bboxes_from_result(
     result: SegmentResult, frame_idx: int = 0
-) -> Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int]]:
+) -> Tuple[Tuple[int, int, int, int], Optional[Tuple[int, int, int, int]]]:
     """Extract (target_bbox, background_bbox) from a SegmentResult for a given frame index."""
-    if not result.target_masks or not result.background_masks:
-        raise ValueError("SegmentResult contains empty mask lists.")
+    if not result.target_masks:
+        raise ValueError("SegmentResult contains empty target mask list.")
     idx = max(0, min(frame_idx, len(result.target_masks) - 1))
     t_box = mask_to_bbox(result.target_masks[idx])
-    b_box = mask_to_bbox(result.background_masks[idx])
+    b_box = mask_to_bbox(result.background_masks[idx]) if result.background_masks else None
     return t_box, b_box
 
 
@@ -195,8 +203,10 @@ def validate_segment_result(result: SegmentResult) -> Dict[str, Any]:
     errors: List[str] = []
     warnings: List[str] = []
 
-    if n_target == 0 or n_bg == 0:
-        errors.append("Target or background mask list is empty.")
+    if n_target == 0:
+        errors.append("Target mask list is empty.")
+    if n_bg == 0:
+        warnings.append("No stationary background found; include ground, buildings or trees in frame")
     elif n_target != n_bg:
         errors.append(f"Mismatched mask counts: target has {n_target}, background has {n_bg}.")
 
@@ -207,17 +217,19 @@ def validate_segment_result(result: SegmentResult) -> Dict[str, Any]:
     avg_b_area = 0.0
     max_iou = 0.0
 
-    if n_target > 0 and n_bg > 0 and n_target == n_bg:
+    if n_target > 0:
         t_areas = [compute_mask_area(m) for m in result.target_masks]
-        b_areas = [compute_mask_area(m) for m in result.background_masks]
         avg_t_area = float(np.mean(t_areas))
-        avg_b_area = float(np.mean(b_areas))
-
         if min(t_areas) == 0:
             warnings.append("One or more target masks contain zero active pixels.")
+
+    if n_bg > 0:
+        b_areas = [compute_mask_area(m) for m in result.background_masks]
+        avg_b_area = float(np.mean(b_areas))
         if min(b_areas) == 0:
             warnings.append("One or more background masks contain zero active pixels.")
 
+    if n_target > 0 and n_bg > 0 and n_target == n_bg:
         ious = [compute_mask_iou(tm, bm) for tm, bm in zip(result.target_masks, result.background_masks)]
         max_iou = float(max(ious)) if ious else 0.0
         if max_iou > 0.15:
@@ -413,10 +425,104 @@ def parse_sam_grammar(resp: Dict[str, Any], frame_shape: Tuple[int, int]) -> Lis
             if content.get("type") == "output_text":
                 text += content.get("text", "")
 
-    if not text:
+    if not text.strip():
         return instances
 
-    # Parse special token box syntax: <|box;x1=...;y1=...;x2=...;y2=...;w=...;h=...|>
+    # Method 1: Official meta_sam_parser image_segmentation_format
+    if HAS_META_SAM_PARSER:
+        try:
+            fmt = meta_sam_parser.image_segmentation_format()
+            parser = fmt.create_parser()
+            parser.push(text)
+            finish = parser.finish(meta_sam_parser.CompletedOutcome())
+            res = finish.result
+
+            box_records = {r.object_id: r for r in res.records if r.kind == "box"}
+            mask_records = {r.object_id: r for r in res.records if r.kind == "mask"}
+
+            if mask_records or box_records:
+                # Find source frame dimensions from box token w, h
+                box_w_m = re.search(r"<\|box;[^>]*w=([0-9]+)[^>]*\|>", text)
+                box_h_m = re.search(r"<\|box;[^>]*h=([0-9]+)[^>]*\|>", text)
+                cw = float(box_w_m.group(1)) if box_w_m else float(w_frame)
+                ch = float(box_h_m.group(1)) if box_h_m else float(h_frame)
+                scale_x = w_frame / cw if cw > 0 else 1.0
+                scale_y = h_frame / ch if ch > 0 else 1.0
+
+                all_ids = list(dict.fromkeys(list(mask_records.keys()) + list(box_records.keys())))
+                for idx, obj_id in enumerate(all_ids):
+                    m_rec = mask_records.get(obj_id)
+                    b_rec = box_records.get(obj_id)
+
+                    conf = None
+                    if m_rec is not None and m_rec.confidence is not None:
+                        conf = float(m_rec.confidence)
+                    elif b_rec is not None and b_rec.confidence is not None:
+                        conf = float(b_rec.confidence)
+                    elif "confidence" in resp and resp["confidence"] is not None:
+                        conf = float(resp["confidence"])
+
+                    if m_rec is not None and m_rec.bounds is not None:
+                        b_left = m_rec.bounds.left
+                        b_top = m_rec.bounds.top
+                        b_right = m_rec.bounds.right
+                        b_bottom = m_rec.bounds.bottom
+                    elif b_rec is not None:
+                        b_left = b_rec.left
+                        b_top = b_rec.top
+                        b_right = b_rec.right
+                        b_bottom = b_rec.bottom
+                    else:
+                        continue
+
+                    bx1 = max(0, min(int(round(b_left * scale_x)), w_frame - 1))
+                    by1 = max(0, min(int(round(b_top * scale_y)), h_frame - 1))
+                    bx2 = max(bx1 + 1, min(int(round(b_right * scale_x)), w_frame))
+                    by2 = max(by1 + 1, min(int(round(b_bottom * scale_y)), h_frame))
+                    bw = bx2 - bx1
+                    bh = by2 - by1
+
+                    mask = None
+                    if m_rec is not None:
+                        try:
+                            raster = meta_sam_parser.decode_mask_to_raster(m_rec.mask)
+                            patch = np.frombuffer(raster, dtype=bool).reshape(
+                                m_rec.mask.height, m_rec.mask.width
+                            )
+                            resized_patch = (
+                                cv2.resize(
+                                    patch.astype(np.uint8),
+                                    (bw, bh),
+                                    interpolation=cv2.INTER_NEAREST,
+                                )
+                                > 0
+                            )
+                            full_mask = np.zeros((h_frame, w_frame), dtype=bool)
+                            full_mask[by1:by2, bx1:bx2] = resized_patch
+                            mask = full_mask
+                        except Exception as dec_err:
+                            logger.debug("meta_sam_parser raster decoding error: %s", dec_err)
+
+                    if mask is None:
+                        mask = bbox_to_mask((bx1, by1, bw, bh), frame_shape)
+
+                    instances.append(
+                        {
+                            "instance_id": int(obj_id) if obj_id.isdigit() else idx,
+                            "bbox": (bx1, by1, bw, bh),
+                            "mask": mask,
+                            "area": compute_mask_area(mask),
+                            "centroid": compute_mask_centroid(mask),
+                            "confidence": conf,
+                        }
+                    )
+
+                if instances:
+                    return instances
+        except Exception as parser_err:
+            logger.debug("meta_sam_parser parse error: %s", parser_err)
+
+    # Method 2: Fallback token regex parser (e.g. for mock tokens or if parser missing)
     box_matches = list(re.finditer(r"<\|box;([^|>]+)\|>", text))
     mask_matches = list(re.finditer(r"<\|mask;([^|>]+)\|>", text))
 
@@ -444,23 +550,15 @@ def parse_sam_grammar(resp: Dict[str, Any], frame_shape: Tuple[int, int]) -> Lis
             bw = max(1, min(int(round((x2 - x1) * scale_x)), w_frame - bx))
             bh = max(1, min(int(round((y2 - y1) * scale_y)), h_frame - by))
 
-            score_val = params.get("score") or params.get("confidence") or resp.get("confidence")
+            score_val = (
+                params.get("score")
+                or params.get("c")
+                or params.get("confidence")
+                or resp.get("confidence")
+            )
             confidence = float(score_val) if score_val is not None else None
 
-            mask = None
-            if HAS_META_SAM_PARSER and idx < len(mask_matches):
-                try:
-                    mask_raw = mask_matches[idx].group(1)
-                    raster = meta_sam_parser.decode_mask_to_raster(mask_raw)  # type: ignore[attr-defined]
-                    if isinstance(raster, np.ndarray) and raster.shape != frame_shape:
-                        raster = cv2.resize(raster.astype(np.uint8), (w_frame, h_frame), interpolation=cv2.INTER_NEAREST) > 0
-                    mask = raster
-                except Exception as decode_exc:
-                    logger.debug("meta_sam_parser raster decoding error: %s", decode_exc)
-                    mask = None
-
-            if mask is None:
-                mask = bbox_to_mask((bx, by, bw, bh), frame_shape)
+            mask = bbox_to_mask((bx, by, bw, bh), frame_shape)
 
             instances.append(
                 {
@@ -558,9 +656,12 @@ class BaseSegmenter(ABC):
         target_masks: List[npt.NDArray[np.bool_]] = [
             initial_out.target_mask.copy() for _ in range(n_frames)
         ]
-        background_masks: List[npt.NDArray[np.bool_]] = [
-            initial_out.background_mask.copy() for _ in range(n_frames)
-        ]
+        if initial_out.background_mask is not None:
+            background_masks: List[npt.NDArray[np.bool_]] = [
+                initial_out.background_mask.copy() for _ in range(n_frames)
+            ]
+        else:
+            background_masks = []
 
         # Optional QA drift check on keyframes
         if qa_keyframes and n_frames > 1:
@@ -628,6 +729,7 @@ class MetaSAM31Segmenter(BaseSegmenter):
         t_prompt = " ".join(target_prompt.strip().split()[:32])
         b_prompt = " ".join(background_prompt.strip().split()[:32])
 
+        warnings: List[str] = []
         try:
             target_resp = client.segment_image(image_b64, prompt=t_prompt, model=self.model_name)
             target_instances = parse_sam_grammar(target_resp, frame.shape[:2])
@@ -641,6 +743,7 @@ class MetaSAM31Segmenter(BaseSegmenter):
             target_box = target_inst["bbox"]
             target_mask = target_inst["mask"]
             target_conf = target_inst.get("confidence")
+            target_source: Literal["sam", "manual", "fallback", "none"] = "sam"
 
             # Stationary background reference
             bg_instances: List[Dict[str, Any]] = []
@@ -648,18 +751,31 @@ class MetaSAM31Segmenter(BaseSegmenter):
                 bg_resp = client.segment_image(image_b64, prompt=b_prompt, model=self.model_name)
                 bg_instances = parse_sam_grammar(bg_resp, frame.shape[:2])
             except Exception as bg_err:
-                logger.debug("Background SAM call failed (%s); using default ground anchor.", bg_err)
+                logger.debug("Background SAM call failed (%s).", bg_err)
 
-            h, w = frame.shape[:2]
             if bg_instances:
                 bg_inst = select_best_instance(bg_instances, frame.shape[:2])
                 bg_box = bg_inst["bbox"]
                 bg_mask = bg_inst["mask"]
+                bg_source: Literal["sam", "manual", "fallback", "none"] = "sam"
             else:
-                bw, bh = int(w * 0.20), int(h * 0.15)
-                bx, by = int(w * 0.05), int(h * 0.80)
-                bg_box = (bx, by, bw, bh)
-                bg_mask = bbox_to_mask(bg_box, (h, w))
+                # Never substitute a hardcoded box
+                bg_box = None
+                bg_mask = None
+                bg_source = "none"
+                no_bg_msg = "No stationary background found; include ground, buildings or trees in frame"
+                warnings.append(no_bg_msg)
+                logger.warning(no_bg_msg)
+
+            # Overall method must not say "sam" if any mask came from elsewhere
+            if target_source == "fallback" or bg_source == "fallback":
+                method: Literal["sam", "manual", "fallback"] = "fallback"
+            elif target_source == "manual" or bg_source == "manual":
+                method = "manual"
+            elif target_source == "sam":
+                method = "sam"
+            else:
+                method = "fallback"
 
             return SegmentationOutput(
                 target_mask=target_mask,
@@ -669,14 +785,21 @@ class MetaSAM31Segmenter(BaseSegmenter):
                 target_prompt=target_prompt,
                 background_prompt=background_prompt,
                 confidence=target_conf,
-                method="sam",
+                method=method,
+                target_source=target_source,
+                background_source=bg_source,
+                warnings=warnings,
                 metadata={
                     "source": "meta_sam_3.1_api",
                     "model": self.model_name,
                     "mode": client.mode,
+                    "target_source": target_source,
+                    "background_source": bg_source,
+                    "warnings": warnings,
                     "all_target_instances": target_instances,
                     "all_background_instances": bg_instances,
                     "target_instance_count": len(target_instances),
+                    "background_instance_count": len(bg_instances),
                     "parser": "meta_sam_parser" if HAS_META_SAM_PARSER else "builtin_grammar_decoder",
                 },
             )
@@ -744,10 +867,15 @@ class MetaSAM31Segmenter(BaseSegmenter):
             background_prompt=background_prompt,
             confidence=None,  # No made-up confidence
             method="fallback",
+            target_source="fallback",
+            background_source="fallback",
+            warnings=["Using offline heuristic fallback; real SAM 3.1 unreachable"],
             metadata={
                 "mode": "sam3.1_concept_heuristic",
                 "target_concept": target_prompt,
                 "background_concept": background_prompt,
+                "target_source": "fallback",
+                "background_source": "fallback",
                 "fallback_reason": "Real SAM 3.1 unreachable; offline heuristic used",
             },
         )
@@ -815,7 +943,10 @@ class ManualSegmenter(BaseSegmenter):
             background_prompt=background_prompt,
             confidence=None,  # No made-up confidence
             method="manual",
-            metadata={"mode": "manual_roi"},
+            target_source="manual",
+            background_source="manual",
+            warnings=[],
+            metadata={"mode": "manual_roi", "target_source": "manual", "background_source": "manual"},
         )
 
 
@@ -855,7 +986,10 @@ class FallbackSegmenter(BaseSegmenter):
             background_prompt=background_prompt,
             confidence=None,  # No made-up confidence
             method="fallback",
-            metadata={"mode": "fallback_offline_segmenter"},
+            target_source="fallback",
+            background_source="fallback",
+            warnings=[],
+            metadata={"mode": "fallback_offline_segmenter", "target_source": "fallback", "background_source": "fallback"},
         )
 
 

@@ -7,18 +7,24 @@ Extracts top dominant frequency peaks as Peak objects with sub-bin quadratic int
 relative spectral power, and peak-prominence signal-to-noise ratio (SNR), ignoring low-frequency
 drift (< 0.5 Hz).
 
-Spectral Metrics Definitions:
-- Relative Power: Defined as the peak band's integrated power (sum of PSD energy across
-  the peak's main lobe bounded by local minima / troughs or a +/- 0.4 Hz band) divided by
-  the total power in the analysis band (0.5 Hz to Nyquist). For a clean sinusoidal tone,
-  this metric concentrates > 80% of total spectral power in the resonant lobe.
-- Peak SNR (dB): Defined as the peak power spectral density (P_peak) over the median noise
-  floor (P_noise) across the analysis band (0.5 Hz to Nyquist), reported in decibels:
-      SNR_dB = 10 * log10(P_peak / P_noise)
-- Reliability Threshold: Set to 10.0 dB (a 10:1 power ratio over the median noise floor).
-  In ambient vibration testing of civil infrastructure, spectral peaks below 10.0 dB
-  cannot be reliably distinguished from colored 1/f ambient noise, camera jitter residuals,
-  or thermal noise. Peaks below 10.0 dB are flagged as "low confidence".
+Spectral Metrics & Multi-Tier Reliability Definitions:
+1. Relative Power: Defined as the peak band's integrated power (sum of PSD energy across
+   the peak's main lobe bounded by local minima / troughs or a +/- 0.4 Hz band) divided by
+   the total power in the analysis band (0.5 Hz to Nyquist). For a clean sinusoidal tone,
+   this metric concentrates > 80% of total spectral power in the resonant lobe.
+2. Peak SNR (dB): Defined as the peak power spectral density (P_peak) over the median noise
+   floor (P_noise) across the analysis band (0.5 Hz to Nyquist), reported in decibels:
+       SNR_dB = 10 * log10(P_peak / P_noise)
+3. Background-Referenced Ratio Check: Compares target PSD to the stationary background
+   residual PSD at the peak frequency: P_target(f0) / P_background(f0).
+   Threshold: MIN_BG_RATIO = 500.0 (approx 27.0 dB). If the target does not exceed background
+   residual motion by at least this factor, the peak is marked unreliable.
+4. Local Prominence Check: Peak power versus neighbouring bins within +/- 1.0 Hz (excluding
+   the peak's own main lobe): 10 * log10(P_peak / median(P_neighbours)).
+   Threshold: LOCAL_PROMINENCE_THRESHOLD_DB = 20.0 dB. Real structural resonance produces sharp,
+   narrow spectral spikes; broad 1/f noise drift produces low local prominence (< 20 dB).
+5. Lower Band Edge Drift Check: Peaks within 0.3 Hz of the lower analysis boundary
+   (f0 <= min_freq_hz + 0.3 = 0.8 Hz) are flagged as "possible drift" and marked unreliable.
 """
 
 from __future__ import annotations
@@ -32,21 +38,85 @@ import scipy.signal as signal
 
 from setu.types import Peak
 
+# ===========================================================================
+# Reliability Thresholds (Calibrated on Synthetic Benchmarks)
+# NOTE: These thresholds were set on synthetic data only and must be
+# recalibrated on real recordings (physical accelerometers / vibrometers).
+# ===========================================================================
+
 RELIABILITY_THRESHOLD_SNR_DB: float = 10.0
-"""Reliability threshold in decibels (dB) for modal peak detection.
+"""Global peak-to-median-noise SNR threshold in decibels (dB)."""
+
+LOCAL_PROMINENCE_THRESHOLD_DB: float = 20.0
+"""Local prominence threshold in dB (peak power over median of neighbouring bins within +/- 1.0 Hz).
 
 Justification:
-A 10.0 dB peak SNR corresponds to a 10:1 power spectral density ratio relative to
-the median background noise floor. In vision-based civil infrastructure screening,
-ambient wind turbulence, pedestrian footfalls, and camera tripod micro-drift create
-an elevated 1/f noise floor. Peaks with SNR < 10.0 dB risk false identification
-of noise artifacts as structural resonant modes and are flagged as 'low confidence'.
+True mechanical structural resonances have narrow spectral bandwidths (Lorentzian/Hann lobes),
+yielding high local prominence (>= 20.0 dB) above immediate neighbouring spectral bins.
+Conversely, broad 1/f noise slopes and low-frequency drift lack sharp spectral confinement,
+reporting low local prominence (< 20.0 dB) despite elevated broadband energy.
+"""
+
+MIN_BG_RATIO: float = 500.0
+"""Minimum target-to-background spectral power ratio at the peak frequency (approx 27.0 dB).
+
+Justification:
+Structural vibration of a bridge pillar or truss must substantially exceed residual motion
+observed in the stationary reference background after camera jitter cancellation. When the
+target PSD at the peak frequency does not exceed the background residual PSD by at least 500x
+(27 dB), the detected oscillation cannot be reliably differentiated from camera micro-jitter
+tracking leakage or mount vibration.
+"""
+
+LOWER_BAND_EDGE_MARGIN_HZ: float = 0.3
+"""Margin in Hz above min_freq_hz below which peaks are flagged as 'possible drift'.
+
+Justification:
+In mobile camera recordings, camera tilt drift, thermal drift, and 1/f sensor noise dominate
+the region immediately adjacent to the highpass cutoff (0.5 Hz - 0.8 Hz). Peaks within 0.3 Hz
+of the lower band edge are suspect and flagged as 'possible drift'.
 """
 
 
-def is_peak_reliable(peak: Peak, threshold_db: float = RELIABILITY_THRESHOLD_SNR_DB) -> bool:
-    """Assess whether a detected peak meets the minimum SNR reliability threshold (default: 10.0 dB)."""
-    return peak.snr >= threshold_db
+def is_peak_reliable(
+    peak: Peak,
+    threshold_snr_db: float = RELIABILITY_THRESHOLD_SNR_DB,
+    min_bg_ratio: float = MIN_BG_RATIO,
+    min_local_prom_db: float = LOCAL_PROMINENCE_THRESHOLD_DB,
+    min_freq_hz: float = 0.5,
+) -> bool:
+    """Assess whether a detected peak meets all reliability criteria.
+
+    Criteria:
+    1. Stationary background reference must be present (never reliable without background).
+    2. Global SNR >= threshold_snr_db (default 10.0 dB).
+    3. Not in lower band edge drift zone (freq > min_freq_hz + 0.3 Hz).
+    4. Local prominence over +/- 1 Hz neighbours >= min_local_prom_db (default 20.0 dB).
+    5. Background PSD ratio at peak frequency >= min_bg_ratio (default 500.0).
+    """
+    if not getattr(peak, "has_background", True):
+        return False
+    if not getattr(peak, "is_reliable", True):
+        return False
+
+    if peak.snr < threshold_snr_db:
+        return False
+
+    is_drift = getattr(peak, "is_drift", None)
+    if is_drift is None:
+        is_drift = (peak.freq_hz - min_freq_hz) <= LOWER_BAND_EDGE_MARGIN_HZ
+    if is_drift:
+        return False
+
+    local_prom = getattr(peak, "local_prom_db", None)
+    if local_prom is not None and local_prom < min_local_prom_db:
+        return False
+
+    bg_ratio = getattr(peak, "bg_ratio", None)
+    if bg_ratio is not None and bg_ratio < min_bg_ratio:
+        return False
+
+    return True
 
 
 @dataclass
@@ -62,6 +132,77 @@ class SpectrumOutput:
     confidence: str = "high"
 
 
+def extract_background_residual_motion(
+    video_path: str,
+    background_bbox: Tuple[int, int, int, int],
+    max_corners: int = 40,
+) -> npt.NDArray[np.float64]:
+    """Track subpixel background residual motion across frames after camera stabilization.
+
+    Args:
+        video_path: Path to input MP4 video file.
+        background_bbox: Bounding box tuple (x, y, w, h) for stationary background anchor.
+        max_corners: Maximum corner features to track in background anchor.
+
+    Returns:
+        1D numpy array of residual background displacement across frames.
+    """
+    import cv2
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return np.zeros(0, dtype=np.float64)
+
+    ret, frame0 = cap.read()
+    if not ret or frame0 is None:
+        cap.release()
+        return np.zeros(0, dtype=np.float64)
+
+    gray0 = cv2.cvtColor(frame0, cv2.COLOR_BGR2GRAY)
+    h, w = gray0.shape
+    bx, by, bw, bh = background_bbox
+    bg_mask = np.zeros(gray0.shape, dtype=np.uint8)
+    bg_mask[by : by + bh, bx : bx + bw] = 255
+
+    p_bg0 = cv2.goodFeaturesToTrack(gray0, maxCorners=max_corners, qualityLevel=0.02, minDistance=8, mask=bg_mask)
+    if p_bg0 is None or len(p_bg0) < 4:
+        ys, xs = np.mgrid[by + 10 : by + bh - 10 : 12, bx + 10 : bx + bw - 10 : 12]
+        p_bg0 = np.vstack((xs.flatten(), ys.flatten())).T.astype(np.float32)[:, np.newaxis, :]
+
+    disp_x = [0.0]
+    M_prev = np.float32([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+
+    while True:
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        p_curr, st, _ = cv2.calcOpticalFlowPyrLK(gray0, gray, p_bg0, None, winSize=(15, 15), maxLevel=2)
+        st_flat = (st.ravel() == 1) if st is not None else np.zeros(len(p_bg0), bool)
+        good0 = p_bg0[st_flat]
+        good_curr = p_curr[st_flat]
+
+        if len(good_curr) >= 4:
+            M, _ = cv2.estimateAffinePartial2D(good_curr, good0, method=cv2.RANSAC, ransacReprojThreshold=2.0)
+            if M is None:
+                M = M_prev.copy()
+            else:
+                M_prev = M.copy()
+        else:
+            M = M_prev.copy()
+
+        warped = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+        p_res, st_res, _ = cv2.calcOpticalFlowPyrLK(gray0, warped, p_bg0, None, winSize=(11, 11), maxLevel=1)
+        if st_res is not None and np.sum(st_res) > 0:
+            diffs = p_res[st_res.ravel() == 1] - p_bg0[st_res.ravel() == 1]
+            disp_x.append(float(np.median(diffs[:, :, 0])))
+        else:
+            disp_x.append(0.0)
+
+    cap.release()
+    return np.array(disp_x, dtype=np.float64)
+
+
 def compute_welch_peaks(
     displacement: Union[npt.NDArray[np.float64], List[float]],
     fps: float,
@@ -69,14 +210,18 @@ def compute_welch_peaks(
     top_k: int = 3,
     nperseg: Optional[int] = None,
     nfft: Optional[int] = None,
+    background_displacement: Optional[Union[npt.NDArray[np.float64], List[float]]] = None,
+    has_background: bool = True,
 ) -> List[Peak]:
     """Given a 1D displacement signal and fps, compute Welch PSD and extract top peaks.
 
-    Metrics:
-    - Relative power: The peak band's power (integrated over the resonant main lobe) divided
-      by total power in the analysis band (min_freq_hz to Nyquist).
-    - Peak SNR: Peak spectral power density over median noise floor, reported in dB:
-      10 * log10(P_peak / median(P_band)).
+    Multi-Tier Reliability Checks:
+    1. Stationary background reference verification (unverified if no stationary background in frame).
+    2. Relative power: Integrated resonant peak lobe power over 0.5Hz-Nyquist total power.
+    3. Peak SNR: Peak spectral power density over median noise floor (dB).
+    4. Background ratio: Target PSD over stationary background PSD at peak frequency (skipped if no BG).
+    5. Local prominence: Peak power over median of neighbouring bins within +/- 1.0 Hz (dB).
+    6. Lower band edge drift check: Flags peaks within 0.3 Hz of min_freq_hz as "possible drift".
 
     Args:
         displacement: 1D array of subpixel structural displacements (in pixels).
@@ -85,6 +230,8 @@ def compute_welch_peaks(
         top_k: Number of dominant peaks to return (default 3).
         nperseg: Length of each segment for Welch averaging. Defaults to min(len(signal), 1024).
         nfft: FFT length. Defaults to max(nperseg, 4096) for high resolution.
+        background_displacement: Optional 1D displacement of stationary background after stabilization.
+        has_background: Whether a stationary background anchor is present in frame (default True).
 
     Returns:
         List of up to top_k Peak objects sorted by prominence/power.
@@ -128,7 +275,23 @@ def compute_welch_peaks(
     if noise_floor <= 0.0:
         noise_floor = float(np.mean(p_band) * 0.1) + 1e-12
 
-    # 4. Peak detection using prominence
+    # 4. Optional background PSD computation (only if stationary background is present)
+    f_bg, p_bg = None, None
+    if has_background and background_displacement is not None:
+        bg_sig = np.asarray(background_displacement, dtype=np.float64).ravel()
+        if len(bg_sig) >= 8:
+            bg_detrended = signal.detrend(bg_sig, type="linear")
+            f_bg, p_bg = signal.welch(
+                bg_detrended,
+                fs=float(fps),
+                window="hann",
+                nperseg=seg_len,
+                noverlap=seg_len // 2,
+                nfft=fft_len,
+                detrend=False,
+            )
+
+    # 5. Peak detection using prominence
     peak_indices, properties = signal.find_peaks(p_band, prominence=0.0)
 
     if len(peak_indices) == 0:
@@ -178,13 +341,66 @@ def compute_welch_peaks(
         snr_ratio = max(peak_psd, 1e-12) / max(noise_floor, 1e-12)
         snr_db = 10.0 * np.log10(snr_ratio)
 
-        peaks.append(
-            Peak(
-                freq_hz=float(round(f_refined, 4)),
-                rel_power=float(round(rel_power, 6)),
-                snr=float(round(snr_db, 2)),
-            )
+        # 6. Lower band edge drift check: within 0.3 Hz of min_freq_hz
+        is_drift = bool((f_refined - min_freq_hz) <= LOWER_BAND_EDGE_MARGIN_HZ)
+
+        # 7. Local prominence check: neighbouring bins within +/- 1.0 Hz excluding lobe
+        neigh_mask = (f_band >= f0 - 1.0) & (f_band <= f0 + 1.0) & ((f_band < f_band[left_idx]) | (f_band > f_band[right_idx]))
+        p_neigh = float(np.median(p_band[neigh_mask])) if np.any(neigh_mask) else noise_floor
+        local_prom_db = float(round(10.0 * np.log10(max(peak_psd, 1e-12) / max(p_neigh, 1e-12)), 2))
+
+        # 8. Background-referenced check: target PSD / background PSD at peak frequency
+        if has_background:
+            if f_bg is not None and p_bg is not None:
+                p_bg_at_peak = float(np.interp(f_refined, f_bg, p_bg))
+                bg_ratio = float(peak_psd / max(p_bg_at_peak, 1e-12))
+                bg_ratio_db = float(round(10.0 * np.log10(bg_ratio), 2))
+            else:
+                bg_ratio = float("inf")
+                bg_ratio_db = float("inf")
+        else:
+            # Skip background-ratio check when no stationary background is present
+            bg_ratio = None
+            bg_ratio_db = None
+
+        # 9. Diagnostic flags and reliability determination
+        flags: List[str] = []
+        if not has_background:
+            flags.append("Unverified: no stationary background in frame")
+        if is_drift:
+            flags.append(f"possible drift (within {LOWER_BAND_EDGE_MARGIN_HZ:.1f} Hz of lower band edge {min_freq_hz:.1f} Hz)")
+        if local_prom_db < LOCAL_PROMINENCE_THRESHOLD_DB:
+            flags.append(f"low local prominence ({local_prom_db:.1f} dB < {LOCAL_PROMINENCE_THRESHOLD_DB:.1f} dB)")
+        if has_background and bg_ratio is not None and bg_ratio < MIN_BG_RATIO:
+            flags.append(f"low target-to-background ratio ({bg_ratio:.1f} < {MIN_BG_RATIO:.1f})")
+        if snr_db < RELIABILITY_THRESHOLD_SNR_DB:
+            flags.append(f"low global SNR ({snr_db:.1f} dB < {RELIABILITY_THRESHOLD_SNR_DB:.1f} dB)")
+
+        if not has_background:
+            is_reliable = False
+            verdict = "Unverified: no stationary background in frame"
+        elif len(flags) == 0:
+            is_reliable = True
+            verdict = "Reliable"
+        else:
+            is_reliable = False
+            verdict = "Low Confidence"
+
+        p_obj = Peak(
+            freq_hz=float(round(f_refined, 4)),
+            rel_power=float(round(rel_power, 6)),
+            snr=float(round(snr_db, 2)),
         )
+        p_obj.has_background = has_background
+        p_obj.is_reliable = is_reliable
+        p_obj.verdict = verdict
+        p_obj.is_drift = is_drift
+        p_obj.local_prom_db = local_prom_db
+        p_obj.bg_ratio = bg_ratio
+        p_obj.bg_ratio_db = bg_ratio_db
+        p_obj.flags = flags
+
+        peaks.append(p_obj)
 
     return peaks
 
@@ -202,13 +418,16 @@ class WelchSpectrumAnalyzer:
         self.min_freq_hz = min_freq_hz
         self.top_k = top_k
 
-    def compute_welch_psd(self, signal_arr: npt.NDArray[np.float64]) -> SpectrumOutput:
+    def compute_welch_psd(
+        self, signal_arr: npt.NDArray[np.float64], has_background: bool = True
+    ) -> SpectrumOutput:
         """Compute PSD and return SpectrumOutput containing top peaks."""
         peaks = compute_welch_peaks(
             signal_arr,
             fps=self.fps,
             min_freq_hz=self.min_freq_hz,
             top_k=self.top_k,
+            has_background=has_background,
         )
         sig_detrended = signal.detrend(signal_arr, type="linear")
         seg_len = min(len(sig_detrended), 1024)
@@ -222,8 +441,12 @@ class WelchSpectrumAnalyzer:
         )
         fund_hz = peaks[0].freq_hz if peaks else None
         snr_val = peaks[0].snr if peaks else 0.0
-        reliable = bool(peaks and is_peak_reliable(peaks[0]))
-        conf = "high" if reliable else "low confidence"
+        if not has_background:
+            reliable = False
+            conf = "Unverified: no stationary background in frame"
+        else:
+            reliable = bool(peaks and is_peak_reliable(peaks[0]))
+            conf = "high" if reliable else "low confidence"
         return SpectrumOutput(
             frequencies_hz=freqs,
             psd=psd,
@@ -234,11 +457,14 @@ class WelchSpectrumAnalyzer:
             confidence=conf,
         )
 
-    def analyze(self, signal_arr: npt.NDArray[np.float64]) -> List[Peak]:
+    def analyze(
+        self, signal_arr: npt.NDArray[np.float64], has_background: bool = True
+    ) -> List[Peak]:
         """Analyze displacement array and return top 3 peaks."""
         return compute_welch_peaks(
             signal_arr,
             fps=self.fps,
             min_freq_hz=self.min_freq_hz,
             top_k=self.top_k,
+            has_background=has_background,
         )

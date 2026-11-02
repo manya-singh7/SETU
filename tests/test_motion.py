@@ -25,8 +25,12 @@ from typing import Any, Dict, List, Tuple
 import pytest
 
 from setu.motion import track_motion
-from setu.spectrum import compute_welch_peaks
-from setu.types import MotionResult
+from setu.spectrum import (
+    compute_welch_peaks,
+    extract_background_residual_motion,
+    is_peak_reliable,
+)
+from setu.types import MotionResult, SegmentResult
 from tests.synth import generate_synthetic_video
 
 CACHE_DIR = Path("tests/.cache")
@@ -170,6 +174,13 @@ def test_motion_recovery_matrix(benchmark_suite):
     target_freq = 3.70
     tolerance = 0.10  # Strict tolerance: |f - 3.70| <= 0.10 Hz
 
+    # Pre-extract background residual displacement per unique cached video path (computed once per video)
+    bg_cache: Dict[str, Any] = {}
+    for _, cond_key in conditions:
+        v_path, _, b_box = benchmark_suite[cond_key]
+        if v_path not in bg_cache:
+            bg_cache[v_path] = extract_background_residual_motion(v_path, b_box)
+
     table_rows: List[Dict[str, str]] = []
     passing_count = 0
     failing_count = 0
@@ -177,6 +188,7 @@ def test_motion_recovery_matrix(benchmark_suite):
     for method in methods:
         for cond_label, cond_key in conditions:
             vid_path, t_box, b_box = benchmark_suite[cond_key]
+            bg_disp = bg_cache[vid_path]
 
             # 1. Run motion tracking
             motion_res: MotionResult = track_motion(
@@ -186,18 +198,34 @@ def test_motion_recovery_matrix(benchmark_suite):
                 method=method,
             )
 
-            # 2. Extract spectral peaks
-            peaks = compute_welch_peaks(motion_res.displacement, fps=motion_res.fps)
+            # 2. Extract spectral peaks with background-referenced and prominence checks
+            peaks = compute_welch_peaks(
+                motion_res.displacement,
+                fps=motion_res.fps,
+                background_displacement=bg_disp,
+            )
 
             if peaks:
                 top_peak = peaks[0]
                 detected_freq = top_peak.freq_hz
                 freq_error = abs(detected_freq - target_freq)
                 passed = freq_error <= tolerance
+                is_reliable = getattr(top_peak, "is_reliable", is_peak_reliable(top_peak))
+                bg_ratio = getattr(top_peak, "bg_ratio", float("inf"))
+                bg_ratio_db = getattr(top_peak, "bg_ratio_db", float("inf"))
+                verdict_str = "Reliable" if is_reliable else "Low Confidence"
+                bg_ratio_str = (
+                    f"{bg_ratio:8.1f} ({bg_ratio_db:4.1f} dB)"
+                    if bg_ratio < 1e7
+                    else f">1e7 ({bg_ratio_db:4.1f} dB)"
+                )
             else:
                 detected_freq = 0.0
                 freq_error = 999.0
                 passed = False
+                is_reliable = False
+                verdict_str = "Low Confidence"
+                bg_ratio_str = "N/A"
 
             if passed:
                 passing_count += 1
@@ -220,33 +248,111 @@ def test_motion_recovery_matrix(benchmark_suite):
                     "Residual": f"{res_val:.4f} px",
                     "Rel Power": rel_p_str,
                     "Peak SNR": snr_db_str,
+                    "BG Ratio": bg_ratio_str,
+                    "Verdict": verdict_str,
                     "Status": status_str,
                 }
             )
 
     # 3. Print Benchmark Table
-    print("\n" + "=" * 130)
+    print("\n" + "=" * 165)
     print("SETU MOTION TRACKING & MODAL FREQUENCY RECOVERY BENCHMARK TABLE")
-    print("=" * 130)
+    print("=" * 165)
     header = (
         f"{'Method':<19} | {'Condition':<26} | {'Target':<10} | {'Detected':<12} | "
-        f"{'Error':<11} | {'Residual':<11} | {'Rel Power':<10} | {'Peak SNR':<11} | {'Status'}"
+        f"{'Error':<11} | {'Residual':<11} | {'Rel Power':<10} | {'Peak SNR':<10} | "
+        f"{'BG Ratio':<24} | {'Verdict':<15} | {'Status'}"
     )
     print(header)
-    print("-" * 130)
+    print("-" * 165)
 
     for r in table_rows:
         row_str = (
             f"{r['Method']:<19} | {r['Condition']:<26} | {r['Target f0']:<10} | {r['Detected f0']:<12} | "
-            f"{r['Error']:<11} | {r['Residual']:<11} | {r['Rel Power']:<10} | {r['Peak SNR']:<11} | {r['Status']}"
+            f"{r['Error']:<11} | {r['Residual']:<11} | {r['Rel Power']:<10} | {r['Peak SNR']:<10} | "
+            f"{r['BG Ratio']:<24} | {r['Verdict']:<15} | {r['Status']}"
         )
         print(row_str)
 
-    print("=" * 130)
+    print("=" * 165)
     print(f"Summary: {passing_count} PASSED, {failing_count} FAILED across {len(table_rows)} evaluated runs.")
-    print("=" * 130 + "\n")
+    print("=" * 165 + "\n")
 
-    # The standard cases must strictly pass
+    # Assertions:
+    # 1. The two 0.05 px failing cases must be flagged as "Low Confidence"
+    # 2. All 12 passing cases must be flagged as "Reliable" and strictly PASS without loosening tolerance
     for r in table_rows:
-        if "Hard:" not in r["Condition"]:
-            assert "PASS" in r["Status"], f"Standard case {r['Method']} under {r['Condition']} failed: {r['Error']}"
+        if "Hard: Low Amp" in r["Condition"]:
+            assert r["Verdict"] == "Low Confidence", (
+                f"Failing case {r['Method']} under {r['Condition']} must be flagged Low Confidence, got {r['Verdict']}"
+            )
+            assert "FAIL" in r["Status"], "Tolerance must not be loosened on low amplitude 0.05 px stress case"
+        else:
+            assert r["Verdict"] == "Reliable", (
+                f"Passing case {r['Method']} under {r['Condition']} must be Reliable, got {r['Verdict']}"
+            )
+            assert "PASS" in r["Status"], (
+                f"Standard/passing case {r['Method']} under {r['Condition']} failed: {r['Error']}"
+            )
+
+
+def test_no_stationary_background_handling(benchmark_suite):
+    """Verify that when SAM finds no stationary background (background_source 'none'):
+    - setu/motion.py runs without crashing.
+    - Camera stabilisation is skipped with a clear warning.
+    - Background-ratio check is skipped.
+    - Result is marked 'Unverified: no stationary background in frame'.
+    - Result is NEVER labelled 'Reliable'.
+    """
+    import cv2
+    import numpy as np
+
+    v_path, t_box, _ = benchmark_suite["no_jitter_crf18"]
+
+    cap = cv2.VideoCapture(v_path)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+
+    target_mask = np.zeros((height, width), dtype=bool)
+    tx, ty, tw, th = t_box
+    target_mask[ty : ty + th, tx : tx + tw] = True
+
+    seg_result = SegmentResult(
+        target_masks=[target_mask],
+        background_masks=[],  # Empty background masks when SAM finds no stationary background
+        fps=60.0,
+        method="fallback",
+    )
+
+    # 1. Run motion tracking without background mask or background bbox
+    motion_res: MotionResult = track_motion(
+        video_path=v_path,
+        segment_result=seg_result,
+        target_bbox=t_box,
+        background_bbox=None,
+        method="phase_correlation",
+    )
+
+    # 2. Verify stabilisation was skipped and clear warning added
+    assert motion_res.quality.get("has_background") is False, "Expected has_background=False in quality"
+    warnings = motion_res.quality.get("warnings", [])
+    assert any("no stationary background" in w.lower() for w in warnings), (
+        f"Expected clear warning about missing background in {warnings}"
+    )
+    assert motion_res.quality.get("confidence") == "Unverified: no stationary background in frame"
+    assert motion_res.quality.get("verdict") == "Unverified: no stationary background in frame"
+
+    # 3. Verify spectral analysis skips background-ratio check and marks peaks unverified
+    peaks = compute_welch_peaks(
+        motion_res.displacement,
+        fps=motion_res.fps,
+        has_background=False,
+    )
+
+    assert len(peaks) >= 1
+    for p in peaks:
+        assert p.is_reliable is False, "Must NEVER be labelled Reliable without a background"
+        assert is_peak_reliable(p) is False
+        assert p.verdict == "Unverified: no stationary background in frame"
+        assert p.bg_ratio is None, "Background ratio check must be skipped"

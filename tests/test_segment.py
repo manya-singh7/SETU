@@ -355,6 +355,82 @@ def test_meta_client_sam_usage_accounting(tmp_path):
     assert log_entry["estimated_cost"] == 0.0025
 
 
+def test_sam31_decoded_pillar_mask_is_not_rectangle():
+    """Verify that decoded pillar mask from real SAM 3.1 fixture is NOT a rectangle."""
+    fixture_path = os.path.join(os.path.dirname(__file__), "fixtures", "sam_3_1_pillar_response.json")
+    with open(fixture_path, "r", encoding="utf-8") as f:
+        real_resp = json.load(f)
+
+    # Decode with pillar frame dimensions (4000x6000)
+    frame_shape = (4000, 6000)
+    instances = parse_sam_grammar(real_resp, frame_shape)
+
+    assert len(instances) == 1
+    inst = instances[0]
+    mask = inst["mask"]
+    bbox = inst["bbox"]
+
+    assert mask.shape == frame_shape
+    bx, by, bw, bh = bbox
+    bbox_area = bw * bh
+    active_pixels = inst["area"]
+
+    # Active pixels must be well below bbox area (not a simple filled rectangle)
+    assert active_pixels > 0
+    assert active_pixels < bbox_area * 0.75, (
+        f"Pillar mask appears to be a filled rectangle: active={active_pixels}, bbox_area={bbox_area}"
+    )
+    # Real SAM response for this pillar contains no score
+    assert inst["confidence"] is None
+
+
+def test_sam31_no_background_returns_no_mask_and_provenance(synthetic_frame: np.ndarray):
+    """Verify SAM returns no background mask and records provenance when background is not found."""
+    target_fixture_path = os.path.join(os.path.dirname(__file__), "fixtures", "sam_3_1_pillar_response.json")
+    with open(target_fixture_path, "r", encoding="utf-8") as f:
+        target_resp = json.load(f)
+
+    empty_bg_resp = {
+        "id": "resp_empty_bg",
+        "object": "response",
+        "model": "sam-3.1",
+        "output": [{"content": [{"type": "output_text", "text": ""}]}],
+    }
+
+    mock_client = MagicMock()
+    mock_client.mode = "mock"
+    mock_client.segment_image.side_effect = [target_resp, empty_bg_resp]
+
+    sam = MetaSAM31Segmenter(meta_client=mock_client)
+    out = sam.segment(synthetic_frame, target_prompt="concrete pillar", background_prompt="distant bedrock")
+
+    # Never substitute a hardcoded box
+    assert out.background_mask is None
+    assert out.background_bbox is None
+    assert out.background_source == "none"
+    assert out.target_source == "sam"
+    assert out.target_mask is not None
+    assert out.method == "sam"
+    assert any("No stationary background found" in w for w in out.warnings)
+
+
+def test_method_not_sam_if_mask_from_elsewhere(synthetic_frame: np.ndarray):
+    """Verify that overall method must NOT say 'sam' if any mask came from fallback/manual."""
+    fallback_seg = FallbackSegmenter()
+    out = fallback_seg.segment(synthetic_frame)
+    assert out.target_source == "fallback"
+    assert out.background_source == "fallback"
+    assert out.method == "fallback"
+    assert out.method != "sam"
+
+    manual_seg = ManualSegmenter(target_bbox=(10, 10, 20, 20), background_bbox=(30, 30, 20, 20))
+    m_out = manual_seg.segment(synthetic_frame)
+    assert m_out.target_source == "manual"
+    assert m_out.background_source == "manual"
+    assert m_out.method == "manual"
+    assert m_out.method != "sam"
+
+
 # ---------------------------------------------------------------------------
 # Fixed-Masks Video Segmentation Tests
 # ---------------------------------------------------------------------------

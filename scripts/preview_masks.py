@@ -67,10 +67,10 @@ def generate_synthetic_bridge_frame(width: int = 640, height: int = 480) -> np.n
 
 def create_mask_overlay(
     frame: np.ndarray,
-    target_mask: np.ndarray,
-    background_mask: np.ndarray,
-    target_bbox: Tuple[int, int, int, int],
-    background_bbox: Tuple[int, int, int, int],
+    target_mask: Optional[np.ndarray],
+    background_mask: Optional[np.ndarray],
+    target_bbox: Optional[Tuple[int, int, int, int]],
+    background_bbox: Optional[Tuple[int, int, int, int]],
     target_prompt: str,
     background_prompt: str,
     method: str,
@@ -86,55 +86,58 @@ def create_mask_overlay(
 
     alpha = 0.45
 
-    if target_mask.any():
+    if target_mask is not None and target_mask.any():
         canvas[target_mask] = (
             canvas[target_mask].astype(np.float32) * (1.0 - alpha) + target_color.astype(np.float32) * alpha
         ).astype(np.uint8)
 
-    if background_mask.any():
+    if background_mask is not None and background_mask.any():
         canvas[background_mask] = (
             canvas[background_mask].astype(np.float32) * (1.0 - alpha) + background_color.astype(np.float32) * alpha
         ).astype(np.uint8)
 
     # Draw Target Bounding Box and Annotation
-    tx, ty, tw, th = target_bbox
-    if tw > 0 and th > 0:
-        cv2.rectangle(canvas, (tx, ty), (tx + tw, ty + th), (0, 255, 0), 2)
-        cv2.putText(
-            canvas,
-            f"TARGET: {target_prompt}",
-            (tx, max(20, ty - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (0, 255, 0),
-            2,
-            cv2.LINE_AA,
-        )
+    if target_bbox is not None:
+        tx, ty, tw, th = target_bbox
+        if tw > 0 and th > 0:
+            cv2.rectangle(canvas, (tx, ty), (tx + tw, ty + th), (0, 255, 0), 2)
+            cv2.putText(
+                canvas,
+                f"TARGET: {target_prompt}",
+                (tx, max(20, ty - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
 
     # Draw Background Reference Bounding Box and Annotation
-    bx, by, bw, bh = background_bbox
-    if bw > 0 and bh > 0:
-        cv2.rectangle(canvas, (bx, by), (bx + bw, by + bh), (255, 180, 0), 2)
-        cv2.putText(
-            canvas,
-            f"BG REF: {background_prompt}",
-            (bx, max(20, by - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 180, 0),
-            2,
-            cv2.LINE_AA,
-        )
+    if background_bbox is not None:
+        bx, by, bw, bh = background_bbox
+        if bw > 0 and bh > 0:
+            cv2.rectangle(canvas, (bx, by), (bx + bw, by + bh), (255, 180, 0), 2)
+            cv2.putText(
+                canvas,
+                f"BG REF: {background_prompt}",
+                (bx, max(20, by - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 180, 0),
+                2,
+                cv2.LINE_AA,
+            )
 
     # Informational Top Header Banner
     banner_height = 42
     banner = np.zeros((banner_height, w, 3), dtype=np.uint8)
     banner[:] = (30, 30, 30)
 
+    bg_info = "BG Anchor: Cyan" if background_mask is not None and background_mask.any() else "BG Anchor: None"
     method_tag = f"METHOD: {method.upper()}"
     cv2.putText(
         banner,
-        f"SETU Frame 0 Segmentation  |  {method_tag}  |  (Target: Green, BG Anchor: Cyan)",
+        f"SETU Frame 0 Segmentation  |  {method_tag}  |  (Target: Green, {bg_info})",
         (12, 26),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.55,
@@ -234,12 +237,19 @@ def main() -> int:
         background_prompt=args.background_prompt,
     )
 
-    # Print which method produced the result
+    # Print which method and provenance produced the result
     print(f"Produced using method: {output.method}")
     conf_str = f"{output.confidence:.2f}" if output.confidence is not None else "None"
     print(f"  Confidence: {conf_str}")
+    print(f"  Target Source: {output.target_source}")
+    print(f"  Background Source: {output.background_source}")
     print(f"  Target BBox: {output.target_bbox} (Active pixels: {compute_mask_area(output.target_mask)})")
-    print(f"  Background BBox: {output.background_bbox} (Active pixels: {compute_mask_area(output.background_mask)})")
+    if output.background_mask is not None:
+        print(f"  Background BBox: {output.background_bbox} (Active pixels: {compute_mask_area(output.background_mask)})")
+    else:
+        print(f"  Background BBox: None (Active pixels: 0)")
+    for w in output.warnings:
+        print(f"  Warning: {w}")
     if "all_target_instances" in output.metadata and len(output.metadata["all_target_instances"]) > 1:
         print(f"  Total target candidates matched: {len(output.metadata['all_target_instances'])} (Selected largest/central)")
     if "fallback_reason" in output.metadata:

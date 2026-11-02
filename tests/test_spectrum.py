@@ -16,7 +16,14 @@ import cv2
 import numpy as np
 import pytest
 
-from setu.spectrum import RELIABILITY_THRESHOLD_SNR_DB, compute_welch_peaks, is_peak_reliable
+from setu.spectrum import (
+    LOCAL_PROMINENCE_THRESHOLD_DB,
+    LOWER_BAND_EDGE_MARGIN_HZ,
+    MIN_BG_RATIO,
+    RELIABILITY_THRESHOLD_SNR_DB,
+    compute_welch_peaks,
+    is_peak_reliable,
+)
 from setu.types import Peak
 from tests.synth import generate_synthetic_video
 
@@ -88,6 +95,84 @@ def test_low_confidence_flag_on_noise():
         # Peak SNR on random noise should be below 10 dB or fail reliability check
         if top_peak.snr < RELIABILITY_THRESHOLD_SNR_DB:
             assert is_peak_reliable(top_peak) is False
+
+
+def test_drift_flag_near_lower_band_edge():
+    """Verify peaks within 0.3 Hz of lower band edge (0.5 Hz) are flagged as possible drift and marked unreliable."""
+    fps = 60.0
+    duration_sec = 20.0
+    n_samples = int(fps * duration_sec)
+    t = np.arange(n_samples, dtype=np.float64) / fps
+
+    # 0.65 Hz is within 0.3 Hz of 0.5 Hz (0.5 <= f <= 0.8 Hz)
+    drift_freq = 0.65
+    sig = 0.2 * np.sin(2.0 * np.pi * drift_freq * t)
+
+    peaks = compute_welch_peaks(sig, fps=fps, min_freq_hz=0.5, top_k=3)
+    assert len(peaks) >= 1
+    top_peak = peaks[0]
+
+    assert top_peak.is_drift is True, "Peak <= 0.8 Hz must have is_drift=True"
+    assert any("possible drift" in f for f in top_peak.flags), f"Expected 'possible drift' flag in {top_peak.flags}"
+    assert top_peak.is_reliable is False, "Drift peak must be flagged unreliable"
+    assert is_peak_reliable(top_peak) is False
+
+
+def test_local_prominence_check():
+    """Verify that sharp resonant peaks have high local prominence while smooth noise lacks prominence."""
+    fps = 60.0
+    duration_sec = 20.0
+    n_samples = int(fps * duration_sec)
+    t = np.arange(n_samples, dtype=np.float64) / fps
+
+    # A sharp resonant sine tone at 3.7 Hz
+    sharp_sine = 0.2 * np.sin(2.0 * np.pi * 3.7 * t)
+    peaks_sharp = compute_welch_peaks(sharp_sine, fps=fps, min_freq_hz=0.5, top_k=1)
+    assert len(peaks_sharp) >= 1
+    assert peaks_sharp[0].local_prom_db >= LOCAL_PROMINENCE_THRESHOLD_DB, (
+        f"Sharp sine must have local prominence >= {LOCAL_PROMINENCE_THRESHOLD_DB} dB, got {peaks_sharp[0].local_prom_db} dB"
+    )
+
+    # A smooth broad noise drift slope (e.g. cumulative random walk without distinct resonance)
+    rng = np.random.default_rng(42)
+    broad_drift = np.cumsum(rng.normal(0, 0.02, size=n_samples))
+    peaks_drift = compute_welch_peaks(broad_drift, fps=fps, min_freq_hz=0.5, top_k=1)
+    if peaks_drift:
+        assert peaks_drift[0].is_reliable is False, "Broad drift signal must be marked unreliable"
+
+
+def test_background_referenced_ratio_check():
+    """Verify that high background residual at peak frequency marks the peak unreliable."""
+    fps = 60.0
+    duration_sec = 20.0
+    n_samples = int(fps * duration_sec)
+    t = np.arange(n_samples, dtype=np.float64) / fps
+
+    # Case A: Target has 3.7 Hz vibration, background is completely stationary (zero motion)
+    target_clean = 0.2 * np.sin(2.0 * np.pi * 3.7 * t)
+    bg_clean = np.zeros(n_samples, dtype=np.float64)
+
+    peaks_clean = compute_welch_peaks(target_clean, fps=fps, min_freq_hz=0.5, top_k=1, background_displacement=bg_clean)
+    assert len(peaks_clean) >= 1
+    assert peaks_clean[0].bg_ratio >= MIN_BG_RATIO
+    assert peaks_clean[0].is_reliable is True
+
+    # Case B: Target has 3.7 Hz vibration, but background also has strong 3.7 Hz motion (camera jitter leakage)
+    target_contaminated = 0.2 * np.sin(2.0 * np.pi * 3.7 * t)
+    bg_contaminated = 0.25 * np.sin(2.0 * np.pi * 3.7 * t)  # stronger background residual
+
+    peaks_bad = compute_welch_peaks(
+        target_contaminated,
+        fps=fps,
+        min_freq_hz=0.5,
+        top_k=1,
+        background_displacement=bg_contaminated,
+    )
+    assert len(peaks_bad) >= 1
+    assert peaks_bad[0].bg_ratio < MIN_BG_RATIO, f"Expected BG ratio < {MIN_BG_RATIO}, got {peaks_bad[0].bg_ratio}"
+    assert any("low target-to-background ratio" in f for f in peaks_bad[0].flags)
+    assert peaks_bad[0].is_reliable is False
+    assert is_peak_reliable(peaks_bad[0]) is False
 
 
 def test_sine_with_noise_and_9hz_component_reports_3_7hz_top():
@@ -201,3 +286,30 @@ def test_synthetic_video_generation_playable_and_frame_count():
                 os.remove(temp_video_path)
             except OSError:
                 pass
+
+
+def test_no_background_marks_peaks_unverified_and_never_reliable():
+    """Verify that when has_background=False, peaks are marked unverified and never reliable,
+    and the background-ratio check is skipped.
+    """
+    fps = 60.0
+    duration_sec = 20.0
+    n_samples = int(fps * duration_sec)
+    t = np.arange(n_samples, dtype=np.float64) / fps
+
+    # Even with a perfectly clean 3.7 Hz sine and high SNR
+    sig = 0.2 * np.sin(2.0 * np.pi * 3.7 * t)
+
+    peaks = compute_welch_peaks(sig, fps=fps, min_freq_hz=0.5, top_k=3, has_background=False)
+    assert len(peaks) >= 1
+    top_peak = peaks[0]
+
+    # Must be marked unverified and never reliable
+    assert top_peak.is_reliable is False, "Result must never be labelled Reliable without a background"
+    assert is_peak_reliable(top_peak) is False
+    assert top_peak.verdict == "Unverified: no stationary background in frame"
+    assert any("no stationary background" in f.lower() for f in top_peak.flags)
+
+    # Background-ratio check must be skipped (bg_ratio is None)
+    assert top_peak.bg_ratio is None, "Background ratio check should be skipped when has_background=False"
+    assert top_peak.bg_ratio_db is None

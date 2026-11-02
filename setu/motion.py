@@ -78,54 +78,78 @@ def track_motion(
         raise ValueError(f"Failed to read reference frame 0 from '{video_path}'")
 
     gray0 = cv2.cvtColor(frame0, cv2.COLOR_BGR2GRAY)
+    warnings: List[str] = []
 
-    # 1. Establish frame 0 masks
-    if segment_result is not None and len(segment_result.target_masks) > 0:
-        target_mask0 = segment_result.target_masks[0].astype(np.uint8) * 255
-        bg_mask0 = segment_result.background_masks[0].astype(np.uint8) * 255
-        t_box = target_bbox or _extract_bounding_box(target_mask0)
-        b_box = background_bbox or _extract_bounding_box(bg_mask0)
+    # 1. Establish frame 0 target and background masks
+    has_background = True
+    bg_mask0 = None
+    b_box = background_bbox
+
+    if segment_result is not None:
+        if len(segment_result.target_masks) > 0:
+            target_mask0 = segment_result.target_masks[0].astype(np.uint8) * 255
+            t_box = target_bbox or _extract_bounding_box(target_mask0)
+        else:
+            t_box = target_bbox or (int(width * 0.4), int(height * 0.2), int(width * 0.2), int(height * 0.6))
+            target_mask0 = np.zeros((height, width), dtype=np.uint8)
+            tx, ty, tw, th = t_box
+            target_mask0[ty : ty + th, tx : tx + tw] = 255
+
+        if len(segment_result.background_masks) > 0 and np.any(segment_result.background_masks[0]):
+            bg_mask0 = segment_result.background_masks[0].astype(np.uint8) * 255
+            b_box = b_box or _extract_bounding_box(bg_mask0)
+        elif b_box is not None and b_box[2] > 0 and b_box[3] > 0:
+            bx, by, bw, bh = b_box
+            bg_mask0 = np.zeros((height, width), dtype=np.uint8)
+            bg_mask0[by : by + bh, bx : bx + bw] = 255
+        else:
+            has_background = False
     else:
         t_box = target_bbox or (int(width * 0.4), int(height * 0.2), int(width * 0.2), int(height * 0.6))
-        b_box = background_bbox or (int(width * 0.05), int(height * 0.7), int(width * 0.25), int(height * 0.2))
-
         target_mask0 = np.zeros((height, width), dtype=np.uint8)
         tx, ty, tw, th = t_box
         target_mask0[ty : ty + th, tx : tx + tw] = 255
 
-        bg_mask0 = np.zeros((height, width), dtype=np.uint8)
-        bx, by, bw, bh = b_box
-        bg_mask0[by : by + bh, bx : bx + bw] = 255
+        if b_box is not None and b_box[2] > 0 and b_box[3] > 0:
+            bx, by, bw, bh = b_box
+            bg_mask0 = np.zeros((height, width), dtype=np.uint8)
+            bg_mask0[by : by + bh, bx : bx + bw] = 255
+        else:
+            has_background = False
 
     tx, ty, tw, th = t_box
-    warnings: List[str] = []
 
-    # 2. Detect good features to track in stationary background mask on frame 0
-    p_bg0 = cv2.goodFeaturesToTrack(
-        gray0,
-        mask=bg_mask0,
-        maxCorners=max_corners_bg,
-        qualityLevel=0.01,
-        minDistance=6,
-    )
-
-    if p_bg0 is None or len(p_bg0) < 6:
-        warnings.append(
-            f"Sparse background features ({len(p_bg0) if p_bg0 is not None else 0} detected). "
-            "Micro-jitter cancellation stability may be reduced."
-        )
-        # Fallback to general grid points inside background box
-        ys, xs = np.mgrid[b_box[1] + 10 : b_box[1] + b_box[3] - 10 : 15, b_box[0] + 10 : b_box[0] + b_box[2] - 10 : 15]
-        grid_pts = np.vstack((xs.flatten(), ys.flatten())).T.astype(np.float32)
-        p_bg0 = grid_pts[:, np.newaxis, :]
+    # 2. Setup background feature tracking (or skip if no background available)
+    if not has_background or bg_mask0 is None or not np.any(bg_mask0):
+        has_background = False
+        warnings.append("No stationary background found; skipping camera micro-jitter stabilisation.")
+        p_bg0 = None
     else:
-        p_bg0 = cv2.cornerSubPix(
+        p_bg0 = cv2.goodFeaturesToTrack(
             gray0,
-            p_bg0,
-            (5, 5),
-            (-1, -1),
-            (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+            mask=bg_mask0,
+            maxCorners=max_corners_bg,
+            qualityLevel=0.01,
+            minDistance=6,
         )
+
+        if p_bg0 is None or len(p_bg0) < 6:
+            warnings.append(
+                f"Sparse background features ({len(p_bg0) if p_bg0 is not None else 0} detected). "
+                "Micro-jitter cancellation stability may be reduced."
+            )
+            # Fallback to general grid points inside background box
+            ys, xs = np.mgrid[b_box[1] + 10 : b_box[1] + b_box[3] - 10 : 15, b_box[0] + 10 : b_box[0] + b_box[2] - 10 : 15]
+            grid_pts = np.vstack((xs.flatten(), ys.flatten())).T.astype(np.float32)
+            p_bg0 = grid_pts[:, np.newaxis, :]
+        else:
+            p_bg0 = cv2.cornerSubPix(
+                gray0,
+                p_bg0,
+                (5, 5),
+                (-1, -1),
+                (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+            )
 
     # 3. Setup method-specific targets
     if method == "phase_correlation":
@@ -169,67 +193,74 @@ def track_motion(
 
         gray_curr = cv2.cvtColor(frame_curr, cv2.COLOR_BGR2GRAY)
 
-        # A. Track background features from frame 0 to current frame
-        p_bg_curr, st_bg, _ = cv2.calcOpticalFlowPyrLK(
-            gray0,
-            gray_curr,
-            p_bg0,
-            None,
-            winSize=(21, 21),
-            maxLevel=3,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
-        )
-
-        st_bg_flat = (st_bg.ravel() == 1) if st_bg is not None else np.zeros(len(p_bg0), dtype=bool)
-        good_bg0 = p_bg0[st_bg_flat]
-        good_bg_curr = p_bg_curr[st_bg_flat]
-
-        # B. Estimate affine warp matrix to align current frame to frame 0
-        if len(good_bg_curr) >= 4:
-            M, inliers = cv2.estimateAffinePartial2D(
-                good_bg_curr, good_bg0, method=cv2.RANSAC, ransacReprojThreshold=2.0
+        if has_background and p_bg0 is not None:
+            # A. Track background features from frame 0 to current frame
+            p_bg_curr, st_bg, _ = cv2.calcOpticalFlowPyrLK(
+                gray0,
+                gray_curr,
+                p_bg0,
+                None,
+                winSize=(21, 21),
+                maxLevel=3,
+                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
             )
-            if M is None:
-                M = M_prev.copy()
-            else:
-                trans_jump = float(np.linalg.norm(M[:, 2] - M_prev[:, 2]))
-                inlier_ratio = (
-                    float(np.sum(inliers)) / float(len(good_bg_curr)) if inliers is not None else 0.0
+
+            st_bg_flat = (st_bg.ravel() == 1) if st_bg is not None else np.zeros(len(p_bg0), dtype=bool)
+            good_bg0 = p_bg0[st_bg_flat]
+            good_bg_curr = p_bg_curr[st_bg_flat]
+
+            # B. Estimate affine warp matrix to align current frame to frame 0
+            if len(good_bg_curr) >= 4:
+                M, inliers = cv2.estimateAffinePartial2D(
+                    good_bg_curr, good_bg0, method=cv2.RANSAC, ransacReprojThreshold=2.0
                 )
-                if trans_jump > 3.0 or inlier_ratio < 0.25:
-                    warnings.append(
-                        f"Frame stabilization jump ({trans_jump:.1f}px) or low inlier ratio ({inlier_ratio:.2f}); "
-                        "applying temporal continuity."
-                    )
+                if M is None:
                     M = M_prev.copy()
                 else:
-                    M_prev = M.copy()
+                    trans_jump = float(np.linalg.norm(M[:, 2] - M_prev[:, 2]))
+                    inlier_ratio = (
+                        float(np.sum(inliers)) / float(len(good_bg_curr)) if inliers is not None else 0.0
+                    )
+                    if trans_jump > 3.0 or inlier_ratio < 0.25:
+                        warnings.append(
+                            f"Frame stabilization jump ({trans_jump:.1f}px) or low inlier ratio ({inlier_ratio:.2f}); "
+                            "applying temporal continuity."
+                        )
+                        M = M_prev.copy()
+                    else:
+                        M_prev = M.copy()
+            else:
+                M = M_prev.copy()
+                warnings.append("Insufficient tracked background points in frame; maintaining prior alignment.")
+
+            # Record camera motion translation from M
+            camera_shifts_x.append(float(M[0, 2]))
+            camera_shifts_y.append(float(M[1, 2]))
+
+            # C. Warp current frame to frame 0 reference coordinate system
+            warped_curr = cv2.warpAffine(
+                gray_curr,
+                M,
+                (width, height),
+                flags=cv2.INTER_LANCZOS4,
+                borderMode=cv2.BORDER_REFLECT,
+            )
+
+            # D. Calculate background residual error after stabilization
+            if len(good_bg_curr) > 0 and M is not None:
+                pts_reshaped = good_bg_curr.reshape(-1, 2)
+                # Apply M to current background points
+                warped_bg_pts = (M[:, :2] @ pts_reshaped.T).T + M[:, 2]
+                res_diff = warped_bg_pts - good_bg0.reshape(-1, 2)
+                res_rms = float(np.sqrt(np.mean(np.sum(res_diff**2, axis=1))))
+                bg_residuals.append(res_rms)
+            else:
+                bg_residuals.append(0.0)
         else:
-            M = M_prev.copy()
-            warnings.append("Insufficient tracked background points in frame; maintaining prior alignment.")
-
-        # Record camera motion translation from M
-        camera_shifts_x.append(float(M[0, 2]))
-        camera_shifts_y.append(float(M[1, 2]))
-
-        # C. Warp current frame to frame 0 reference coordinate system
-        warped_curr = cv2.warpAffine(
-            gray_curr,
-            M,
-            (width, height),
-            flags=cv2.INTER_LANCZOS4,
-            borderMode=cv2.BORDER_REFLECT,
-        )
-
-        # D. Calculate background residual error after stabilization
-        if len(good_bg_curr) > 0 and M is not None:
-            pts_reshaped = good_bg_curr.reshape(-1, 2)
-            # Apply M to current background points
-            warped_bg_pts = (M[:, :2] @ pts_reshaped.T).T + M[:, 2]
-            res_diff = warped_bg_pts - good_bg0.reshape(-1, 2)
-            res_rms = float(np.sqrt(np.mean(np.sum(res_diff**2, axis=1))))
-            bg_residuals.append(res_rms)
-        else:
+            # Skip camera stabilization: use unwarped frame and record zero camera shifts
+            warped_curr = gray_curr
+            camera_shifts_x.append(0.0)
+            camera_shifts_y.append(0.0)
             bg_residuals.append(0.0)
 
         # E. Measure target motion using FIXED frame 0 mask
@@ -303,6 +334,7 @@ def track_motion(
         )
 
     quality: Dict[str, Any] = {
+        "has_background": has_background,
         "background_residual_px": round(bg_residual_px, 4),
         "snr": round(snr_val, 2),
         "camera_motion_rms_px": round(cam_rms, 4),
@@ -310,6 +342,9 @@ def track_motion(
         "method": method,
         "warnings": warnings,
     }
+    if not has_background:
+        quality["confidence"] = "Unverified: no stationary background in frame"
+        quality["verdict"] = "Unverified: no stationary background in frame"
 
     return MotionResult(
         displacement=displacement,
