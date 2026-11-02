@@ -66,6 +66,6 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
-   tests/.cache/
+tests/.cache/
 
 uploads/
