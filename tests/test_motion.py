@@ -150,7 +150,7 @@ def test_motion_recovery_matrix(benchmark_videos):
                     "Error": f"{freq_error:.4f} Hz",
                     "Residual": f"{res_val:.4f} px",
                     "SNR": f"{snr_val:.1f}",
-                    "Status": "PASS (≤0.1 Hz)",
+                    "Status": "PASS (<=0.1 Hz)",
                 }
             )
 
