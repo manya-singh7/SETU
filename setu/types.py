@@ -21,13 +21,13 @@ class SegmentResult:
         target_masks: List of (H, W) boolean numpy arrays, one per video frame.
         background_masks: List of (H, W) boolean numpy arrays, one per video frame.
         fps: Video frame rate in frames per second.
-        method: Segmentation strategy ("sam" or "manual").
+        method: Segmentation strategy ("sam", "manual", or "fallback").
     """
 
     target_masks: List[npt.NDArray[np.bool_]]
     background_masks: List[npt.NDArray[np.bool_]]
     fps: float
-    method: Literal["sam", "manual"] = "sam"
+    method: Literal["sam", "manual", "fallback"] = "sam"
 
 
 @dataclass

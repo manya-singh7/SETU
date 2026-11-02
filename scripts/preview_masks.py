@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""
+Mask Preview Script for Project SETU.
+
+Loads a civil infrastructure video recording (or generates a synthetic benchmark frame),
+segments the structural target and stationary reference anchor on Frame 0,
+overlays the masks and bounding boxes onto Frame 0, saves the resulting visualization
+as a PNG file, and prints the segmentation method that produced them.
+
+Usage:
+    python scripts/preview_masks.py --video path/to/bridge.mp4 --target-prompt "corner of concrete pillar"
+    python scripts/preview_masks.py --method fallback --output preview.png
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from typing import Optional, Tuple
+
+# Ensure project root is in sys.path when running as a standalone script
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+import cv2
+import numpy as np
+
+from setu.segment import (
+    compute_mask_area,
+    get_segmenter,
+    load_video_frames,
+    mask_to_bbox,
+)
+
+
+def parse_bbox(bbox_str: Optional[str]) -> Optional[Tuple[int, int, int, int]]:
+    """Parse comma-separated 'x,y,w,h' string into an integer tuple."""
+    if not bbox_str:
+        return None
+    parts = [int(p.strip()) for p in bbox_str.split(",")]
+    if len(parts) != 4:
+        raise ValueError(f"Invalid bounding box '{bbox_str}'. Expected 'x,y,w,h'.")
+    return (parts[0], parts[1], parts[2], parts[3])
+
+
+def generate_synthetic_bridge_frame(width: int = 640, height: int = 480) -> np.ndarray:
+    """Generate a synthetic 640x480 frame simulating a bridge pillar against ground."""
+    frame = np.full((height, width, 3), 190, dtype=np.uint8)  # Sky / daylight background
+
+    # Concrete Pier / Pillar in middle-ground
+    px1, py1, pw, ph = int(width * 0.40), int(height * 0.25), int(width * 0.20), int(height * 0.55)
+    cv2.rectangle(frame, (px1, py1), (px1 + pw, py1 + ph), (105, 105, 105), -1)
+    # Add vertical joint texture lines
+    cv2.line(frame, (px1 + pw // 3, py1), (px1 + pw // 3, py1 + ph), (80, 80, 80), 2)
+    cv2.line(frame, (px1 + 2 * pw // 3, py1), (px1 + 2 * pw // 3, py1 + ph), (80, 80, 80), 2)
+
+    # Bridge Deck (horizontal beam across top)
+    cv2.rectangle(frame, (0, int(height * 0.20)), (width, int(height * 0.32)), (75, 75, 75), -1)
+
+    # Stationary Bedrock / Embankment ground anchor
+    cv2.rectangle(frame, (0, int(height * 0.78)), (width, height), (50, 60, 45), -1)
+
+    return frame
+
+
+def create_mask_overlay(
+    frame: np.ndarray,
+    target_mask: np.ndarray,
+    background_mask: np.ndarray,
+    target_bbox: Tuple[int, int, int, int],
+    background_bbox: Tuple[int, int, int, int],
+    target_prompt: str,
+    background_prompt: str,
+    method: str,
+) -> np.ndarray:
+    """Composite semi-transparent colored masks, bounding boxes, and label banners onto frame."""
+    canvas = frame.copy()
+    h, w = canvas.shape[:2]
+
+    # Target Mask: Emerald Green overlay
+    target_color = np.array([30, 200, 30], dtype=np.uint8)
+    # Background Reference Mask: Deep Sky Blue overlay
+    background_color = np.array([230, 140, 20], dtype=np.uint8)
+
+    alpha = 0.45
+
+    if target_mask.any():
+        canvas[target_mask] = (
+            canvas[target_mask].astype(np.float32) * (1.0 - alpha) + target_color.astype(np.float32) * alpha
+        ).astype(np.uint8)
+
+    if background_mask.any():
+        canvas[background_mask] = (
+            canvas[background_mask].astype(np.float32) * (1.0 - alpha) + background_color.astype(np.float32) * alpha
+        ).astype(np.uint8)
+
+    # Draw Target Bounding Box and Annotation
+    tx, ty, tw, th = target_bbox
+    if tw > 0 and th > 0:
+        cv2.rectangle(canvas, (tx, ty), (tx + tw, ty + th), (0, 255, 0), 2)
+        cv2.putText(
+            canvas,
+            f"TARGET: {target_prompt}",
+            (tx, max(20, ty - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
+    # Draw Background Reference Bounding Box and Annotation
+    bx, by, bw, bh = background_bbox
+    if bw > 0 and bh > 0:
+        cv2.rectangle(canvas, (bx, by), (bx + bw, by + bh), (255, 180, 0), 2)
+        cv2.putText(
+            canvas,
+            f"BG REF: {background_prompt}",
+            (bx, max(20, by - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 180, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
+    # Informational Top Header Banner
+    banner_height = 42
+    banner = np.zeros((banner_height, w, 3), dtype=np.uint8)
+    banner[:] = (30, 30, 30)
+
+    method_tag = f"METHOD: {method.upper()}"
+    cv2.putText(
+        banner,
+        f"SETU Frame 0 Segmentation  |  {method_tag}  |  (Target: Green, BG Anchor: Cyan)",
+        (12, 26),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+
+    combined = np.vstack([banner, canvas])
+    return combined
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Overlay target and background segmentation masks on Frame 0 of bridge video."
+    )
+    parser.add_argument(
+        "--video",
+        type=str,
+        default=None,
+        help="Path to input video file (.mp4, .mov, etc.). If omitted, uses synthetic bridge benchmark frame.",
+    )
+    parser.add_argument(
+        "--target-prompt",
+        type=str,
+        default="corner of concrete pillar",
+        help="Open-vocabulary text cue for vibrating structural target.",
+    )
+    parser.add_argument(
+        "--background-prompt",
+        type=str,
+        default="stationary ground reference",
+        help="Text cue for stationary background anchor.",
+    )
+    parser.add_argument(
+        "--method",
+        type=str,
+        choices=["sam", "manual", "fallback"],
+        default="sam",
+        help="Segmentation strategy to run ('sam', 'manual', or 'fallback').",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="mask_preview.png",
+        help="Destination path for the preview PNG overlay image.",
+    )
+    parser.add_argument(
+        "--target-bbox",
+        type=str,
+        default=None,
+        help="Manual target bounding box 'x,y,w,h' (used if method='manual').",
+    )
+    parser.add_argument(
+        "--background-bbox",
+        type=str,
+        default=None,
+        help="Manual background bounding box 'x,y,w,h' (used if method='manual').",
+    )
+
+    args = parser.parse_args()
+
+    # Load video or fallback to synthetic frame
+    if args.video and os.path.exists(args.video):
+        print(f"Loading video: {args.video}")
+        frames, fps = load_video_frames(args.video, max_frames=1)
+        frame0 = frames[0]
+    else:
+        if args.video:
+            print(f"Warning: Video '{args.video}' not found. Generating synthetic bridge test frame.")
+        else:
+            print("No video specified. Using synthetic civil infrastructure benchmark frame.")
+        frame0 = generate_synthetic_bridge_frame()
+
+    # Parse manual bboxes if supplied
+    t_box = parse_bbox(args.target_bbox)
+    b_box = parse_bbox(args.background_bbox)
+
+    # Initialize segmenter
+    segmenter = get_segmenter(
+        method=args.method,
+        target_bbox=t_box,
+        background_bbox=b_box,
+    )
+
+    # Run single-frame segmentation on Frame 0
+    output = segmenter.segment(
+        frame=frame0,
+        target_prompt=args.target_prompt,
+        background_prompt=args.background_prompt,
+    )
+
+    # Print which method produced the result
+    print(f"Produced using method: {output.method}")
+    print(f"  Confidence: {output.confidence:.2f}")
+    print(f"  Target BBox: {output.target_bbox} (Active pixels: {compute_mask_area(output.target_mask)})")
+    print(f"  Background BBox: {output.background_bbox} (Active pixels: {compute_mask_area(output.background_mask)})")
+    if "fallback_reason" in output.metadata:
+        print(f"  Fallback note: {output.metadata['fallback_reason']}")
+
+    # Generate composite overlay
+    overlay_img = create_mask_overlay(
+        frame=frame0,
+        target_mask=output.target_mask,
+        background_mask=output.background_mask,
+        target_bbox=output.target_bbox,
+        background_bbox=output.background_bbox,
+        target_prompt=args.target_prompt,
+        background_prompt=args.background_prompt,
+        method=output.method,
+    )
+
+    # Ensure parent output directory exists and write PNG
+    output_dir = os.path.dirname(args.output)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    success = cv2.imwrite(args.output, overlay_img)
+    if success:
+        print(f"Saved mask overlay preview to: {os.path.abspath(args.output)}")
+    else:
+        print(f"Error: Failed to write image to {args.output}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
