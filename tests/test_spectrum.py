@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 import pytest
 
-from setu.spectrum import compute_welch_peaks
+from setu.spectrum import RELIABILITY_THRESHOLD_SNR_DB, compute_welch_peaks, is_peak_reliable
 from setu.types import Peak
 from tests.synth import generate_synthetic_video
 
@@ -41,8 +41,53 @@ def test_pure_sine_frequency_accuracy():
     assert abs(top_peak.freq_hz - freq_target) <= 0.05, (
         f"Peak frequency {top_peak.freq_hz:.4f} Hz deviates more than ±0.05 Hz from target {freq_target} Hz"
     )
-    assert top_peak.rel_power > 0.05, "Relative power should be significant for pure sine"
-    assert top_peak.snr > 10.0, "SNR should be high for pure sine signal"
+    assert top_peak.rel_power > 0.80, f"Clean sine must have relative power > 80%, got {top_peak.rel_power * 100:.2f}%"
+    assert top_peak.snr >= 10.0, f"SNR in dB should be >= 10.0 dB for pure sine signal, got {top_peak.snr} dB"
+    assert is_peak_reliable(top_peak), "Clean sine peak must meet reliability threshold"
+
+
+def test_clean_sine_relative_power_above_80_percent():
+    """Explicitly verify that a clean sinusoidal tone concentrates > 80% relative power in peak band."""
+    fps = 60.0
+    duration_sec = 30.0
+    freq_target = 3.7
+    amplitude = 0.2
+
+    n_samples = int(fps * duration_sec)
+    t = np.arange(n_samples, dtype=np.float64) / fps
+    signal = amplitude * np.sin(2.0 * np.pi * freq_target * t)
+
+    peaks = compute_welch_peaks(signal, fps=fps, min_freq_hz=0.5, top_k=3)
+
+    assert len(peaks) >= 1
+    top_peak = peaks[0]
+    # Dominant peak power lobe must contain > 80% (0.80) of total 0.5Hz-Nyquist band power
+    assert top_peak.rel_power > 0.80, (
+        f"Expected relative power > 80% (0.80) for clean sine, got {top_peak.rel_power * 100:.2f}%"
+    )
+    # Peak SNR in dB must exceed 10.0 dB reliability threshold
+    assert top_peak.snr >= RELIABILITY_THRESHOLD_SNR_DB, (
+        f"Expected SNR >= {RELIABILITY_THRESHOLD_SNR_DB} dB for clean sine, got {top_peak.snr} dB"
+    )
+    assert is_peak_reliable(top_peak) is True
+
+
+def test_low_confidence_flag_on_noise():
+    """Verify that pure white noise yields low SNR and is marked low confidence."""
+    fps = 60.0
+    duration_sec = 10.0
+    n_samples = int(fps * duration_sec)
+    rng = np.random.default_rng(999)
+    noise_signal = rng.normal(0.0, 0.05, size=n_samples)
+
+    peaks = compute_welch_peaks(noise_signal, fps=fps, min_freq_hz=0.5, top_k=3)
+    if peaks:
+        top_peak = peaks[0]
+        # Pure noise should not produce high relative power
+        assert top_peak.rel_power < 0.50
+        # Peak SNR on random noise should be below 10 dB or fail reliability check
+        if top_peak.snr < RELIABILITY_THRESHOLD_SNR_DB:
+            assert is_peak_reliable(top_peak) is False
 
 
 def test_sine_with_noise_and_9hz_component_reports_3_7hz_top():

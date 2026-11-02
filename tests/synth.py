@@ -21,6 +21,12 @@ import cv2
 import numpy as np
 import numpy.typing as npt
 
+try:
+    import av
+    HAS_PYAV = True
+except ImportError:
+    HAS_PYAV = False
+
 
 @dataclass
 class SyntheticVideoResult:
@@ -110,6 +116,9 @@ def generate_synthetic_video(
     jitter_walk_scale: float = 0.015,
     gaussian_noise_std: float = 0.0,
     crf: int = 23,
+    moving_object: bool = False,
+    moving_object_start_sec: float = 3.0,
+    moving_object_duration_sec: float = 2.0,
     target_bbox: Optional[Tuple[int, int, int, int]] = None,
     background_bbox: Optional[Tuple[int, int, int, int]] = None,
     seed: int = 42,
@@ -130,6 +139,9 @@ def generate_synthetic_video(
         jitter_walk_scale: Standard deviation of frame-to-frame random walk drift.
         gaussian_noise_std: Standard deviation of additive sensor Gaussian noise.
         crf: Constant Rate Factor for H.264 compression (default: 23).
+        moving_object: If True, passes a moving object through background for 2s.
+        moving_object_start_sec: Time in seconds when the moving object enters the scene.
+        moving_object_duration_sec: Duration in seconds of the moving object traversal.
         target_bbox: Optional (x, y, w, h) for the pillar. Defaults to (270, 90, 100, 280).
         background_bbox: Optional (x, y, w, h) for stationary anchor. Defaults to (40, 360, 120, 80).
         seed: Random generator seed for repeatable benchmark runs.
@@ -177,30 +189,38 @@ def generate_synthetic_video(
     bg_base = _create_textured_background(width, height, rng)
     pillar_base = _create_textured_pillar(tw, th, margin, rng)
 
-    # Video Writer configuration
-    # Set FFMPEG options for CRF if OpenCV uses ffmpeg backend
-    os.environ["OPENCV_FFMPEG_WRITER_OPTIONS"] = f"crf={crf}"
-
-    # Try H.264 / avc1 codec first, fallback to mp4v
-    fourcc_options = ["avc1", "H264", "X264", "mp4v"]
+    # Video Writer configuration: Use PyAV with libx264 for real CRF compression
+    container = None
+    stream = None
     writer: Optional[cv2.VideoWriter] = None
 
-    for codec in fourcc_options:
-        try:
-            fourcc = cv2.VideoWriter_fourcc(*codec)
-            candidate = cv2.VideoWriter(output_path, fourcc, float(fps), (width, height))
-            if candidate.isOpened():
-                writer = candidate
-                break
-        except Exception:
-            continue
+    if HAS_PYAV:
+        container = av.open(output_path, mode="w")
+        stream = container.add_stream("libx264", rate=int(round(fps)))
+        stream.width = width
+        stream.height = height
+        stream.pix_fmt = "yuv420p"
+        stream.options = {"crf": str(crf), "preset": "fast"}
+    else:
+        # Fallback to OpenCV VideoWriter
+        os.environ["OPENCV_FFMPEG_WRITER_OPTIONS"] = f"crf={crf}"
+        fourcc_options = ["avc1", "H264", "X264", "mp4v"]
+        for codec in fourcc_options:
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*codec)
+                candidate = cv2.VideoWriter(output_path, fourcc, float(fps), (width, height))
+                if candidate.isOpened():
+                    writer = candidate
+                    break
+            except Exception:
+                continue
 
-    if writer is None or not writer.isOpened():
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(output_path, fourcc, float(fps), (width, height))
+        if writer is None or not writer.isOpened():
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(output_path, fourcc, float(fps), (width, height))
 
-    if not writer.isOpened():
-        raise RuntimeError(f"Failed to initialize cv2.VideoWriter for path '{output_path}'")
+        if not writer.isOpened():
+            raise RuntimeError(f"Failed to initialize cv2.VideoWriter for path '{output_path}'")
 
     # Render frames
     try:
@@ -229,14 +249,42 @@ def generate_synthetic_video(
             # Insert pillar into frame
             frame[ty : ty + th, tx : tx + tw] = warped_pillar[margin : margin + th, margin : margin + tw]
 
+            # If moving object is enabled, overlay moving block passing through background
+            t_now = i / fps
+            if moving_object and (moving_object_start_sec <= t_now <= moving_object_start_sec + moving_object_duration_sec):
+                t_rel = (t_now - moving_object_start_sec) / max(moving_object_duration_sec, 1e-4)
+                bx, by, bw, bh = b_bbox
+                x_obj = int((bx - 20) + t_rel * (bw + 40))
+                y_obj = by + int(bh * 0.3)
+                obj_w, obj_h = 35, 25
+                x1 = max(0, x_obj)
+                x2 = min(width, x_obj + obj_w)
+                y1 = max(0, y_obj)
+                y2 = min(height, y_obj + obj_h)
+                if x2 > x1 and y2 > y1:
+                    obj_color = np.array([230, 40, 40], dtype=np.uint8)
+                    frame[y1:y2, x1:x2] = cv2.addWeighted(
+                        frame[y1:y2, x1:x2], 0.2, np.full((y2 - y1, x2 - x1, 3), obj_color, dtype=np.uint8), 0.8, 0
+                    )
+
             # Add optional Gaussian noise
             if gaussian_noise_std > 0.0:
                 noise = rng.normal(0, gaussian_noise_std, size=(height, width, 3))
                 frame = np.clip(frame.astype(np.float32) + noise, 0, 255).astype(np.uint8)
 
-            writer.write(frame)
+            if container is not None and stream is not None:
+                av_frame = av.VideoFrame.from_ndarray(frame, format="bgr24")
+                for packet in stream.encode(av_frame):
+                    container.mux(packet)
+            elif writer is not None:
+                writer.write(frame)
     finally:
-        writer.release()
+        if container is not None and stream is not None:
+            for packet in stream.encode():
+                container.mux(packet)
+            container.close()
+        elif writer is not None:
+            writer.release()
 
     return SyntheticVideoResult(
         video_path=output_path,

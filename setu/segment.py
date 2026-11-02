@@ -5,9 +5,13 @@ Step 2 in SETU Pipeline:
 Segments the structural target from a text prompt (e.g. "corner of concrete pillar")
 and a stationary background reference (e.g. "bedrock / distant building") using Meta SAM 3.1.
 
-Both live Meta SAM 3.1 API and local offline fallbacks are placed behind the BaseSegmenter interface.
+Integrates with Meta's OpenAI-compatible Model API (sam-3.1 at https://api.meta.ai/v1)
+routed through setu/meta_client.py for unified mock/cached/live dispatch, usage logging,
+and budget cap enforcement.
+
 Supports Promptable Concept Segmentation (PCS), manual bounding box ROI segmentation,
-and fixed-mask frame replication for downstream subpixel motion cancellation.
+multi-instance candidate ranking, and fixed-mask frame replication for downstream
+subpixel motion cancellation.
 
 Safety Principle:
 SETU NEVER declares a bridge safe. Vision-based vibration screening provides an early
@@ -17,10 +21,13 @@ screening heuristic only, routing flagged readings to human civil engineers for 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import base64
 from dataclasses import dataclass, field
 import logging
+import math
 import os
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 import cv2
@@ -29,9 +36,17 @@ import numpy.typing as npt
 import requests
 
 from setu.config import settings
+from setu.meta_client import BudgetExceededError, MetaAPIError, MetaClient, get_meta_client
 from setu.types import SegmentResult
 
 logger = logging.getLogger(__name__)
+
+# Check if official meta_sam_parser package is available
+try:
+    import meta_sam_parser
+    HAS_META_SAM_PARSER = True
+except ImportError:
+    HAS_META_SAM_PARSER = False
 
 
 # ---------------------------------------------------------------------------
@@ -49,9 +64,9 @@ class SegmentationOutput:
         background_bbox: Bounding box tuple (x, y, w, h) around stationary background.
         target_prompt: Text prompt used (e.g. "corner of concrete pillar").
         background_prompt: Reference prompt used (e.g. "stationary ground reference").
-        confidence: Segmentation confidence score.
+        confidence: Optional confidence score reported by SAM, or None if fallback.
         method: Method used to generate segmentation ("sam", "manual", or "fallback").
-        metadata: Model and execution details.
+        metadata: Model, instance candidates, and execution details.
     """
 
     target_mask: npt.NDArray[np.bool_]
@@ -60,20 +75,14 @@ class SegmentationOutput:
     background_bbox: Tuple[int, int, int, int]
     target_prompt: str = "corner of concrete pillar"
     background_prompt: str = "stationary ground reference"
-    confidence: float = 1.0
+    confidence: Optional[float] = None
     method: Literal["sam", "manual", "fallback"] = "fallback"
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class PointPrompt:
-    """A 2D coordinate point prompt for interactive segmentation.
-
-    Attributes:
-        x: Horizontal coordinate in pixels.
-        y: Vertical coordinate in pixels.
-        label: 1 for positive (foreground) prompt, 0 for negative (background) prompt.
-    """
+    """A 2D coordinate point prompt for interactive segmentation."""
 
     x: float
     y: float
@@ -180,12 +189,7 @@ def extract_bboxes_from_result(
 
 
 def validate_segment_result(result: SegmentResult) -> Dict[str, Any]:
-    """Validate a SegmentResult for structural integrity and pipeline compliance.
-
-    Returns:
-        Dictionary containing validation status ('is_valid': bool), frame count,
-        mask areas, overlap warning, and diagnostic messages.
-    """
+    """Validate a SegmentResult for structural integrity and pipeline compliance."""
     n_target = len(result.target_masks)
     n_bg = len(result.background_masks)
     errors: List[str] = []
@@ -237,20 +241,19 @@ def load_video_frames(
     default_fps: float = 30.0,
     max_frames: Optional[int] = None,
 ) -> Tuple[List[npt.NDArray[np.uint8]], float]:
-    """Load video frames and sampling frame rate from a file path or array structure.
-
-    Args:
-        video_source: Filepath string/Path, 4D/3D numpy array, or sequence of frame arrays.
-        default_fps: Default frame rate if source metadata does not specify it.
-        max_frames: Optional maximum number of frames to load.
-
-    Returns:
-        Tuple of (list of frame arrays, fps).
-    """
+    """Load video frames and sampling frame rate from a file path or array structure."""
     if isinstance(video_source, (str, Path)):
         path_str = str(video_source)
         if not os.path.exists(path_str):
-            raise FileNotFoundError(f"Video file not found: {path_str}")
+            raise FileNotFoundError(f"Video or image file not found: {path_str}")
+
+        # Check if direct still image
+        ext = os.path.splitext(path_str)[1].lower()
+        if ext in (".jpg", ".jpeg", ".png", ".bmp", ".webp"):
+            img = cv2.imread(path_str)
+            if img is None:
+                raise ValueError(f"Failed to decode image file: {path_str}")
+            return [img], float(default_fps)
 
         cap = cv2.VideoCapture(path_str)
         if not cap.isOpened():
@@ -281,8 +284,10 @@ def load_video_frames(
             frames = [video_source[i].astype(np.uint8) for i in range(len(video_source))]
         elif video_source.ndim == 3:
             frames = [video_source[i].astype(np.uint8) for i in range(len(video_source))]
+        elif video_source.ndim == 2:
+            frames = [video_source.astype(np.uint8)]
         else:
-            raise ValueError(f"Expected 3D or 4D numpy array for video frames, got {video_source.ndim}D array.")
+            raise ValueError(f"Expected 2D, 3D, or 4D numpy array, got {video_source.ndim}D array.")
 
         if max_frames is not None:
             frames = frames[:max_frames]
@@ -312,15 +317,10 @@ def track_roi_displacement(
     bbox: Tuple[int, int, int, int],
     search_margin: int = 12,
 ) -> Tuple[int, int]:
-    """Template matching displacement tracking (used for optional QA drift monitoring).
-
-    Finds the integer (dx, dy) translation of a template ROI between reference and
-    current frames using squared-difference minimization.
-    """
+    """Template matching displacement tracking (used for optional QA drift monitoring)."""
     x, y, w, h = bbox
     H, W = ref_gray.shape[:2]
 
-    # Constrain reference template within frame
     x1 = max(0, min(x, W - 1))
     y1 = max(0, min(y, H - 1))
     x2 = max(x1 + 1, min(x + w, W))
@@ -331,7 +331,6 @@ def track_roi_displacement(
     if th < 3 or tw < 3:
         return (0, 0)
 
-    # Search window around bounding box in current frame
     sw_x1 = max(0, x1 - search_margin)
     sw_y1 = max(0, y1 - search_margin)
     sw_x2 = min(W, x2 + search_margin)
@@ -341,9 +340,8 @@ def track_roi_displacement(
     if search_window.shape[0] < th or search_window.shape[1] < tw:
         return (0, 0)
 
-    # Use TM_SQDIFF for robust minimum difference tracking
     res = cv2.matchTemplate(search_window, template, cv2.TM_SQDIFF)
-    min_val, _, min_loc, _ = cv2.minMaxLoc(res)
+    _, _, min_loc, _ = cv2.minMaxLoc(res)
 
     best_x = sw_x1 + min_loc[0]
     best_y = sw_y1 + min_loc[1]
@@ -351,6 +349,159 @@ def track_roi_displacement(
     dx = int(best_x - x1)
     dy = int(best_y - y1)
     return dx, dy
+
+
+# ---------------------------------------------------------------------------
+# SAM 3.1 Grammar Parsing & Multi-Instance Ranking
+# ---------------------------------------------------------------------------
+
+def parse_sam_grammar(resp: Dict[str, Any], frame_shape: Tuple[int, int]) -> List[Dict[str, Any]]:
+    """Parse Meta SAM 3.1 output text grammar or structured records into candidate instances.
+
+    Each instance dictionary contains:
+        instance_id: int
+        bbox: (x, y, w, h)
+        mask: (H, W) boolean numpy array
+        area: int
+        centroid: (cx, cy)
+        confidence: Optional[float]
+    """
+    h_frame, w_frame = frame_shape
+    instances: List[Dict[str, Any]] = []
+
+    # Handle direct test/mock payload structures
+    if "target_bbox" in resp:
+        t_box = tuple(resp["target_bbox"])
+        mask = bbox_to_mask(t_box, frame_shape)
+        conf = resp.get("confidence")
+        return [
+            {
+                "instance_id": 0,
+                "bbox": t_box,
+                "mask": mask,
+                "area": compute_mask_area(mask),
+                "centroid": compute_mask_centroid(mask),
+                "confidence": float(conf) if conf is not None else None,
+            }
+        ]
+
+    # Handle structured instance list if provided
+    if "instances" in resp and isinstance(resp["instances"], list):
+        for idx, inst in enumerate(resp["instances"]):
+            box = tuple(inst.get("bbox", (0, 0, 0, 0)))
+            mask = inst.get("mask")
+            if mask is None:
+                mask = bbox_to_mask(box, frame_shape)
+            conf = inst.get("confidence", inst.get("score"))
+            instances.append(
+                {
+                    "instance_id": idx,
+                    "bbox": box,
+                    "mask": mask,
+                    "area": compute_mask_area(mask),
+                    "centroid": compute_mask_centroid(mask),
+                    "confidence": float(conf) if conf is not None else None,
+                }
+            )
+        if instances:
+            return instances
+
+    # Extract output_text from Meta Model API responses
+    text = ""
+    for item in resp.get("output", []):
+        for content in item.get("content", []):
+            if content.get("type") == "output_text":
+                text += content.get("text", "")
+
+    if not text:
+        return instances
+
+    # Parse special token box syntax: <|box;x1=...;y1=...;x2=...;y2=...;w=...;h=...|>
+    box_matches = list(re.finditer(r"<\|box;([^|>]+)\|>", text))
+    mask_matches = list(re.finditer(r"<\|mask;([^|>]+)\|>", text))
+
+    for idx, match in enumerate(box_matches):
+        box_str = match.group(1)
+        params: Dict[str, str] = {}
+        for part in box_str.split(";"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                params[k.strip().lower()] = v.strip()
+
+        try:
+            x1 = float(params.get("x1", 0))
+            y1 = float(params.get("y1", 0))
+            x2 = float(params.get("x2", 0))
+            y2 = float(params.get("y2", 0))
+            cw = float(params.get("w", w_frame))
+            ch = float(params.get("h", h_frame))
+
+            scale_x = w_frame / cw if cw > 0 else 1.0
+            scale_y = h_frame / ch if ch > 0 else 1.0
+
+            bx = max(0, min(int(round(x1 * scale_x)), w_frame - 1))
+            by = max(0, min(int(round(y1 * scale_y)), h_frame - 1))
+            bw = max(1, min(int(round((x2 - x1) * scale_x)), w_frame - bx))
+            bh = max(1, min(int(round((y2 - y1) * scale_y)), h_frame - by))
+
+            score_val = params.get("score") or params.get("confidence") or resp.get("confidence")
+            confidence = float(score_val) if score_val is not None else None
+
+            mask = None
+            if HAS_META_SAM_PARSER and idx < len(mask_matches):
+                try:
+                    mask_raw = mask_matches[idx].group(1)
+                    raster = meta_sam_parser.decode_mask_to_raster(mask_raw)  # type: ignore[attr-defined]
+                    if isinstance(raster, np.ndarray) and raster.shape != frame_shape:
+                        raster = cv2.resize(raster.astype(np.uint8), (w_frame, h_frame), interpolation=cv2.INTER_NEAREST) > 0
+                    mask = raster
+                except Exception as decode_exc:
+                    logger.debug("meta_sam_parser raster decoding error: %s", decode_exc)
+                    mask = None
+
+            if mask is None:
+                mask = bbox_to_mask((bx, by, bw, bh), frame_shape)
+
+            instances.append(
+                {
+                    "instance_id": idx,
+                    "bbox": (bx, by, bw, bh),
+                    "mask": mask,
+                    "area": compute_mask_area(mask),
+                    "centroid": compute_mask_centroid(mask),
+                    "confidence": confidence,
+                }
+            )
+        except (ValueError, KeyError) as parse_err:
+            logger.debug("Failed to parse box token '%s': %s", box_str, parse_err)
+
+    return instances
+
+
+def select_best_instance(
+    instances: List[Dict[str, Any]], frame_shape: Tuple[int, int]
+) -> Dict[str, Any]:
+    """Select the largest and most central instance from multiple prompt matches."""
+    if not instances:
+        raise ValueError("Cannot select from empty instance list.")
+    if len(instances) == 1:
+        return instances[0]
+
+    h_frame, w_frame = frame_shape
+    center_x = w_frame / 2.0
+    center_y = h_frame / 2.0
+    max_dist = max(1.0, math.hypot(center_x, center_y))
+    max_area = max(1, max(inst["area"] for inst in instances))
+
+    def score_instance(inst: Dict[str, Any]) -> float:
+        centroid = inst.get("centroid") or (center_x, center_y)
+        cx, cy = centroid
+        dist = math.hypot(cx - center_x, cy - center_y)
+        centrality = 1.0 - (dist / max_dist)
+        area_ratio = inst["area"] / max_area
+        return 0.6 * area_ratio + 0.4 * centrality
+
+    return max(instances, key=score_instance)
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +526,7 @@ class BaseSegmenter(ABC):
             background_prompt: Text description of static background reference anchor.
 
         Returns:
-            SegmentationOutput containing binary masks and bounding boxes.
+            SegmentationOutput containing binary masks, bounding boxes, and optional confidence.
         """
         pass
 
@@ -393,27 +544,16 @@ class BaseSegmenter(ABC):
         Segments ONLY the first frame (frame 0) and returns the same fixed masks
         for every frame. Motion stabilization and displacement tracking happen
         downstream (in setu/motion.py), so masks must remain fixed per frame.
-
-        Args:
-            video_source: Video file path, 4D/3D numpy array, or list of frames.
-            target_prompt: Open-vocabulary target cue.
-            background_prompt: Static reference cue.
-            fps: Frame rate (used if not determinable from video_source).
-            qa_keyframes: If True, computes template tracking drift metrics for QA.
-            qa_keyframe_interval: Frame interval for QA keyframe checks.
-
-        Returns:
-            SegmentResult conforming to SETU pipeline data contract with fixed masks.
         """
         frames, detected_fps = load_video_frames(video_source, default_fps=fps)
         if not frames:
             raise ValueError("No frames provided to segment_video.")
 
-        # Segment ONLY the first frame
+        # Segment ONLY Frame 0
         first_frame = frames[0]
         initial_out = self.segment(first_frame, target_prompt, background_prompt)
 
-        # Return the same fixed masks for every frame (masks must not move per frame)
+        # Return the same fixed masks for every frame
         n_frames = len(frames)
         target_masks: List[npt.NDArray[np.bool_]] = [
             initial_out.target_mask.copy() for _ in range(n_frames)
@@ -447,13 +587,8 @@ class BaseSegmenter(ABC):
 class MetaSAM31Segmenter(BaseSegmenter):
     """Meta SAM 3.1 implementation using Promptable Concept Segmentation (PCS).
 
-    Supports text prompt cues (e.g., 'corner of concrete pillar'), point prompts,
-    and bounding boxes. Integrates with the Meta Model API.
-
-    Safety / Integrity Guarantee:
-    If real SAM 3.1 cannot be reached (no API key, offline mode, or network failure),
-    this class logs a warning and returns method="fallback" (or raises an error if
-    raise_on_failure=True). It NEVER labels a fallback result as "sam".
+    Calls Meta Model API (sam-3.1) routed via setu/meta_client.py for unified
+    mock/cached/live modes, disk caching, usage logging, and budget cap checks.
     """
 
     def __init__(
@@ -461,14 +596,16 @@ class MetaSAM31Segmenter(BaseSegmenter):
         api_key: Optional[str] = None,
         model_name: Optional[str] = None,
         api_base_url: Optional[str] = None,
-        timeout: int = 15,
+        timeout: int = 25,
         raise_on_failure: bool = False,
+        meta_client: Optional[MetaClient] = None,
     ) -> None:
         self.api_key = api_key or settings.META_API_KEY
-        self.model_name = model_name or settings.SAM_MODEL_NAME
+        self.model_name = model_name or getattr(settings, "SAM_MODEL", "sam-3.1")
         self.api_base_url = api_base_url or settings.META_API_BASE_URL
         self.timeout = timeout
         self.raise_on_failure = raise_on_failure
+        self.meta_client = meta_client
 
     def _call_api_endpoint(
         self,
@@ -476,51 +613,78 @@ class MetaSAM31Segmenter(BaseSegmenter):
         target_prompt: str,
         background_prompt: str,
     ) -> Optional[SegmentationOutput]:
-        """Call Meta SAM 3.1 Model API endpoint if configured."""
-        if not self.api_key:
+        """Call Meta SAM 3.1 Model API endpoint via MetaClient."""
+        client = self.meta_client or get_meta_client()
+        if client.mode == "live" and not client.api_key:
             return None
 
-        endpoint = f"{self.api_base_url.rstrip('/')}/models/{self.model_name}/segment"
-        h, w = frame.shape[:2]
+        # Encode frame 0 as JPEG base64
+        ret, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        if not ret:
+            return None
+        image_b64 = base64.b64encode(buf).decode("utf-8")
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": self.model_name,
-            "target_prompt": target_prompt,
-            "background_prompt": background_prompt,
-            "image_dimensions": {"height": h, "width": w},
-        }
+        # Truncate prompt to max 32 tokens
+        t_prompt = " ".join(target_prompt.strip().split()[:32])
+        b_prompt = " ".join(background_prompt.strip().split()[:32])
 
         try:
-            resp = requests.post(endpoint, json=payload, headers=headers, timeout=self.timeout)
-            if resp.status_code == 200:
-                data = resp.json()
-                t_box_data = data.get("target_bbox")
-                b_box_data = data.get("background_bbox")
-                if t_box_data and b_box_data:
-                    t_box = tuple(t_box_data)
-                    b_box = tuple(b_box_data)
-                    t_mask = bbox_to_mask(t_box, (h, w))  # type: ignore[arg-type]
-                    b_mask = bbox_to_mask(b_box, (h, w))  # type: ignore[arg-type]
-                    return SegmentationOutput(
-                        target_mask=t_mask,
-                        background_mask=b_mask,
-                        target_bbox=t_box,  # type: ignore[arg-type]
-                        background_bbox=b_box,  # type: ignore[arg-type]
-                        target_prompt=target_prompt,
-                        background_prompt=background_prompt,
-                        confidence=float(data.get("confidence", 0.95)),
-                        method="sam",
-                        metadata={"source": "meta_sam_3.1_api", "model": self.model_name},
-                    )
-            logger.warning("Meta SAM API responded with status %s: %s", resp.status_code, resp.text)
-        except Exception as exc:
-            logger.warning("Meta SAM API call failed (%s). Falling back to offline heuristic.", exc)
+            target_resp = client.segment_image(image_b64, prompt=t_prompt, model=self.model_name)
+            target_instances = parse_sam_grammar(target_resp, frame.shape[:2])
 
-        return None
+            if not target_instances:
+                logger.warning("SAM 3.1 returned no target instances for prompt '%s'.", t_prompt)
+                return None
+
+            # Return largest/most central instance as target, keeping all in metadata
+            target_inst = select_best_instance(target_instances, frame.shape[:2])
+            target_box = target_inst["bbox"]
+            target_mask = target_inst["mask"]
+            target_conf = target_inst.get("confidence")
+
+            # Stationary background reference
+            bg_instances: List[Dict[str, Any]] = []
+            try:
+                bg_resp = client.segment_image(image_b64, prompt=b_prompt, model=self.model_name)
+                bg_instances = parse_sam_grammar(bg_resp, frame.shape[:2])
+            except Exception as bg_err:
+                logger.debug("Background SAM call failed (%s); using default ground anchor.", bg_err)
+
+            h, w = frame.shape[:2]
+            if bg_instances:
+                bg_inst = select_best_instance(bg_instances, frame.shape[:2])
+                bg_box = bg_inst["bbox"]
+                bg_mask = bg_inst["mask"]
+            else:
+                bw, bh = int(w * 0.20), int(h * 0.15)
+                bx, by = int(w * 0.05), int(h * 0.80)
+                bg_box = (bx, by, bw, bh)
+                bg_mask = bbox_to_mask(bg_box, (h, w))
+
+            return SegmentationOutput(
+                target_mask=target_mask,
+                background_mask=bg_mask,
+                target_bbox=target_box,
+                background_bbox=bg_box,
+                target_prompt=target_prompt,
+                background_prompt=background_prompt,
+                confidence=target_conf,
+                method="sam",
+                metadata={
+                    "source": "meta_sam_3.1_api",
+                    "model": self.model_name,
+                    "mode": client.mode,
+                    "all_target_instances": target_instances,
+                    "all_background_instances": bg_instances,
+                    "target_instance_count": len(target_instances),
+                    "parser": "meta_sam_parser" if HAS_META_SAM_PARSER else "builtin_grammar_decoder",
+                },
+            )
+        except BudgetExceededError:
+            raise
+        except Exception as exc:
+            logger.warning("Meta SAM API call via MetaClient failed (%s).", exc)
+            return None
 
     def _heuristic_semantic_segmentation(
         self,
@@ -530,13 +694,12 @@ class MetaSAM31Segmenter(BaseSegmenter):
     ) -> SegmentationOutput:
         """Adaptive prompt-guided heuristic segmentation for offline/fallback use.
 
-        Returns method='fallback'. Never labels a fallback result as 'sam'.
+        Returns method='fallback' and confidence=None (no made-up confidence).
         """
         h, w = frame.shape[:2]
         tp_lower = target_prompt.lower()
         bp_lower = background_prompt.lower()
 
-        # Semantic target region determination based on prompt keywords
         if any(kw in tp_lower for kw in ("cable", "stay", "tendon", "wire")):
             tw, th = int(w * 0.15), int(h * 0.35)
             tx, ty = int(w * 0.45), int(h * 0.20)
@@ -550,7 +713,6 @@ class MetaSAM31Segmenter(BaseSegmenter):
             tw, th = int(w * 0.25), int(h * 0.25)
             tx, ty = int(w * 0.375), int(h * 0.375)
 
-        # Stationary reference region determination based on background keywords
         if any(kw in bp_lower for kw in ("sky", "cloud", "horizon")):
             bw, bh = int(w * 0.20), int(h * 0.15)
             bx, by = int(w * 0.75), int(h * 0.05)
@@ -561,11 +723,9 @@ class MetaSAM31Segmenter(BaseSegmenter):
             bw, bh = int(w * 0.20), int(h * 0.15)
             bx, by = int(w * 0.05), int(h * 0.80)
 
-        # Generate base rectangular masks
         target_mask = bbox_to_mask((tx, ty, tw, th), (h, w))
         background_mask = bbox_to_mask((bx, by, bw, bh), (h, w))
 
-        # Refine target mask using structural contrast/edges if frame has variation
         gray = _to_gray(frame)
         target_roi = gray[ty : ty + th, tx : tx + tw]
         if target_roi.size > 0 and np.std(target_roi) > 5.0:
@@ -582,7 +742,7 @@ class MetaSAM31Segmenter(BaseSegmenter):
             background_bbox=(bx, by, bw, bh),
             target_prompt=target_prompt,
             background_prompt=background_prompt,
-            confidence=0.91,
+            confidence=None,  # No made-up confidence
             method="fallback",
             metadata={
                 "mode": "sam3.1_concept_heuristic",
@@ -598,19 +758,16 @@ class MetaSAM31Segmenter(BaseSegmenter):
         target_prompt: str = "corner of concrete pillar",
         background_prompt: str = "stationary ground reference",
     ) -> SegmentationOutput:
-        """Segment target and background using Meta SAM 3.1 API or offline concept heuristic.
-
-        Never labels a fallback result as 'sam'.
-        """
-        if not settings.USE_LOCAL_FALLBACKS and self.api_key:
+        """Segment target and background using Meta SAM 3.1 API or offline concept heuristic."""
+        client = self.meta_client or get_meta_client()
+        if client.mode == "mock" or client.api_key:
             api_res = self._call_api_endpoint(frame, target_prompt, background_prompt)
             if api_res is not None:
                 return api_res
 
         if self.raise_on_failure:
             raise RuntimeError(
-                f"Real Meta SAM 3.1 model/API not reachable (USE_LOCAL_FALLBACKS={settings.USE_LOCAL_FALLBACKS}, "
-                f"api_key={'set' if self.api_key else 'none'}) and raise_on_failure=True."
+                f"Real Meta SAM 3.1 model/API not reachable and raise_on_failure=True."
             )
 
         logger.warning(
@@ -624,12 +781,7 @@ class MetaSAM31Segmenter(BaseSegmenter):
 # ---------------------------------------------------------------------------
 
 class ManualSegmenter(BaseSegmenter):
-    """User-guided manual region-of-interest segmentation.
-
-    Allows civil engineers or field technicians to manually define target and
-    background bounding boxes when automated models require override.
-    Sets method="manual" in SegmentResult.
-    """
+    """User-guided manual region-of-interest segmentation."""
 
     def __init__(
         self,
@@ -661,7 +813,7 @@ class ManualSegmenter(BaseSegmenter):
             background_bbox=b_box,
             target_prompt=target_prompt,
             background_prompt=background_prompt,
-            confidence=1.0,
+            confidence=None,  # No made-up confidence
             method="manual",
             metadata={"mode": "manual_roi"},
         )
@@ -674,8 +826,7 @@ class ManualSegmenter(BaseSegmenter):
 class FallbackSegmenter(BaseSegmenter):
     """Local, offline-friendly deterministic fallback segmenter.
 
-    Generates reproducible geometric ROIs for zero-latency local development
-    and automated test suites. Always sets method="fallback".
+    Generates reproducible geometric ROIs. Always sets method="fallback" and confidence=None.
     """
 
     def segment(
@@ -687,12 +838,10 @@ class FallbackSegmenter(BaseSegmenter):
         """Generate deterministic target and background regions from frame dimensions."""
         h, w = frame.shape[:2]
 
-        # Target: Central structural joint (e.g. pillar or truss junction)
         tw, th = int(w * 0.25), int(h * 0.25)
         tx, ty = int(w * 0.375), int(h * 0.375)
         target_mask = bbox_to_mask((tx, ty, tw, th), (h, w))
 
-        # Stationary reference: Lower/distant ground anchor
         bw, bh = int(w * 0.20), int(h * 0.15)
         bx, by = int(w * 0.05), int(h * 0.80)
         background_mask = bbox_to_mask((bx, by, bw, bh), (h, w))
@@ -704,7 +853,7 @@ class FallbackSegmenter(BaseSegmenter):
             background_bbox=(bx, by, bw, bh),
             target_prompt=target_prompt,
             background_prompt=background_prompt,
-            confidence=0.92,
+            confidence=None,  # No made-up confidence
             method="fallback",
             metadata={"mode": "fallback_offline_segmenter"},
         )
@@ -721,20 +870,9 @@ def get_segmenter(
     api_key: Optional[str] = None,
     model_name: Optional[str] = None,
     raise_on_failure: bool = False,
+    meta_client: Optional[MetaClient] = None,
 ) -> BaseSegmenter:
-    """Factory providing the configured segmenter implementation.
-
-    Args:
-        method: Segmenter choice ("sam", "manual", or "fallback").
-        target_bbox: Optional bounding box for manual segmentation.
-        background_bbox: Optional background bounding box for manual segmentation.
-        api_key: Optional Meta API key override.
-        model_name: Optional model identifier override.
-        raise_on_failure: If True, MetaSAM31Segmenter raises RuntimeError when real SAM is unreachable.
-
-    Returns:
-        Instance conforming to BaseSegmenter.
-    """
+    """Factory providing the configured segmenter implementation."""
     if method == "manual":
         return ManualSegmenter(target_bbox=target_bbox, background_bbox=background_bbox)
 
@@ -745,6 +883,7 @@ def get_segmenter(
         api_key=api_key,
         model_name=model_name,
         raise_on_failure=raise_on_failure,
+        meta_client=meta_client,
     )
 
 
@@ -757,31 +896,15 @@ def segment_video(
     target_bbox: Optional[Tuple[int, int, int, int]] = None,
     background_bbox: Optional[Tuple[int, int, int, int]] = None,
     raise_on_failure: bool = False,
+    meta_client: Optional[MetaClient] = None,
 ) -> SegmentResult:
-    """Convenience function to segment video with fixed masks per frame.
-
-    Segments ONLY the first frame and returns fixed masks for every frame.
-    Motion stabilization happens downstream in setu/motion.py.
-
-    Args:
-        video_source: Video file path, 4D/3D array, or list of frames.
-        target_prompt: Open-vocabulary target cue.
-        background_prompt: Static reference cue.
-        fps: Sampling frame rate.
-        method: "sam", "manual", or "fallback".
-        target_bbox: Optional bounding box if method="manual".
-        background_bbox: Optional background bounding box if method="manual".
-        raise_on_failure: If True, raises RuntimeError when SAM 3.1 cannot be reached.
-
-    Returns:
-        SegmentResult containing target_masks, background_masks, fps, and method.
-        Never labels a fallback result as "sam".
-    """
+    """Convenience function to segment video with fixed masks per frame."""
     segmenter = get_segmenter(
         method=method,
         target_bbox=target_bbox,
         background_bbox=background_bbox,
         raise_on_failure=raise_on_failure,
+        meta_client=meta_client,
     )
     return segmenter.segment_video(
         video_source=video_source,

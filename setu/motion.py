@@ -160,6 +160,7 @@ def track_motion(
     bg_residuals: List[float] = [0.0]
     camera_shifts_x: List[float] = [0.0]
     camera_shifts_y: List[float] = [0.0]
+    M_prev = np.float32([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
 
     while True:
         ret, frame_curr = cap.read()
@@ -185,12 +186,27 @@ def track_motion(
 
         # B. Estimate affine warp matrix to align current frame to frame 0
         if len(good_bg_curr) >= 4:
-            M, inliers = cv2.estimateAffinePartial2D(good_bg_curr, good_bg0, method=cv2.RANSAC, ransacReprojThreshold=2.5)
+            M, inliers = cv2.estimateAffinePartial2D(
+                good_bg_curr, good_bg0, method=cv2.RANSAC, ransacReprojThreshold=2.0
+            )
             if M is None:
-                M = np.float32([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+                M = M_prev.copy()
+            else:
+                trans_jump = float(np.linalg.norm(M[:, 2] - M_prev[:, 2]))
+                inlier_ratio = (
+                    float(np.sum(inliers)) / float(len(good_bg_curr)) if inliers is not None else 0.0
+                )
+                if trans_jump > 3.0 or inlier_ratio < 0.25:
+                    warnings.append(
+                        f"Frame stabilization jump ({trans_jump:.1f}px) or low inlier ratio ({inlier_ratio:.2f}); "
+                        "applying temporal continuity."
+                    )
+                    M = M_prev.copy()
+                else:
+                    M_prev = M.copy()
         else:
-            M = np.float32([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
-            warnings.append("Insufficient tracked background points in frame; fallback to identity alignment.")
+            M = M_prev.copy()
+            warnings.append("Insufficient tracked background points in frame; maintaining prior alignment.")
 
         # Record camera motion translation from M
         camera_shifts_x.append(float(M[0, 2]))

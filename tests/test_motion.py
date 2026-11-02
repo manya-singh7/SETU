@@ -1,21 +1,27 @@
 """
-Tests for subpixel motion tracking and camera jitter cancellation.
+Comprehensive benchmark and verification tests for subpixel motion tracking.
 
 Verifies:
-1. Recovery of injected 3.7 Hz structural vibration within ±0.1 Hz across:
-   - Methods: phase_correlation, lucas_kanade
-   - Conditions: with and without camera jitter
-   - Compression: CRF 18 vs CRF 28
-2. Checks whether CRF compression is active by comparing video file sizes.
-3. Caches generated test videos in tests/.cache/ for fast reruns.
-4. Prints a benchmark table of method x condition x detected frequency.
+1. Cache keys uniquely hashed by every generation parameter (frequency, amplitude,
+   jitter, noise, moving_object, CRF, seed, duration, fps).
+2. Standard vibration conditions:
+   - No jitter (CRF 18, CRF 28)
+   - With 9 Hz camera micro-jitter (CRF 18, CRF 28)
+3. Harder synthetic stress cases:
+   - Low subpixel amplitude (0.05 px)
+   - Close-frequency camera jitter (3.0 Hz component vs 3.7 Hz target)
+   - 2-second background moving object occlusion
+4. Evaluates methods: phase_correlation vs lucas_kanade.
+5. Strict tolerance assertion: |f_detected - 3.70| <= 0.10 Hz.
+6. Prints a complete benchmark table reporting PASS / FAIL status for each condition.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 import pytest
 
 from setu.motion import track_motion
@@ -26,95 +32,151 @@ from tests.synth import generate_synthetic_video
 CACHE_DIR = Path("tests/.cache")
 
 
-def _get_or_create_cached_video(
-    name: str,
-    camera_jitter: bool,
-    crf: int,
-    duration_sec: float = 12.0,
-    fps: float = 60.0,
+def _generate_cache_key(prefix: str, params: Dict[str, Any]) -> str:
+    """Generate a deterministic filename incorporating all generation parameters."""
+    param_str = (
+        f"fps={params.get('fps', 60.0):.1f}_"
+        f"dur={params.get('duration_sec', 10.0):.1f}_"
+        f"f={params.get('freq_hz', 3.7):.2f}_"
+        f"a={params.get('amplitude_px', 0.2):.3f}_"
+        f"jit={int(params.get('camera_jitter', False))}_"
+        f"jfreq={params.get('jitter_tremor_freq', 9.0):.2f}_"
+        f"jamp={params.get('jitter_tremor_amp', 0.08):.3f}_"
+        f"noise={params.get('gaussian_noise_std', 0.0):.2f}_"
+        f"mov={int(params.get('moving_object', False))}_"
+        f"crf={params.get('crf', 23)}_"
+        f"seed={params.get('seed', 42)}"
+    )
+    param_hash = hashlib.sha256(param_str.encode()).hexdigest()[:12]
+    return f"{prefix}_{param_hash}.mp4"
+
+
+def _get_or_create_benchmark_video(
+    prefix: str,
+    params: Dict[str, Any],
 ) -> Tuple[str, Tuple[int, int, int, int], Tuple[int, int, int, int]]:
     """Retrieve existing cached video or generate and save to tests/.cache/."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    video_path = str(CACHE_DIR / f"{name}.mp4")
+    filename = _generate_cache_key(prefix, params)
+    video_path = str(CACHE_DIR / filename)
 
     target_bbox = (270, 90, 100, 280)
     bg_bbox = (40, 360, 120, 80)
 
-    # Check if cached file already exists and is non-empty
     if os.path.exists(video_path) and os.path.getsize(video_path) > 10000:
         return video_path, target_bbox, bg_bbox
 
     res = generate_synthetic_video(
         output_path=video_path,
-        fps=fps,
-        duration_sec=duration_sec,
+        fps=params.get("fps", 60.0),
+        duration_sec=params.get("duration_sec", 10.0),
         width=640,
         height=480,
-        freq_hz=3.7,
-        amplitude_px=0.2,
-        camera_jitter=camera_jitter,
-        crf=crf,
+        freq_hz=params.get("freq_hz", 3.7),
+        amplitude_px=params.get("amplitude_px", 0.2),
+        camera_jitter=params.get("camera_jitter", False),
+        jitter_tremor_freq=params.get("jitter_tremor_freq", 9.0),
+        jitter_tremor_amp=params.get("jitter_tremor_amp", 0.08),
+        gaussian_noise_std=params.get("gaussian_noise_std", 0.0),
+        crf=params.get("crf", 23),
+        moving_object=params.get("moving_object", False),
+        moving_object_start_sec=params.get("moving_object_start_sec", 3.0),
+        moving_object_duration_sec=params.get("moving_object_duration_sec", 2.0),
         target_bbox=target_bbox,
         background_bbox=bg_bbox,
-        seed=42,
+        seed=params.get("seed", 42),
     )
     return res.video_path, res.target_bbox, res.background_bbox
 
 
 @pytest.fixture(scope="session")
-def benchmark_videos() -> Dict[str, Tuple[str, Tuple[int, int, int, int], Tuple[int, int, int, int]]]:
-    """Session fixture creating and caching synthetic test videos across conditions."""
-    videos = {}
-    videos["no_jitter_crf18"] = _get_or_create_cached_video("synth_nojitter_crf18", camera_jitter=False, crf=18)
-    videos["no_jitter_crf28"] = _get_or_create_cached_video("synth_nojitter_crf28", camera_jitter=False, crf=28)
-    videos["with_jitter_crf18"] = _get_or_create_cached_video("synth_jitter_crf18", camera_jitter=True, crf=18)
-    videos["with_jitter_crf28"] = _get_or_create_cached_video("synth_jitter_crf28", camera_jitter=True, crf=28)
-    return videos
+def benchmark_suite() -> Dict[str, Tuple[str, Tuple[int, int, int, int], Tuple[int, int, int, int]]]:
+    """Session fixture creating cached test videos with unique parameter-hashed filenames."""
+    suite = {}
+
+    # 1. Standard Conditions
+    suite["no_jitter_crf18"] = _get_or_create_benchmark_video(
+        "std_nojitter_crf18",
+        {"camera_jitter": False, "crf": 18, "amplitude_px": 0.2, "freq_hz": 3.7},
+    )
+    suite["no_jitter_crf28"] = _get_or_create_benchmark_video(
+        "std_nojitter_crf28",
+        {"camera_jitter": False, "crf": 28, "amplitude_px": 0.2, "freq_hz": 3.7},
+    )
+    suite["with_jitter_crf18"] = _get_or_create_benchmark_video(
+        "std_jitter_crf18",
+        {"camera_jitter": True, "jitter_tremor_freq": 9.0, "crf": 18, "amplitude_px": 0.2, "freq_hz": 3.7},
+    )
+    suite["with_jitter_crf28"] = _get_or_create_benchmark_video(
+        "std_jitter_crf28",
+        {"camera_jitter": True, "jitter_tremor_freq": 9.0, "crf": 28, "amplitude_px": 0.2, "freq_hz": 3.7},
+    )
+
+    # 2. Harder Synthetic Cases
+    suite["hard_low_amplitude"] = _get_or_create_benchmark_video(
+        "hard_low_amp",
+        {"camera_jitter": True, "jitter_tremor_freq": 9.0, "amplitude_px": 0.05, "freq_hz": 3.7, "crf": 18},
+    )
+    suite["hard_close_jitter"] = _get_or_create_benchmark_video(
+        "hard_close_jitter",
+        {"camera_jitter": True, "jitter_tremor_freq": 3.0, "jitter_tremor_amp": 0.12, "amplitude_px": 0.2, "freq_hz": 3.7, "crf": 18},
+    )
+    suite["hard_moving_object"] = _get_or_create_benchmark_video(
+        "hard_moving_obj",
+        {"camera_jitter": True, "jitter_tremor_freq": 9.0, "moving_object": True, "amplitude_px": 0.2, "freq_hz": 3.7, "crf": 18},
+    )
+
+    return suite
 
 
-def test_crf_compression_file_size_check(benchmark_videos):
-    """Check whether CRF 18 and CRF 28 produce different file sizes."""
-    path_crf18, _, _ = benchmark_videos["no_jitter_crf18"]
-    path_crf28, _, _ = benchmark_videos["no_jitter_crf28"]
+def test_crf_compression_file_size_check(benchmark_suite):
+    """Check whether CRF 18 and CRF 28 produce substantially different file sizes."""
+    path_crf18, _, _ = benchmark_suite["no_jitter_crf18"]
+    path_crf28, _, _ = benchmark_suite["no_jitter_crf28"]
 
     size18 = os.path.getsize(path_crf18)
     size28 = os.path.getsize(path_crf28)
     diff = abs(size18 - size28)
+    ratio = (size18 - size28) / max(size18, 1) * 100.0
 
     print("\n--- CRF COMPRESSION CHECK ---")
-    print(f"CRF 18 File Size: {size18:,} bytes")
-    print(f"CRF 28 File Size: {size28:,} bytes")
-    print(f"Size Difference: {diff:,} bytes")
+    print(f"CRF 18 Video File: {os.path.basename(path_crf18)} ({size18:,} bytes)")
+    print(f"CRF 28 Video File: {os.path.basename(path_crf28)} ({size28:,} bytes)")
+    print(f"Size Difference:   {diff:,} bytes ({ratio:.1f}% size reduction with CRF 28)")
 
-    if diff == 0:
-        msg = (
-            "NOTICE: CRF 18 and CRF 28 video files have identical size. "
-            "H.264 CRF compression is NOT being applied by OpenCV because the OpenH264 "
-            "encoder library (openh264-2.5.0-win64.dll) is missing in this environment, "
-            "so OpenCV falls back to standard mp4v container encoding."
-        )
-        print(f"\n{msg}\n")
-    else:
-        print("CONFIRMED: H.264 CRF compression is active and altering file size.\n")
+    assert size18 > size28, (
+        f"CRF 18 ({size18} bytes) must be larger than CRF 28 ({size28} bytes)."
+    )
+    assert diff > 0.20 * size18, (
+        f"CRF 18 and CRF 28 do not differ substantially! Diff: {diff:,} bytes ({ratio:.1f}%)."
+    )
+    print(f"CONFIRMED: Real libx264 CRF compression is active ({diff:,} bytes saved with CRF 28).\n")
 
 
 @pytest.mark.slow
-def test_motion_recovery_matrix(benchmark_videos):
-    """Recover 3.7 Hz within ±0.1 Hz across methods, jitter conditions, and CRFs."""
+def test_motion_recovery_matrix(benchmark_suite):
+    """Run full benchmark matrix across standard and harder cases without loosening tolerance."""
     methods = ["phase_correlation", "lucas_kanade"]
     conditions = [
         ("No Jitter (CRF 18)", "no_jitter_crf18"),
         ("No Jitter (CRF 28)", "no_jitter_crf28"),
         ("With Jitter (CRF 18)", "with_jitter_crf18"),
         ("With Jitter (CRF 28)", "with_jitter_crf28"),
+        ("Hard: Low Amp (0.05 px)", "hard_low_amplitude"),
+        ("Hard: Close Jitter (3.0 Hz)", "hard_close_jitter"),
+        ("Hard: Moving Object (2s)", "hard_moving_object"),
     ]
 
     target_freq = 3.70
+    tolerance = 0.10  # Strict tolerance: |f - 3.70| <= 0.10 Hz
+
     table_rows: List[Dict[str, str]] = []
+    passing_count = 0
+    failing_count = 0
 
     for method in methods:
         for cond_label, cond_key in conditions:
-            vid_path, t_box, b_box = benchmark_videos[cond_key]
+            vid_path, t_box, b_box = benchmark_suite[cond_key]
 
             # 1. Run motion tracking
             motion_res: MotionResult = track_motion(
@@ -124,52 +186,67 @@ def test_motion_recovery_matrix(benchmark_videos):
                 method=method,
             )
 
-            # 2. Extract spectral peaks via setu.spectrum
+            # 2. Extract spectral peaks
             peaks = compute_welch_peaks(motion_res.displacement, fps=motion_res.fps)
-            assert len(peaks) > 0, f"No spectral peaks detected for {method} under {cond_label}"
 
-            top_peak = peaks[0]
-            detected_freq = top_peak.freq_hz
-            freq_error = abs(detected_freq - target_freq)
+            if peaks:
+                top_peak = peaks[0]
+                detected_freq = top_peak.freq_hz
+                freq_error = abs(detected_freq - target_freq)
+                passed = freq_error <= tolerance
+            else:
+                detected_freq = 0.0
+                freq_error = 999.0
+                passed = False
 
-            # 3. Assert recovery within ±0.1 Hz
-            assert freq_error <= 0.10, (
-                f"Method '{method}' under '{cond_label}' recovered {detected_freq:.3f} Hz, "
-                f"which deviates by {freq_error:.3f} Hz (limit: ±0.10 Hz)"
-            )
+            if passed:
+                passing_count += 1
+                status_str = f"PASS (<={tolerance} Hz)"
+            else:
+                failing_count += 1
+                status_str = f"FAIL (>{tolerance} Hz)"
 
-            snr_val = motion_res.quality.get("snr", 0.0)
             res_val = motion_res.quality.get("background_residual_px", 0.0)
+            rel_p_str = f"{top_peak.rel_power * 100:.1f}%" if peaks else "N/A"
+            snr_db_str = f"{top_peak.snr:.1f} dB" if peaks else "N/A"
 
             table_rows.append(
                 {
                     "Method": method,
                     "Condition": cond_label,
                     "Target f0": f"{target_freq:.2f} Hz",
-                    "Detected f0": f"{detected_freq:.3f} Hz",
-                    "Error": f"{freq_error:.4f} Hz",
+                    "Detected f0": f"{detected_freq:.3f} Hz" if peaks else "None",
+                    "Error": f"{freq_error:.4f} Hz" if peaks else "N/A",
                     "Residual": f"{res_val:.4f} px",
-                    "SNR": f"{snr_val:.1f}",
-                    "Status": "PASS (<=0.1 Hz)",
+                    "Rel Power": rel_p_str,
+                    "Peak SNR": snr_db_str,
+                    "Status": status_str,
                 }
             )
 
-    # 4. Print benchmark summary table
-    print("\n" + "=" * 105)
+    # 3. Print Benchmark Table
+    print("\n" + "=" * 130)
     print("SETU MOTION TRACKING & MODAL FREQUENCY RECOVERY BENCHMARK TABLE")
-    print("=" * 105)
+    print("=" * 130)
     header = (
-        f"{'Method':<19} | {'Condition':<22} | {'Target':<10} | {'Detected':<12} | "
-        f"{'Error':<11} | {'Residual':<11} | {'SNR':<8} | {'Status'}"
+        f"{'Method':<19} | {'Condition':<26} | {'Target':<10} | {'Detected':<12} | "
+        f"{'Error':<11} | {'Residual':<11} | {'Rel Power':<10} | {'Peak SNR':<11} | {'Status'}"
     )
     print(header)
-    print("-" * 105)
+    print("-" * 130)
 
     for r in table_rows:
         row_str = (
-            f"{r['Method']:<19} | {r['Condition']:<22} | {r['Target f0']:<10} | {r['Detected f0']:<12} | "
-            f"{r['Error']:<11} | {r['Residual']:<11} | {r['SNR']:<8} | {r['Status']}"
+            f"{r['Method']:<19} | {r['Condition']:<26} | {r['Target f0']:<10} | {r['Detected f0']:<12} | "
+            f"{r['Error']:<11} | {r['Residual']:<11} | {r['Rel Power']:<10} | {r['Peak SNR']:<11} | {r['Status']}"
         )
         print(row_str)
 
-    print("=" * 105 + "\n")
+    print("=" * 130)
+    print(f"Summary: {passing_count} PASSED, {failing_count} FAILED across {len(table_rows)} evaluated runs.")
+    print("=" * 130 + "\n")
+
+    # The standard cases must strictly pass
+    for r in table_rows:
+        if "Hard:" not in r["Condition"]:
+            assert "PASS" in r["Status"], f"Standard case {r['Method']} under {r['Condition']} failed: {r['Error']}"

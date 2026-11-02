@@ -36,6 +36,9 @@ class BudgetExceededError(MetaAPIError):
 INPUT_COST_PER_1K_TOKENS = 0.0005
 OUTPUT_COST_PER_1K_TOKENS = 0.0015
 
+# SAM 3.1 pricing: $2.50 per 1,000 images ($0.0025 per image)
+SAM_COST_PER_IMAGE = 0.0025
+
 
 def get_running_total_cost(usage_path: str = "usage.jsonl") -> float:
     """Read usage.jsonl and calculate the cumulative cost of live calls."""
@@ -76,7 +79,12 @@ class MetaClient:
         self.api_key = api_key or settings.META_API_KEY
         self.base_url = base_url or settings.META_API_BASE_URL
         self.model = model or settings.MUSE_MODEL
-        self.mode = (mode or settings.SETU_META_MODE or "mock").lower()
+        if mode is not None:
+            self.mode = mode.lower()
+        elif "PYTEST_CURRENT_TEST" in os.environ and not os.environ.get("SETU_TEST_REAL_API"):
+            self.mode = "mock"
+        else:
+            self.mode = (settings.SETU_META_MODE or "mock").lower()
         self.budget_cap = budget_cap if budget_cap is not None else settings.SETU_BUDGET_CAP
         self.usage_log_path = usage_log_path or settings.USAGE_LOG_PATH
         self.cache_dir = cache_dir or settings.CACHE_META_DIR
@@ -301,6 +309,150 @@ class MetaClient:
             fixture_name=fixture_name,
             extra_inputs={"image_hash": image_hash, "prompt": prompt},
         )
+
+    def _record_live_sam_usage(self, model: str, images_count: int = 1) -> float:
+        """Log live SAM API image usage to usage.jsonl and print running total."""
+        estimated_cost = round(images_count * SAM_COST_PER_IMAGE, 6)
+        current_total = get_running_total_cost(self.usage_log_path)
+        new_total = round(current_total + estimated_cost, 6)
+
+        log_entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "model": model,
+            "images": images_count,
+            "estimated_cost": estimated_cost,
+        }
+
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.usage_log_path)), exist_ok=True)
+            with open(self.usage_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_entry) + "\n")
+        except Exception as exc:
+            logger.warning(f"Could not write to usage log {self.usage_log_path}: {exc}")
+
+        print(
+            f"[Meta API Usage] Model: {model} | Images: {images_count} | "
+            f"Call: ${estimated_cost:.6f} | Running Total: ${new_total:.6f} / Cap: ${self.budget_cap:.2f}"
+        )
+        return estimated_cost
+
+    def segment_image(
+        self,
+        image_base64: str,
+        prompt: str,
+        model: Optional[str] = None,
+        fixture_name: Optional[str] = "sam_3_1_segment.json",
+    ) -> Dict[str, Any]:
+        """Call Meta Model API SAM 3.1 segmentation endpoint.
+
+        Args:
+            image_base64: Base64-encoded JPEG image string of Frame 0.
+            prompt: Short text prompt (max 32 tokens, e.g. "concrete pillar").
+            model: SAM model identifier (defaults to settings.SAM_MODEL, "sam-3.1").
+            fixture_name: Fixture file name for mock mode.
+
+        Returns:
+            Dictionary containing API response with output_text segmentation grammar.
+        """
+        active_model = model or getattr(settings, "SAM_MODEL", "sam-3.1")
+        prompt_trimmed = " ".join(prompt.strip().split()[:32])
+
+        # MODE 1: MOCK
+        if self.mode == "mock":
+            try:
+                return self._load_fixture(fixture_name or "sam_3_1_segment.json")
+            except FileNotFoundError:
+                return {
+                    "id": "mock-sam-3-1-001",
+                    "object": "response",
+                    "model": active_model,
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "<0f>0<|box;x1=256;y1=168;x2=384;y2=336;w=640;h=480|><|mask;x=256;y=168;data=mock|>",
+                                }
+                            ],
+                        }
+                    ],
+                    "confidence": 0.94,
+                    "_mock_data": True,
+                }
+
+        # Cache key hashing based on model + prompt + image hash
+        image_hash = hashlib.sha256(image_base64.encode("utf-8")).hexdigest()
+        cache_key = self._compute_cache_key(
+            active_model,
+            [{"prompt": prompt_trimmed}],
+            {"image_hash": image_hash},
+        )
+        cache_file = os.path.join(self.cache_dir, f"{cache_key}.json")
+
+        # MODE 2: CACHED
+        if self.mode == "cached" and os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as exc:
+                logger.warning(f"Error reading Meta SAM cache {cache_file}: {exc}")
+
+        # Enforce hard budget cap before live network call
+        current_total = get_running_total_cost(self.usage_log_path)
+        if current_total + SAM_COST_PER_IMAGE > self.budget_cap:
+            raise BudgetExceededError(
+                f"SETU budget cap of ${self.budget_cap:.2f} reached (Current spend: ${current_total:.4f}). "
+                f"Refusing live call."
+            )
+
+        if not self.api_key:
+            raise MetaAPIError("META_API_KEY is not set. Cannot execute live call.")
+
+        url = f"{self.base_url.rstrip('/')}/responses"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "SETU-Civil-Telemetry/0.2.0",
+        }
+        payload = {
+            "model": active_model,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt_trimmed},
+                        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{image_base64}"},
+                    ],
+                }
+            ],
+        }
+
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+            if resp.status_code != 200:
+                raise MetaAPIError(
+                    f"Meta SAM API responded with HTTP {resp.status_code}: {resp.text[:300]}"
+                )
+            data = resp.json()
+        except requests.exceptions.RequestException as exc:
+            raise MetaAPIError(f"Meta SAM API network request failed: {exc}") from exc
+
+        # Log SAM usage ($0.0025 per image)
+        self._record_live_sam_usage(active_model, images_count=1)
+
+        # Cache on disk if in cached mode
+        if self.mode == "cached":
+            try:
+                os.makedirs(self.cache_dir, exist_ok=True)
+                with open(cache_file, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+            except Exception as exc:
+                logger.warning(f"Could not write Meta SAM cache to {cache_file}: {exc}")
+
+        return data
 
 
 _default_client: Optional[MetaClient] = None

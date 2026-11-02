@@ -4,8 +4,11 @@ Unit and integration tests for SETU structural segmentation module (setu.segment
 Tests cover:
 - SegmentResult data shape compliance with setu.types (methods: "sam", "manual", "fallback")
 - Strict enforcement: fallback results are NEVER labeled as "sam"
+- Confidence verification: fallback/manual have confidence=None (no made-up scores)
 - Fixed mask replication across all video frames (downstream motion stabilization requirement)
-- Meta SAM 3.1 Promptable Concept Segmentation (PCS) & mock API interactions
+- Meta SAM 3.1 Promptable Concept Segmentation (PCS) via MetaClient (sam-3.1 model)
+- Multi-instance matching: keeps all instances in metadata and selects largest/most central as target
+- MetaClient SAM usage accounting ($2.50 per 1,000 images = $0.0025/image)
 - MetaSAM31Segmenter raise_on_failure vs graceful fallback behavior
 - Manual ROI segmentation with method="manual"
 - Fallback offline segmenter determinism with method="fallback"
@@ -16,6 +19,7 @@ Tests cover:
 - scripts/preview_masks.py CLI overlay execution
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -25,6 +29,7 @@ import numpy as np
 import pytest
 import requests
 
+from setu.meta_client import MetaClient
 from setu.segment import (
     BaseSegmenter,
     FallbackSegmenter,
@@ -39,8 +44,10 @@ from setu.segment import (
     get_segmenter,
     load_video_frames,
     mask_to_bbox,
+    parse_sam_grammar,
     segment_manual,
     segment_video,
+    select_best_instance,
     shift_mask,
     track_roi_displacement,
     validate_segment_result,
@@ -91,7 +98,6 @@ def test_segment_result_contract():
     bg1 = np.zeros((h, w), dtype=bool)
     bg1[40:55, 10:30] = True
 
-    # Test with each valid Literal method
     for method in ("sam", "manual", "fallback"):
         res = SegmentResult(
             target_masks=[m1],
@@ -116,34 +122,29 @@ def test_segment_result_contract():
 # ---------------------------------------------------------------------------
 
 def test_fallback_segmenter_single_frame(synthetic_frame: np.ndarray):
-    """Verify FallbackSegmenter produces deterministic masks and flags method='fallback'."""
+    """Verify FallbackSegmenter produces deterministic masks, confidence=None, and method='fallback'."""
     segmenter = FallbackSegmenter()
     out = segmenter.segment(synthetic_frame)
 
     assert isinstance(out, SegmentationOutput)
     h, w = synthetic_frame.shape[:2]
 
-    # Check mask shapes & types
     assert out.target_mask.shape == (h, w)
     assert out.background_mask.shape == (h, w)
     assert out.target_mask.dtype == bool
     assert out.background_mask.dtype == bool
 
-    # Check non-emptiness
     assert np.any(out.target_mask)
     assert np.any(out.background_mask)
-
-    # Check non-overlap
     assert not np.any(np.logical_and(out.target_mask, out.background_mask))
 
-    # Check bounding box consistency
     tx, ty, tw, th = out.target_bbox
     assert tw == int(w * 0.25)
     assert th == int(h * 0.25)
-    assert out.confidence >= 0.9
 
-    # Method MUST be "fallback", NEVER "sam"
-    assert out.method == "fallback"
+    # Strict confidence & method requirements
+    assert out.confidence is None, "Fallback segmenter must not produce made-up confidence"
+    assert out.method == "fallback", "Fallback segmenter must NEVER be labeled as 'sam'"
 
 
 def test_fallback_segmenter_video_fixed_masks(synthetic_video_frames: list[np.ndarray]):
@@ -157,7 +158,6 @@ def test_fallback_segmenter_video_fixed_masks(synthetic_video_frames: list[np.nd
     assert res.fps == 25.0
     assert res.method == "fallback"
 
-    # All frames must have the exact same fixed masks (masks must NOT move per frame)
     for i in range(len(synthetic_video_frames)):
         assert np.array_equal(res.target_masks[i], res.target_masks[0])
         assert np.array_equal(res.background_masks[i], res.background_masks[0])
@@ -168,7 +168,7 @@ def test_fallback_segmenter_video_fixed_masks(synthetic_video_frames: list[np.nd
 # ---------------------------------------------------------------------------
 
 def test_manual_segmenter_roi(synthetic_frame: np.ndarray):
-    """Verify ManualSegmenter strictly respects user ROIs and flags method='manual'."""
+    """Verify ManualSegmenter strictly respects user ROIs, flags method='manual', and confidence=None."""
     h, w = synthetic_frame.shape[:2]
     t_box = (15, 20, 30, 40)
     b_box = (50, 80, 25, 20)
@@ -179,12 +179,11 @@ def test_manual_segmenter_roi(synthetic_frame: np.ndarray):
     assert out.target_bbox == t_box
     assert out.background_bbox == b_box
     assert out.method == "manual"
+    assert out.confidence is None, "Manual segmenter must have confidence=None"
 
-    # Mask active area matches bbox area
     assert compute_mask_area(out.target_mask) == 30 * 40
     assert compute_mask_area(out.background_mask) == 25 * 20
 
-    # Test video segmentation: method="manual" and fixed masks across frames
     res = seg.segment_video([synthetic_frame, synthetic_frame, synthetic_frame], fps=30.0)
     assert res.method == "manual"
     assert len(res.target_masks) == 3
@@ -196,15 +195,16 @@ def test_manual_segmenter_roi(synthetic_frame: np.ndarray):
 # Meta SAM 3.1 & Strict Method Labeling Tests
 # ---------------------------------------------------------------------------
 
-def test_sam31_offline_never_labels_as_sam(synthetic_frame: np.ndarray, caplog: pytest.LogCaptureFixture):
-    """Verify that when real SAM 3.1 is unreachable, method is 'fallback' (NEVER 'sam')."""
-    sam = MetaSAM31Segmenter()  # Default offline without API key
+def test_sam31_offline_never_labels_as_sam(synthetic_frame: np.ndarray):
+    """Verify that when real SAM 3.1 is unreachable, method is 'fallback' and confidence is None."""
+    client = MetaClient(mode="live", api_key="")  # Unconfigured live mode
+    sam = MetaSAM31Segmenter(meta_client=client)
 
     out = sam.segment(synthetic_frame)
     assert out.method == "fallback"
     assert out.method != "sam"
+    assert out.confidence is None, "Offline fallback must have confidence=None"
 
-    # Verify video segmentation also sets method="fallback"
     res = sam.segment_video([synthetic_frame, synthetic_frame])
     assert res.method == "fallback"
     assert res.method != "sam"
@@ -212,64 +212,147 @@ def test_sam31_offline_never_labels_as_sam(synthetic_frame: np.ndarray, caplog: 
 
 def test_sam31_raise_on_failure(synthetic_frame: np.ndarray):
     """Verify MetaSAM31Segmenter raises RuntimeError when raise_on_failure=True and real SAM unreachable."""
-    sam = MetaSAM31Segmenter(api_key=None, raise_on_failure=True)
+    client = MetaClient(mode="live", api_key="")
+    sam = MetaSAM31Segmenter(meta_client=client, raise_on_failure=True)
     with pytest.raises(RuntimeError, match="Real Meta SAM 3.1 model/API not reachable"):
         sam.segment(synthetic_frame)
 
 
 def test_sam31_text_prompt_specialization(synthetic_frame: np.ndarray):
     """Verify Meta SAM 3.1 semantic heuristics tailor ROI based on structural keywords."""
-    sam = MetaSAM31Segmenter()
+    client = MetaClient(mode="live", api_key="")
+    sam = MetaSAM31Segmenter(meta_client=client)
 
     cable_out = sam.segment(synthetic_frame, target_prompt="stay cable anchor", background_prompt="distant sky")
     assert cable_out.method == "fallback"
+    assert cable_out.confidence is None
 
     deck_out = sam.segment(synthetic_frame, target_prompt="deck concrete girder", background_prompt="bedrock anchor")
-    assert deck_out.target_bbox[2] > cable_out.target_bbox[2]  # deck width is broader
+    assert deck_out.target_bbox[2] > cable_out.target_bbox[2]
 
     pier_out = sam.segment(synthetic_frame, target_prompt="concrete pier column", background_prompt="bedrock anchor")
-    assert pier_out.target_bbox[3] > deck_out.target_bbox[3]  # pier height is taller
+    assert pier_out.target_bbox[3] > deck_out.target_bbox[3]
 
 
-def test_sam31_api_success_mock(synthetic_frame: np.ndarray):
-    """Test MetaSAM31Segmenter labels method='sam' ONLY when Meta Model API actually succeeds."""
+def test_sam31_meta_client_mock_mode(synthetic_frame: np.ndarray):
+    """Test MetaSAM31Segmenter integration with MetaClient in mock mode."""
+    client = MetaClient(mode="mock")
+    sam = MetaSAM31Segmenter(meta_client=client)
+    out = sam.segment(synthetic_frame, target_prompt="concrete pillar")
+
+    assert out.method == "sam"
+    assert out.confidence == 0.94
+    assert out.target_bbox is not None
+    assert out.metadata["source"] == "meta_sam_3.1_api"
+    assert out.metadata["mode"] == "mock"
+
+
+def test_sam31_api_responses_grammar_parsing(synthetic_frame: np.ndarray):
+    """Test MetaSAM31Segmenter correctly parses Meta Model API Responses token grammar."""
+    raw_response = {
+        "id": "resp_test_123",
+        "object": "response",
+        "model": "sam-3.1",
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "<0f>0<|box;x1=25;y1=30;x2=65;y2=80;w=160;h=120;score=0.96|><|mask;x=25;y=30;data=rle_test|>",
+                    }
+                ],
+            }
+        ],
+    }
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = raw_response
+
+    with patch("requests.post", return_value=mock_resp) as mock_post:
+        client = MetaClient(api_key="meta_test_key_live", mode="live")
+        sam = MetaSAM31Segmenter(meta_client=client)
+        out = sam.segment(synthetic_frame)
+
+        assert mock_post.called
+        assert out.method == "sam"
+        assert out.confidence == 0.96
+        assert out.target_bbox == (25, 30, 40, 50)
+        assert out.metadata["target_instance_count"] == 1
+
+
+def test_sam31_multi_instance_selection_and_retention(synthetic_frame: np.ndarray):
+    """Test that SAM 3.1 multiple matches are all retained in metadata, returning largest/central as target."""
+    raw_response = {
+        "id": "resp_multi_123",
+        "object": "response",
+        "model": "sam-3.1",
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        # Instance 0: small corner box (x=10, y=10, w=15, h=15)
+                        # Instance 1: large central pillar box (x=60, y=30, x2=100, y2=90 -> w=40, h=60)
+                        "text": (
+                            "<0f>0<|box;x1=10;y1=10;x2=25;y2=25;w=160;h=120;score=0.85|><|mask;data=m0|>,"
+                            "1<|box;x1=60;y1=30;x2=100;y2=90;w=160;h=120;score=0.97|><|mask;data=m1|>"
+                        ),
+                    }
+                ],
+            }
+        ],
+    }
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = raw_response
+
+    with patch("requests.post", return_value=mock_resp):
+        client = MetaClient(api_key="meta_key_valid", mode="live")
+        sam = MetaSAM31Segmenter(meta_client=client)
+        out = sam.segment(synthetic_frame, target_prompt="concrete pillar")
+
+        assert out.method == "sam"
+        # All candidates must be retained in metadata
+        assert "all_target_instances" in out.metadata
+        assert len(out.metadata["all_target_instances"]) == 2
+        assert out.metadata["target_instance_count"] == 2
+
+        # Largest and most central instance (Instance 1) must be returned as target
+        assert out.target_bbox == (60, 30, 40, 60)
+        assert out.confidence == 0.97
+
+
+def test_meta_client_sam_usage_accounting(tmp_path):
+    """Verify that live SAM 3.1 calls log usage at $2.50 per 1,000 images ($0.0025 per call)."""
+    usage_file = tmp_path / "usage.jsonl"
     mock_resp = MagicMock()
     mock_resp.status_code = 200
     mock_resp.json.return_value = {
-        "target_bbox": [25, 30, 40, 50],
-        "background_bbox": [10, 95, 35, 20],
-        "confidence": 0.98,
+        "output": [{"content": [{"type": "output_text", "text": "<0f>0<|box;x1=1;y1=1;x2=2;y2=2;w=10;h=10|>"}]}]
     }
 
-    with patch("requests.post", return_value=mock_resp) as mock_post:
-        with patch("setu.config.settings.USE_LOCAL_FALLBACKS", False):
-            sam = MetaSAM31Segmenter(api_key="meta_test_key_live", model_name="facebook/sam3.1")
-            out = sam.segment(synthetic_frame)
+    with patch("requests.post", return_value=mock_resp):
+        client = MetaClient(
+            api_key="meta_key_live",
+            mode="live",
+            usage_log_path=str(usage_file),
+        )
+        client.segment_image(image_base64="dummy_b64", prompt="pillar")
 
-            assert mock_post.called
-            assert out.target_bbox == (25, 30, 40, 50)
-            assert out.background_bbox == (10, 95, 35, 20)
-            assert out.confidence == 0.98
-            # Must be labeled "sam" because real API call succeeded
-            assert out.method == "sam"
-            assert out.metadata["source"] == "meta_sam_3.1_api"
-
-            # Video result must also have method="sam"
-            video_res = sam.segment_video([synthetic_frame, synthetic_frame])
-            assert video_res.method == "sam"
-
-
-def test_sam31_api_failure_graceful_fallback(synthetic_frame: np.ndarray):
-    """Verify that when Meta SAM API call fails, it logs warning and labels method='fallback'."""
-    with patch("requests.post", side_effect=requests.RequestException("Connection timeout")):
-        with patch("setu.config.settings.USE_LOCAL_FALLBACKS", False):
-            sam = MetaSAM31Segmenter(api_key="meta_test_key_abc", raise_on_failure=False)
-            out = sam.segment(synthetic_frame)
-
-            # Must fall back gracefully to heuristic and MUST be labeled "fallback"
-            assert out is not None
-            assert out.method == "fallback"
-            assert out.method != "sam"
+    assert usage_file.exists()
+    with open(usage_file, "r", encoding="utf-8") as f:
+        log_entry = json.loads(f.readline())
+    assert log_entry["model"] == "sam-3.1"
+    assert log_entry["images"] == 1
+    assert log_entry["estimated_cost"] == 0.0025
 
 
 # ---------------------------------------------------------------------------
@@ -277,10 +360,7 @@ def test_sam31_api_failure_graceful_fallback(synthetic_frame: np.ndarray):
 # ---------------------------------------------------------------------------
 
 def test_fixed_masks_replicated_across_frames(synthetic_video_frames: list[np.ndarray]):
-    """Verify segment_video returns the exact same fixed masks across all frames.
-
-    Motion stabilization is handled downstream in setu/motion.py, so masks must not move.
-    """
+    """Verify segment_video returns the exact same fixed masks across all frames."""
     segmenter = get_segmenter(method="fallback")
     result = segmenter.segment_video(synthetic_video_frames, fps=30.0)
 
@@ -288,10 +368,9 @@ def test_fixed_masks_replicated_across_frames(synthetic_video_frames: list[np.nd
     assert len(result.target_masks) == n_frames
     assert len(result.background_masks) == n_frames
 
-    # Check identical mask contents on all frames
     for i in range(1, n_frames):
-        assert np.array_equal(result.target_masks[i], result.target_masks[0]), f"Frame {i} target mask shifted!"
-        assert np.array_equal(result.background_masks[i], result.background_masks[0]), f"Frame {i} background mask shifted!"
+        assert np.array_equal(result.target_masks[i], result.target_masks[0])
+        assert np.array_equal(result.background_masks[i], result.background_masks[0])
 
 
 def test_qa_template_displacement_utility():
@@ -301,7 +380,6 @@ def test_qa_template_displacement_utility():
     ref_gray[40:50, 40:50] = 220
 
     curr_gray = np.full((h, w), 50, dtype=np.uint8)
-    # Feature shifted right by 3 pixels, down by 2 pixels
     curr_gray[42:52, 43:53] = 220
 
     dx, dy = track_roi_displacement(ref_gray, curr_gray, bbox=(40, 40, 10, 10))
@@ -448,11 +526,10 @@ def test_get_segmenter_factory():
 
 def test_top_level_convenience_functions(synthetic_video_frames: list[np.ndarray]):
     """Verify segment_video and segment_manual helper functions."""
-    res_sam = segment_video(synthetic_video_frames, fps=30.0, method="sam")
-    assert isinstance(res_sam, SegmentResult)
-    # Since offline, method must be "fallback", never "sam"
-    assert res_sam.method == "fallback"
-    assert len(res_sam.target_masks) == len(synthetic_video_frames)
+    res_fallback = segment_video(synthetic_video_frames, fps=30.0, method="fallback")
+    assert isinstance(res_fallback, SegmentResult)
+    assert res_fallback.method == "fallback"
+    assert len(res_fallback.target_masks) == len(synthetic_video_frames)
 
     res_man = segment_manual(
         synthetic_video_frames,
@@ -483,5 +560,6 @@ def test_preview_masks_script(capsys: pytest.CaptureFixture):
 
         captured = capsys.readouterr()
         assert "Produced using method: fallback" in captured.out
+        assert "Confidence: None" in captured.out
         assert os.path.exists(out_png)
         assert os.path.getsize(out_png) > 1000

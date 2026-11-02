@@ -6,6 +6,19 @@ Hann windowing, and segment averaging) from a 1D subpixel structural displacemen
 Extracts top dominant frequency peaks as Peak objects with sub-bin quadratic interpolation,
 relative spectral power, and peak-prominence signal-to-noise ratio (SNR), ignoring low-frequency
 drift (< 0.5 Hz).
+
+Spectral Metrics Definitions:
+- Relative Power: Defined as the peak band's integrated power (sum of PSD energy across
+  the peak's main lobe bounded by local minima / troughs or a +/- 0.4 Hz band) divided by
+  the total power in the analysis band (0.5 Hz to Nyquist). For a clean sinusoidal tone,
+  this metric concentrates > 80% of total spectral power in the resonant lobe.
+- Peak SNR (dB): Defined as the peak power spectral density (P_peak) over the median noise
+  floor (P_noise) across the analysis band (0.5 Hz to Nyquist), reported in decibels:
+      SNR_dB = 10 * log10(P_peak / P_noise)
+- Reliability Threshold: Set to 10.0 dB (a 10:1 power ratio over the median noise floor).
+  In ambient vibration testing of civil infrastructure, spectral peaks below 10.0 dB
+  cannot be reliably distinguished from colored 1/f ambient noise, camera jitter residuals,
+  or thermal noise. Peaks below 10.0 dB are flagged as "low confidence".
 """
 
 from __future__ import annotations
@@ -19,6 +32,22 @@ import scipy.signal as signal
 
 from setu.types import Peak
 
+RELIABILITY_THRESHOLD_SNR_DB: float = 10.0
+"""Reliability threshold in decibels (dB) for modal peak detection.
+
+Justification:
+A 10.0 dB peak SNR corresponds to a 10:1 power spectral density ratio relative to
+the median background noise floor. In vision-based civil infrastructure screening,
+ambient wind turbulence, pedestrian footfalls, and camera tripod micro-drift create
+an elevated 1/f noise floor. Peaks with SNR < 10.0 dB risk false identification
+of noise artifacts as structural resonant modes and are flagged as 'low confidence'.
+"""
+
+
+def is_peak_reliable(peak: Peak, threshold_db: float = RELIABILITY_THRESHOLD_SNR_DB) -> bool:
+    """Assess whether a detected peak meets the minimum SNR reliability threshold (default: 10.0 dB)."""
+    return peak.snr >= threshold_db
+
 
 @dataclass
 class SpectrumOutput:
@@ -29,6 +58,8 @@ class SpectrumOutput:
     dominant_peaks: List[Peak]
     fundamental_frequency_hz: Optional[float]
     snr_db: float = 0.0
+    is_reliable: bool = True
+    confidence: str = "high"
 
 
 def compute_welch_peaks(
@@ -41,12 +72,11 @@ def compute_welch_peaks(
 ) -> List[Peak]:
     """Given a 1D displacement signal and fps, compute Welch PSD and extract top peaks.
 
-    Steps:
-    1. Linear detrending to eliminate DC drift and linear camera motion.
-    2. Hann windowing and Welch averaging to suppress spectral leakage.
-    3. Truncate frequency band below min_freq_hz (default 0.5 Hz).
-    4. Detect peaks via prominence, refine frequencies with parabolic peak interpolation.
-    5. Calculate relative power and peak-prominence SNR for the top peaks.
+    Metrics:
+    - Relative power: The peak band's power (integrated over the resonant main lobe) divided
+      by total power in the analysis band (min_freq_hz to Nyquist).
+    - Peak SNR: Peak spectral power density over median noise floor, reported in dB:
+      10 * log10(P_peak / median(P_band)).
 
     Args:
         displacement: 1D array of subpixel structural displacements (in pixels).
@@ -115,8 +145,8 @@ def compute_welch_peaks(
 
     for idx in order:
         k = int(peak_indices[idx])
-        raw_prom = float(prominences[idx])
         peak_psd = float(p_band[k])
+        f0 = float(f_band[k])
 
         # Parabolic interpolation around peak bin for sub-bin frequency accuracy
         if 0 < k < len(p_band) - 1 and p_band[k - 1] > 0 and p_band[k] > 0 and p_band[k + 1] > 0:
@@ -130,14 +160,29 @@ def compute_welch_peaks(
         else:
             f_refined = f_band[k]
 
-        rel_power = peak_psd / total_band_power
-        snr = raw_prom / noise_floor
+        # Calculate peak band power: integrate PSD across peak's main lobe
+        # bounded by local minima / troughs or a maximum half-width of 0.4 Hz
+        left_idx = k
+        while left_idx > 0 and p_band[left_idx - 1] <= p_band[left_idx] and (f0 - f_band[left_idx - 1]) <= 0.4:
+            left_idx -= 1
+
+        right_idx = k
+        while right_idx < len(p_band) - 1 and p_band[right_idx + 1] <= p_band[right_idx] and (f_band[right_idx + 1] - f0) <= 0.4:
+            right_idx += 1
+
+        peak_band_power = float(np.sum(p_band[left_idx : right_idx + 1]))
+        rel_power = peak_band_power / total_band_power
+        rel_power = float(np.clip(rel_power, 0.0, 1.0))
+
+        # Peak SNR in dB: 10 * log10(P_peak / P_noise_median)
+        snr_ratio = max(peak_psd, 1e-12) / max(noise_floor, 1e-12)
+        snr_db = 10.0 * np.log10(snr_ratio)
 
         peaks.append(
             Peak(
                 freq_hz=float(round(f_refined, 4)),
                 rel_power=float(round(rel_power, 6)),
-                snr=float(round(snr, 2)),
+                snr=float(round(snr_db, 2)),
             )
         )
 
@@ -177,12 +222,16 @@ class WelchSpectrumAnalyzer:
         )
         fund_hz = peaks[0].freq_hz if peaks else None
         snr_val = peaks[0].snr if peaks else 0.0
+        reliable = bool(peaks and is_peak_reliable(peaks[0]))
+        conf = "high" if reliable else "low confidence"
         return SpectrumOutput(
             frequencies_hz=freqs,
             psd=psd,
             dominant_peaks=peaks,
             fundamental_frequency_hz=fund_hz,
             snr_db=snr_val,
+            is_reliable=reliable,
+            confidence=conf,
         )
 
     def analyze(self, signal_arr: npt.NDArray[np.float64]) -> List[Peak]:

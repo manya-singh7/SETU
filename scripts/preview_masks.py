@@ -158,6 +158,12 @@ def main() -> int:
         help="Path to input video file (.mp4, .mov, etc.). If omitted, uses synthetic bridge benchmark frame.",
     )
     parser.add_argument(
+        "--image",
+        type=str,
+        default=None,
+        help="Path to input still image (.jpg, .jpeg, .png). Takes precedence over --video.",
+    )
+    parser.add_argument(
         "--target-prompt",
         type=str,
         default="corner of concrete pillar",
@@ -197,16 +203,17 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    # Load video or fallback to synthetic frame
-    if args.video and os.path.exists(args.video):
-        print(f"Loading video: {args.video}")
-        frames, fps = load_video_frames(args.video, max_frames=1)
+    # Load image/video or fallback to synthetic frame
+    media_path = args.image or args.video
+    if media_path and os.path.exists(media_path):
+        print(f"Loading input media: {media_path}")
+        frames, fps = load_video_frames(media_path, max_frames=1)
         frame0 = frames[0]
     else:
-        if args.video:
-            print(f"Warning: Video '{args.video}' not found. Generating synthetic bridge test frame.")
+        if media_path:
+            print(f"Warning: Media file '{media_path}' not found. Generating synthetic bridge test frame.")
         else:
-            print("No video specified. Using synthetic civil infrastructure benchmark frame.")
+            print("No video or image specified. Using synthetic civil infrastructure benchmark frame.")
         frame0 = generate_synthetic_bridge_frame()
 
     # Parse manual bboxes if supplied
@@ -229,9 +236,12 @@ def main() -> int:
 
     # Print which method produced the result
     print(f"Produced using method: {output.method}")
-    print(f"  Confidence: {output.confidence:.2f}")
+    conf_str = f"{output.confidence:.2f}" if output.confidence is not None else "None"
+    print(f"  Confidence: {conf_str}")
     print(f"  Target BBox: {output.target_bbox} (Active pixels: {compute_mask_area(output.target_mask)})")
     print(f"  Background BBox: {output.background_bbox} (Active pixels: {compute_mask_area(output.background_mask)})")
+    if "all_target_instances" in output.metadata and len(output.metadata["all_target_instances"]) > 1:
+        print(f"  Total target candidates matched: {len(output.metadata['all_target_instances'])} (Selected largest/central)")
     if "fallback_reason" in output.metadata:
         print(f"  Fallback note: {output.metadata['fallback_reason']}")
 

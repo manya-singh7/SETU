@@ -18,7 +18,9 @@ class Settings(BaseSettings):
     META_API_BASE_URL: str = "https://api.meta.ai/v1"
     MUSE_MODEL: str = "muse-spark-1.3"
     MUSE_MODEL_NAME: Optional[str] = None
-    SAM_MODEL_NAME: str = "facebook/sam3.1"
+    SAM_MODEL: str = "sam-3.1"
+    SAM_MODEL_NAME: str = "sam-3.1"
+    SAM_COST_PER_IMAGE: float = 0.0025  # $2.50 per 1,000 images
 
     # Meta Execution Mode & Budget Safety
     SETU_META_MODE: str = "mock"  # "mock" | "cached" | "live"
@@ -51,12 +53,17 @@ class Settings(BaseSettings):
     )
 
     @model_validator(mode="after")
-    def sync_muse_model(self) -> "Settings":
-        """Keep MUSE_MODEL and legacy MUSE_MODEL_NAME in sync."""
+    def sync_models(self) -> "Settings":
+        """Keep model aliases in sync."""
         if self.MUSE_MODEL_NAME and not self.MUSE_MODEL:
             self.MUSE_MODEL = self.MUSE_MODEL_NAME
         elif self.MUSE_MODEL and not self.MUSE_MODEL_NAME:
             self.MUSE_MODEL_NAME = self.MUSE_MODEL
+
+        if self.SAM_MODEL_NAME and not self.SAM_MODEL:
+            self.SAM_MODEL = self.SAM_MODEL_NAME
+        elif self.SAM_MODEL and not self.SAM_MODEL_NAME:
+            self.SAM_MODEL_NAME = self.SAM_MODEL
         return self
 
     @property
