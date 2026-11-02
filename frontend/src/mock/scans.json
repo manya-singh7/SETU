@@ -1,0 +1,426 @@
+[
+  {
+    "id": "scan-chn-001",
+    "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
+    "bridge_name": "Napier Bridge",
+    "city": "Chennai",
+    "lat": 13.0674,
+    "lon": 80.2848,
+    "timestamp": "2026-10-28T09:30:00Z",
+    "peaks": [
+      { "freq_hz": 2.45, "rel_power": 1.0, "snr": 18.2 },
+      { "freq_hz": 4.90, "rel_power": 0.35, "snr": 9.4 },
+      { "freq_hz": 7.35, "rel_power": 0.12, "snr": 5.1 }
+    ],
+    "quality": {
+      "background_residual_px": 0.08,
+      "snr": 16.5,
+      "warnings": ["Slight wind buffeting in initial 5 seconds"]
+    },
+    "assessment": {
+      "severity": "medium",
+      "reasons": [
+        "12.5% downward frequency shift relative to historical baseline (2.80 Hz)",
+        "Second harmonic peak broadening observed at 4.90 Hz"
+      ],
+      "confidence": 0.88,
+      "data_quality_issues": [],
+      "recommended_action": "Schedule engineer structural review; check bearing pad seatings and pier expansion joints."
+    },
+    "video_url": "",
+    "magnified_url": "",
+    "history": [
+      { "timestamp": "2026-05-10T08:00:00Z", "freq_hz": 2.82 },
+      { "timestamp": "2026-07-14T10:15:00Z", "freq_hz": 2.78 },
+      { "timestamp": "2026-09-02T14:40:00Z", "freq_hz": 2.65 },
+      { "timestamp": "2026-10-28T09:30:00Z", "freq_hz": 2.45 }
+    ]
+  },
+  {
+    "id": "scan-chn-002",
+    "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
+    "bridge_name": "Kathipara Flyover",
+    "city": "Chennai",
+    "lat": 13.0067,
+    "lon": 80.2018,
+    "timestamp": "2026-10-25T14:15:00Z",
+    "peaks": [
+      { "freq_hz": 3.15, "rel_power": 0.95, "snr": 22.4 },
+      { "freq_hz": 6.30, "rel_power": 0.28, "snr": 11.2 }
+    ],
+    "quality": {
+      "background_residual_px": 0.05,
+      "snr": 21.0,
+      "warnings": []
+    },
+    "assessment": {
+      "severity": "low",
+      "reasons": [
+        "Minor 3.8% modal frequency variance within expected thermal diurnal envelope"
+      ],
+      "confidence": 0.94,
+      "data_quality_issues": [],
+      "recommended_action": "Log baseline telemetry; continue quarterly routine mobile monitoring."
+    },
+    "video_url": "",
+    "magnified_url": "",
+    "history": [
+      { "timestamp": "2026-04-12T11:00:00Z", "freq_hz": 3.25 },
+      { "timestamp": "2026-07-20T16:30:00Z", "freq_hz": 3.22 },
+      { "timestamp": "2026-10-25T14:15:00Z", "freq_hz": 3.15 }
+    ]
+  },
+  {
+    "id": "scan-chn-003",
+    "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
+    "bridge_name": "Anna Flyover (Gemini)",
+    "city": "Chennai",
+    "lat": 13.0519,
+    "lon": 80.2505,
+    "timestamp": "2026-10-29T11:00:00Z",
+    "peaks": [
+      { "freq_hz": 4.10, "rel_power": 1.0, "snr": 25.1 },
+      { "freq_hz": 8.20, "rel_power": 0.22, "snr": 13.0 }
+    ],
+    "quality": {
+      "background_residual_px": 0.03,
+      "snr": 24.5,
+      "warnings": []
+    },
+    "assessment": {
+      "severity": "none",
+      "reasons": [
+        "Fundamental natural frequency matches nominal design baseline perfectly (4.10 Hz)",
+        "Clean single-mode resonance with high SNR"
+      ],
+      "confidence": 0.97,
+      "data_quality_issues": [],
+      "recommended_action": "No anomalous vibration characteristics observed. Re-scan per standard annual schedule."
+    },
+    "video_url": "",
+    "magnified_url": "",
+    "history": [
+      { "timestamp": "2026-03-05T09:30:00Z", "freq_hz": 4.12 },
+      { "timestamp": "2026-06-18T10:00:00Z", "freq_hz": 4.11 },
+      { "timestamp": "2026-10-29T11:00:00Z", "freq_hz": 4.10 }
+    ]
+  },
+  {
+    "id": "scan-chn-004",
+    "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
+    "bridge_name": "Perambur Loco Flyover",
+    "city": "Chennai",
+    "lat": 13.1098,
+    "lon": 80.2335,
+    "timestamp": "2026-10-18T16:45:00Z",
+    "peaks": [
+      { "freq_hz": 1.62, "rel_power": 1.0, "snr": 14.8 },
+      { "freq_hz": 3.25, "rel_power": 0.65, "snr": 8.7 },
+      { "freq_hz": 5.10, "rel_power": 0.40, "snr": 6.2 }
+    ],
+    "quality": {
+      "background_residual_px": 0.12,
+      "snr": 13.5,
+      "warnings": ["Intermittent high-traffic ground vibrations"]
+    },
+    "assessment": {
+      "severity": "high",
+      "reasons": [
+        "Significant 24% fundamental frequency reduction (nominal 2.15 Hz -> 1.62 Hz)",
+        "Multiple asymmetric split peaks indicating potential loss of torsional stiffness"
+      ],
+      "confidence": 0.91,
+      "data_quality_issues": ["Vehicle transit induced slight camera tremor"],
+      "recommended_action": "PRIORITY INSPECTION: Deploy certified structural engineer for immediate visual inspection of girders and rocker bearings."
+    },
+    "video_url": "",
+    "magnified_url": "",
+    "history": [
+      { "timestamp": "2026-01-15T14:00:00Z", "freq_hz": 2.14 },
+      { "timestamp": "2026-05-22T15:30:00Z", "freq_hz": 1.95 },
+      { "timestamp": "2026-08-11T12:00:00Z", "freq_hz": 1.78 },
+      { "timestamp": "2026-10-18T16:45:00Z", "freq_hz": 1.62 }
+    ]
+  },
+  {
+    "id": "scan-chn-005",
+    "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
+    "bridge_name": "Puzhal Canal Bridge",
+    "city": "Chennai",
+    "lat": 13.1582,
+    "lon": 80.1983,
+    "timestamp": "2026-10-12T10:20:00Z",
+    "peaks": [
+      { "freq_hz": 3.80, "rel_power": 0.88, "snr": 19.3 },
+      { "freq_hz": 7.60, "rel_power": 0.19, "snr": 7.5 }
+    ],
+    "quality": {
+      "background_residual_px": 0.04,
+      "snr": 18.0,
+      "warnings": []
+    },
+    "assessment": {
+      "severity": "low",
+      "reasons": [
+        "Marginal frequency attenuation (-4.5%) correlated with heavy monsoon water table loading"
+      ],
+      "confidence": 0.89,
+      "data_quality_issues": [],
+      "recommended_action": "Continue automated logging. Re-examine post-monsoon season."
+    },
+    "video_url": "",
+    "magnified_url": "",
+    "history": [
+      { "timestamp": "2026-02-10T10:00:00Z", "freq_hz": 4.02 },
+      { "timestamp": "2026-06-15T11:30:00Z", "freq_hz": 3.95 },
+      { "timestamp": "2026-10-12T10:20:00Z", "freq_hz": 3.80 }
+    ]
+  },
+  {
+    "id": "scan-chn-006",
+    "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
+    "bridge_name": "Maraimalai Adigal Bridge",
+    "city": "Chennai",
+    "lat": 13.0163,
+    "lon": 80.2227,
+    "timestamp": "2026-10-22T08:45:00Z",
+    "peaks": [
+      { "freq_hz": 2.10, "rel_power": 1.0, "snr": 17.5 },
+      { "freq_hz": 4.25, "rel_power": 0.42, "snr": 10.1 }
+    ],
+    "quality": {
+      "background_residual_px": 0.09,
+      "snr": 15.2,
+      "warnings": ["Moderate morning mist partially reducing pixel contrast"]
+    },
+    "assessment": {
+      "severity": "medium",
+      "reasons": [
+        "Damping ratio higher than historical normal (estimated 3.8% vs 2.1%)",
+        "Consistent downward trend across 3 consecutive scans"
+      ],
+      "confidence": 0.85,
+      "data_quality_issues": ["Atmospheric haze slight attenuation"],
+      "recommended_action": "Engineer on-site check recommended for concrete sub-structure spalling near waterline."
+    },
+    "video_url": "",
+    "magnified_url": "",
+    "history": [
+      { "timestamp": "2026-03-18T09:00:00Z", "freq_hz": 2.40 },
+      { "timestamp": "2026-07-04T10:15:00Z", "freq_hz": 2.25 },
+      { "timestamp": "2026-10-22T08:45:00Z", "freq_hz": 2.10 }
+    ]
+  },
+  {
+    "id": "scan-mum-001",
+    "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
+    "bridge_name": "Bandra-Worli Sea Link",
+    "city": "Mumbai",
+    "lat": 19.0368,
+    "lon": 72.8172,
+    "timestamp": "2026-10-30T17:10:00Z",
+    "peaks": [
+      { "freq_hz": 0.38, "rel_power": 1.0, "snr": 28.4 },
+      { "freq_hz": 0.76, "rel_power": 0.52, "snr": 19.8 },
+      { "freq_hz": 1.15, "rel_power": 0.31, "snr": 14.2 }
+    ],
+    "quality": {
+      "background_residual_px": 0.04,
+      "snr": 26.0,
+      "warnings": []
+    },
+    "assessment": {
+      "severity": "none",
+      "reasons": [
+        "Cable stay fundamental and sway modes coincide with finite-element baseline model (0.38 Hz)",
+        "Symmetric harmonic decay characteristic of healthy post-tensioned stays"
+      ],
+      "confidence": 0.98,
+      "data_quality_issues": [],
+      "recommended_action": "Normal baseline confirmed. Next scheduled scan in 6 months."
+    },
+    "video_url": "",
+    "magnified_url": "",
+    "history": [
+      { "timestamp": "2026-02-14T11:00:00Z", "freq_hz": 0.39 },
+      { "timestamp": "2026-06-25T15:00:00Z", "freq_hz": 0.38 },
+      { "timestamp": "2026-10-30T17:10:00Z", "freq_hz": 0.38 }
+    ]
+  },
+  {
+    "id": "scan-mum-002",
+    "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
+    "bridge_name": "Vashi Bridge (Thane Creek 1)",
+    "city": "Mumbai",
+    "lat": 19.0628,
+    "lon": 72.9739,
+    "timestamp": "2026-10-15T12:00:00Z",
+    "peaks": [
+      { "freq_hz": 1.35, "rel_power": 1.0, "snr": 15.0 },
+      { "freq_hz": 2.70, "rel_power": 0.72, "snr": 9.5 }
+    ],
+    "quality": {
+      "background_residual_px": 0.11,
+      "snr": 14.0,
+      "warnings": ["Marine atmospheric turbulence near water surface"]
+    },
+    "assessment": {
+      "severity": "high",
+      "reasons": [
+        "28% drop in fundamental bending frequency over 12 months (1.88 Hz -> 1.35 Hz)",
+        "Marine tidal corrosion risk factor flagged on prestressed box girders"
+      ],
+      "confidence": 0.92,
+      "data_quality_issues": [],
+      "recommended_action": "URGENT ENGINEER REVIEW: Flag for underwater pier NDT inspection and prestress cable integrity audit."
+    },
+    "video_url": "",
+    "magnified_url": "",
+    "history": [
+      { "timestamp": "2025-10-10T10:00:00Z", "freq_hz": 1.88 },
+      { "timestamp": "2026-03-20T11:30:00Z", "freq_hz": 1.65 },
+      { "timestamp": "2026-07-18T14:00:00Z", "freq_hz": 1.48 },
+      { "timestamp": "2026-10-15T12:00:00Z", "freq_hz": 1.35 }
+    ]
+  },
+  {
+    "id": "scan-mum-003",
+    "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
+    "bridge_name": "Airoli Bridge",
+    "city": "Mumbai",
+    "lat": 19.1558,
+    "lon": 72.9836,
+    "timestamp": "2026-10-26T15:30:00Z",
+    "peaks": [
+      { "freq_hz": 2.85, "rel_power": 0.92, "snr": 20.8 },
+      { "freq_hz": 5.70, "rel_power": 0.30, "snr": 12.0 }
+    ],
+    "quality": {
+      "background_residual_px": 0.05,
+      "snr": 19.8,
+      "warnings": []
+    },
+    "assessment": {
+      "severity": "low",
+      "reasons": [
+        "Slight stiffness fluctuation (+2.5%) attributable to recent bridge deck resurfacing"
+      ],
+      "confidence": 0.93,
+      "data_quality_issues": [],
+      "recommended_action": "Record updated post-maintenance baseline; routine follow-up."
+    },
+    "video_url": "",
+    "magnified_url": "",
+    "history": [
+      { "timestamp": "2026-01-20T09:00:00Z", "freq_hz": 2.76 },
+      { "timestamp": "2026-06-10T14:00:00Z", "freq_hz": 2.78 },
+      { "timestamp": "2026-10-26T15:30:00Z", "freq_hz": 2.85 }
+    ]
+  },
+  {
+    "id": "scan-mum-004",
+    "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
+    "bridge_name": "Currey Road ROB",
+    "city": "Mumbai",
+    "lat": 18.9950,
+    "lon": 72.8318,
+    "timestamp": "2026-10-20T13:40:00Z",
+    "peaks": [
+      { "freq_hz": 3.40, "rel_power": 1.0, "snr": 16.8 },
+      { "freq_hz": 6.85, "rel_power": 0.45, "snr": 8.9 }
+    ],
+    "quality": {
+      "background_residual_px": 0.07,
+      "snr": 16.2,
+      "warnings": ["Occasional railway EMU vibration harmonics"]
+    },
+    "assessment": {
+      "severity": "medium",
+      "reasons": [
+        "11% shift in fundamental vibration mode (3.85 Hz down to 3.40 Hz)",
+        "Aging steel truss structure with rivet fatigue risk"
+      ],
+      "confidence": 0.86,
+      "data_quality_issues": [],
+      "recommended_action": "Engineer visual inspection of bottom chords and gusset plates recommended."
+    },
+    "video_url": "",
+    "magnified_url": "",
+    "history": [
+      { "timestamp": "2026-02-01T10:00:00Z", "freq_hz": 3.85 },
+      { "timestamp": "2026-05-18T12:00:00Z", "freq_hz": 3.65 },
+      { "timestamp": "2026-10-20T13:40:00Z", "freq_hz": 3.40 }
+    ]
+  },
+  {
+    "id": "scan-mum-005",
+    "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
+    "bridge_name": "Elphinstone Road / Prabhadevi ROB",
+    "city": "Mumbai",
+    "lat": 19.0060,
+    "lon": 72.8340,
+    "timestamp": "2026-10-10T09:15:00Z",
+    "peaks": [
+      { "freq_hz": 1.90, "rel_power": 1.0, "snr": 13.9 },
+      { "freq_hz": 3.75, "rel_power": 0.58, "snr": 8.1 }
+    ],
+    "quality": {
+      "background_residual_px": 0.14,
+      "snr": 12.8,
+      "warnings": ["High pedestrian transit motion noise"]
+    },
+    "assessment": {
+      "severity": "high",
+      "reasons": [
+        "22% frequency drop below historic norm (2.45 Hz -> 1.90 Hz)",
+        "Notable peak broadening indicating elevated damping / structural loosening"
+      ],
+      "confidence": 0.90,
+      "data_quality_issues": ["Crowd movement induced low-frequency baseline noise"],
+      "recommended_action": "URGENT INSPECTION: Schedule immediate railway civil engineering survey of steel support trestles."
+    },
+    "video_url": "",
+    "magnified_url": "",
+    "history": [
+      { "timestamp": "2025-11-05T08:30:00Z", "freq_hz": 2.45 },
+      { "timestamp": "2026-04-14T11:00:00Z", "freq_hz": 2.20 },
+      { "timestamp": "2026-07-29T16:00:00Z", "freq_hz": 2.05 },
+      { "timestamp": "2026-10-10T09:15:00Z", "freq_hz": 1.90 }
+    ]
+  },
+  {
+    "id": "scan-mum-006",
+    "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
+    "bridge_name": "Sion Railway Overbridge",
+    "city": "Mumbai",
+    "lat": 19.0384,
+    "lon": 72.8624,
+    "timestamp": "2026-10-31T14:50:00Z",
+    "peaks": [
+      { "freq_hz": 2.95, "rel_power": 1.0, "snr": 23.5 },
+      { "freq_hz": 5.90, "rel_power": 0.25, "snr": 11.8 }
+    ],
+    "quality": {
+      "background_residual_px": 0.04,
+      "snr": 22.1,
+      "warnings": []
+    },
+    "assessment": {
+      "severity": "none",
+      "reasons": [
+        "Vibration dynamics completely stable and conforming to historic range (2.95 Hz vs 2.98 Hz)",
+        "High quality background ego-motion cancellation"
+      ],
+      "confidence": 0.96,
+      "data_quality_issues": [],
+      "recommended_action": "Telemetry within acceptable operational parameters. Next scan per regular cycle."
+    },
+    "video_url": "",
+    "magnified_url": "",
+    "history": [
+      { "timestamp": "2026-03-22T10:00:00Z", "freq_hz": 2.98 },
+      { "timestamp": "2026-07-12T13:30:00Z", "freq_hz": 2.96 },
+      { "timestamp": "2026-10-31T14:50:00Z", "freq_hz": 2.95 }
+    ]
+  }
+]
