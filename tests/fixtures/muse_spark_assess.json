@@ -1,0 +1,12 @@
+{
+  "severity": "medium",
+  "reasons": [
+    "Observed fundamental frequency of 1.62 Hz is 24% lower than historic baseline of 2.15 Hz",
+    "Harmonic peak asymmetry detected at 3.25 Hz indicating potential loss of torsional stiffness"
+  ],
+  "expected_range_hz": [1.90, 2.30],
+  "confidence": "high",
+  "data_quality_issues": [],
+  "recommended_action": "Schedule physical on-site civil engineer inspection of rocker bearings and main girder bottom chords.",
+  "assessor": "muse_spark"
+}

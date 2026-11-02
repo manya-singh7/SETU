@@ -6,6 +6,7 @@ Adheres strictly to the principle: no secrets in code.
 """
 
 from typing import List, Optional
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,8 +16,15 @@ class Settings(BaseSettings):
     # Meta Model API (SAM 3.1 & Muse Spark 1.3)
     META_API_KEY: Optional[str] = None
     META_API_BASE_URL: str = "https://api.meta.ai/v1"
-    MUSE_MODEL_NAME: str = "muse-spark-1.3"
+    MUSE_MODEL: str = "muse-spark-1.3"
+    MUSE_MODEL_NAME: Optional[str] = None
     SAM_MODEL_NAME: str = "facebook/sam3.1"
+
+    # Meta Execution Mode & Budget Safety
+    SETU_META_MODE: str = "mock"  # "mock" | "cached" | "live"
+    SETU_BUDGET_CAP: float = 50.0  # Hard budget limit in USD
+    USAGE_LOG_PATH: str = "usage.jsonl"
+    CACHE_META_DIR: str = "cache/meta"
 
     # Execution Mode: allow offline/local fallback during hackathon
     USE_LOCAL_FALLBACKS: bool = True
@@ -41,6 +49,15 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    @model_validator(mode="after")
+    def sync_muse_model(self) -> "Settings":
+        """Keep MUSE_MODEL and legacy MUSE_MODEL_NAME in sync."""
+        if self.MUSE_MODEL_NAME and not self.MUSE_MODEL:
+            self.MUSE_MODEL = self.MUSE_MODEL_NAME
+        elif self.MUSE_MODEL and not self.MUSE_MODEL_NAME:
+            self.MUSE_MODEL_NAME = self.MUSE_MODEL
+        return self
 
     @property
     def cors_origin_list(self) -> List[str]:

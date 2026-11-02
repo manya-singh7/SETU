@@ -2,7 +2,9 @@
   {
     "id": "scan-chn-001",
     "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
-    "bridge_name": "Napier Bridge",
+    "is_sample_data": true,
+    "magnification_factor": "50x",
+    "bridge_name": "Sample Bridge A - Chennai (Sample data)",
     "city": "Chennai",
     "lat": 13.0674,
     "lon": 80.2848,
@@ -20,10 +22,10 @@
     "assessment": {
       "severity": "medium",
       "reasons": [
-        "12.5% downward frequency shift relative to historical baseline (2.80 Hz)",
-        "Second harmonic peak broadening observed at 4.90 Hz"
+        "EVM 50x magnification reveals 12.5% downward frequency shift relative to baseline (2.80 Hz)",
+        "Second harmonic peak broadening observed at 4.90 Hz (Sample data)"
       ],
-      "confidence": 0.88,
+      "confidence": "high",
       "data_quality_issues": [],
       "recommended_action": "Schedule engineer structural review; check bearing pad seatings and pier expansion joints."
     },
@@ -39,7 +41,9 @@
   {
     "id": "scan-chn-002",
     "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
-    "bridge_name": "Kathipara Flyover",
+    "is_sample_data": true,
+    "magnification_factor": "50x",
+    "bridge_name": "Sample Bridge B - Chennai (Sample data)",
     "city": "Chennai",
     "lat": 13.0067,
     "lon": 80.2018,
@@ -56,9 +60,9 @@
     "assessment": {
       "severity": "low",
       "reasons": [
-        "Minor 3.8% modal frequency variance within expected thermal diurnal envelope"
+        "EVM 50x motion analysis: Minor 3.8% modal variance within thermal diurnal envelope (Sample data)"
       ],
-      "confidence": 0.94,
+      "confidence": "high",
       "data_quality_issues": [],
       "recommended_action": "Log baseline telemetry; continue quarterly routine mobile monitoring."
     },
@@ -73,7 +77,9 @@
   {
     "id": "scan-chn-003",
     "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
-    "bridge_name": "Anna Flyover (Gemini)",
+    "is_sample_data": true,
+    "magnification_factor": "50x",
+    "bridge_name": "Sample Bridge C - Chennai (Sample data)",
     "city": "Chennai",
     "lat": 13.0519,
     "lon": 80.2505,
@@ -90,10 +96,10 @@
     "assessment": {
       "severity": "none",
       "reasons": [
-        "Fundamental natural frequency matches nominal design baseline perfectly (4.10 Hz)",
-        "Clean single-mode resonance with high SNR"
+        "EVM 50x motion tracking shows fundamental natural frequency matches design baseline (4.10 Hz)",
+        "Clean single-mode resonance with high SNR (Sample data)"
       ],
-      "confidence": 0.97,
+      "confidence": "high",
       "data_quality_issues": [],
       "recommended_action": "No anomalous vibration characteristics observed. Re-scan per standard annual schedule."
     },
@@ -108,7 +114,9 @@
   {
     "id": "scan-chn-004",
     "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
-    "bridge_name": "Perambur Loco Flyover",
+    "is_sample_data": true,
+    "magnification_factor": "50x",
+    "bridge_name": "Sample Bridge D - Chennai (Sample data)",
     "city": "Chennai",
     "lat": 13.1098,
     "lon": 80.2335,
@@ -126,10 +134,10 @@
     "assessment": {
       "severity": "high",
       "reasons": [
-        "Significant 24% fundamental frequency reduction (nominal 2.15 Hz -> 1.62 Hz)",
-        "Multiple asymmetric split peaks indicating potential loss of torsional stiffness"
+        "EVM 50x magnification confirms 24% fundamental frequency reduction (2.15 Hz -> 1.62 Hz)",
+        "Multiple asymmetric split peaks indicating potential loss of torsional stiffness (Sample data)"
       ],
-      "confidence": 0.91,
+      "confidence": "high",
       "data_quality_issues": ["Vehicle transit induced slight camera tremor"],
       "recommended_action": "PRIORITY INSPECTION: Deploy certified structural engineer for immediate visual inspection of girders and rocker bearings."
     },
@@ -145,7 +153,9 @@
   {
     "id": "scan-chn-005",
     "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
-    "bridge_name": "Puzhal Canal Bridge",
+    "is_sample_data": true,
+    "magnification_factor": "50x",
+    "bridge_name": "Sample Bridge E - Chennai (Sample data)",
     "city": "Chennai",
     "lat": 13.1582,
     "lon": 80.1983,
@@ -162,9 +172,9 @@
     "assessment": {
       "severity": "low",
       "reasons": [
-        "Marginal frequency attenuation (-4.5%) correlated with heavy monsoon water table loading"
+        "EVM 50x analysis: Marginal frequency attenuation (-4.5%) correlated with heavy water table loading (Sample data)"
       ],
-      "confidence": 0.89,
+      "confidence": "medium",
       "data_quality_issues": [],
       "recommended_action": "Continue automated logging. Re-examine post-monsoon season."
     },
@@ -179,7 +189,9 @@
   {
     "id": "scan-chn-006",
     "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
-    "bridge_name": "Maraimalai Adigal Bridge",
+    "is_sample_data": true,
+    "magnification_factor": "50x",
+    "bridge_name": "Sample Bridge F - Chennai (Sample data)",
     "city": "Chennai",
     "lat": 13.0163,
     "lon": 80.2227,
@@ -196,10 +208,10 @@
     "assessment": {
       "severity": "medium",
       "reasons": [
-        "Damping ratio higher than historical normal (estimated 3.8% vs 2.1%)",
-        "Consistent downward trend across 3 consecutive scans"
+        "EVM 50x magnification: Damping ratio higher than normal (estimated 3.8% vs 2.1%)",
+        "Consistent downward trend across 3 consecutive scans (Sample data)"
       ],
-      "confidence": 0.85,
+      "confidence": "medium",
       "data_quality_issues": ["Atmospheric haze slight attenuation"],
       "recommended_action": "Engineer on-site check recommended for concrete sub-structure spalling near waterline."
     },
@@ -214,7 +226,9 @@
   {
     "id": "scan-mum-001",
     "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
-    "bridge_name": "Bandra-Worli Sea Link",
+    "is_sample_data": true,
+    "magnification_factor": "50x",
+    "bridge_name": "Sample Bridge G - Mumbai (Sample data)",
     "city": "Mumbai",
     "lat": 19.0368,
     "lon": 72.8172,
@@ -232,10 +246,10 @@
     "assessment": {
       "severity": "none",
       "reasons": [
-        "Cable stay fundamental and sway modes coincide with finite-element baseline model (0.38 Hz)",
-        "Symmetric harmonic decay characteristic of healthy post-tensioned stays"
+        "EVM 50x stay cable sway analysis coincides with baseline model (0.38 Hz)",
+        "Symmetric harmonic decay characteristic of healthy stay tension (Sample data)"
       ],
-      "confidence": 0.98,
+      "confidence": "high",
       "data_quality_issues": [],
       "recommended_action": "Normal baseline confirmed. Next scheduled scan in 6 months."
     },
@@ -250,7 +264,9 @@
   {
     "id": "scan-mum-002",
     "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
-    "bridge_name": "Vashi Bridge (Thane Creek 1)",
+    "is_sample_data": true,
+    "magnification_factor": "50x",
+    "bridge_name": "Sample Bridge H - Mumbai (Sample data)",
     "city": "Mumbai",
     "lat": 19.0628,
     "lon": 72.9739,
@@ -267,10 +283,10 @@
     "assessment": {
       "severity": "high",
       "reasons": [
-        "28% drop in fundamental bending frequency over 12 months (1.88 Hz -> 1.35 Hz)",
-        "Marine tidal corrosion risk factor flagged on prestressed box girders"
+        "EVM 50x magnification detects 28% drop in fundamental bending frequency (1.88 Hz -> 1.35 Hz)",
+        "Marine tidal corrosion risk factor flagged on prestressed box girders (Sample data)"
       ],
-      "confidence": 0.92,
+      "confidence": "high",
       "data_quality_issues": [],
       "recommended_action": "URGENT ENGINEER REVIEW: Flag for underwater pier NDT inspection and prestress cable integrity audit."
     },
@@ -286,7 +302,9 @@
   {
     "id": "scan-mum-003",
     "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
-    "bridge_name": "Airoli Bridge",
+    "is_sample_data": true,
+    "magnification_factor": "50x",
+    "bridge_name": "Sample Bridge I - Mumbai (Sample data)",
     "city": "Mumbai",
     "lat": 19.1558,
     "lon": 72.9836,
@@ -303,9 +321,9 @@
     "assessment": {
       "severity": "low",
       "reasons": [
-        "Slight stiffness fluctuation (+2.5%) attributable to recent bridge deck resurfacing"
+        "EVM 50x tracking: Slight stiffness fluctuation (+2.5%) attributable to recent bridge deck resurfacing (Sample data)"
       ],
-      "confidence": 0.93,
+      "confidence": "high",
       "data_quality_issues": [],
       "recommended_action": "Record updated post-maintenance baseline; routine follow-up."
     },
@@ -320,7 +338,9 @@
   {
     "id": "scan-mum-004",
     "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
-    "bridge_name": "Currey Road ROB",
+    "is_sample_data": true,
+    "magnification_factor": "50x",
+    "bridge_name": "Sample Bridge J - Mumbai (Sample data)",
     "city": "Mumbai",
     "lat": 18.9950,
     "lon": 72.8318,
@@ -337,10 +357,10 @@
     "assessment": {
       "severity": "medium",
       "reasons": [
-        "11% shift in fundamental vibration mode (3.85 Hz down to 3.40 Hz)",
-        "Aging steel truss structure with rivet fatigue risk"
+        "EVM 50x magnification shows 11% shift in fundamental vibration mode (3.85 Hz down to 3.40 Hz)",
+        "Aging steel truss structure with rivet fatigue risk (Sample data)"
       ],
-      "confidence": 0.86,
+      "confidence": "medium",
       "data_quality_issues": [],
       "recommended_action": "Engineer visual inspection of bottom chords and gusset plates recommended."
     },
@@ -355,7 +375,9 @@
   {
     "id": "scan-mum-005",
     "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
-    "bridge_name": "Elphinstone Road / Prabhadevi ROB",
+    "is_sample_data": true,
+    "magnification_factor": "50x",
+    "bridge_name": "Sample Bridge K - Mumbai (Sample data)",
     "city": "Mumbai",
     "lat": 19.0060,
     "lon": 72.8340,
@@ -372,10 +394,10 @@
     "assessment": {
       "severity": "high",
       "reasons": [
-        "22% frequency drop below historic norm (2.45 Hz -> 1.90 Hz)",
-        "Notable peak broadening indicating elevated damping / structural loosening"
+        "EVM 50x magnification reveals 22% frequency drop below historic norm (2.45 Hz -> 1.90 Hz)",
+        "Notable peak broadening indicating elevated damping / structural loosening (Sample data)"
       ],
-      "confidence": 0.90,
+      "confidence": "high",
       "data_quality_issues": ["Crowd movement induced low-frequency baseline noise"],
       "recommended_action": "URGENT INSPECTION: Schedule immediate railway civil engineering survey of steel support trestles."
     },
@@ -391,7 +413,9 @@
   {
     "id": "scan-mum-006",
     "_sample_data_notice": "SAMPLE BENCHMARK DATASET - FOR OFFLINE DEVELOPMENT & DEMONSTRATION ONLY",
-    "bridge_name": "Sion Railway Overbridge",
+    "is_sample_data": true,
+    "magnification_factor": "50x",
+    "bridge_name": "Sample Bridge L - Mumbai (Sample data)",
     "city": "Mumbai",
     "lat": 19.0384,
     "lon": 72.8624,
@@ -408,10 +432,10 @@
     "assessment": {
       "severity": "none",
       "reasons": [
-        "Vibration dynamics completely stable and conforming to historic range (2.95 Hz vs 2.98 Hz)",
-        "High quality background ego-motion cancellation"
+        "EVM 50x deflection tracking confirms vibration dynamics stable (2.95 Hz vs 2.98 Hz)",
+        "High quality background ego-motion cancellation (Sample data)"
       ],
-      "confidence": 0.96,
+      "confidence": "high",
       "data_quality_issues": [],
       "recommended_action": "Telemetry within acceptable operational parameters. Next scan per regular cycle."
     },
