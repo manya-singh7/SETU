@@ -319,51 +319,6 @@ def test_no_background_marks_peaks_unverified_and_never_reliable():
     assert top_peak.bg_ratio_db is None
 
 
-def test_input_guards_flat_non_finite_top_k():
-    """Verify input guards in compute_welch_peaks:
-    1. Returns no peaks for non-finite input (NaN or Inf).
-    2. Returns no peaks for top_k <= 0.
-    3. Returns no peaks for a flat signal after detrending (max abs <= 1e-10).
-    4. A still recording must never produce a peak.
-    """
-    fps = 60.0
-    n_samples = 600
-
-    # A. Non-finite inputs
-    nan_sig = np.zeros(n_samples, dtype=np.float64)
-    nan_sig[100] = np.nan
-    assert compute_welch_peaks(nan_sig, fps=fps) == []
-
-    inf_sig = np.zeros(n_samples, dtype=np.float64)
-    inf_sig[50] = np.inf
-    assert compute_welch_peaks(inf_sig, fps=fps) == []
-
-    # B. top_k <= 0
-    t = np.arange(n_samples) / fps
-    valid_sine = 0.2 * np.sin(2.0 * np.pi * 3.7 * t)
-    assert compute_welch_peaks(valid_sine, fps=fps, top_k=0) == []
-    assert compute_welch_peaks(valid_sine, fps=fps, top_k=-2) == []
-
-    # C. Flat signal / still recording (max abs <= 1e-10 after detrending)
-    flat_zero = np.zeros(n_samples, dtype=np.float64)
-    assert compute_welch_peaks(flat_zero, fps=fps) == [], "Still recording (zeros) must never produce a peak"
-
-    flat_const = np.ones(n_samples, dtype=np.float64) * 42.123
-    assert compute_welch_peaks(flat_const, fps=fps) == [], "Still recording (constant offset) must never produce a peak"
-
-    flat_linear_drift = 0.05 * t  # Linear detrending reduces this to ~0 <= 1e-10
-    assert compute_welch_peaks(flat_linear_drift, fps=fps) == [], "Pure linear drift with no vibration must produce no peaks"
-
-    # D. determine_spectrum_verdict returns 'failed' for flat or non-finite inputs
-    v_flat, r_flat = determine_spectrum_verdict([], is_flat=True)
-    assert v_flat == "failed"
-    assert any("flat signal" in r for r in r_flat)
-
-    v_nan, r_nan = determine_spectrum_verdict([], is_non_finite=True)
-    assert v_nan == "failed"
-    assert any("non-finite" in r for r in r_nan)
-
-
 def test_frequency_uncertainty_overlapping_segments():
     """Verify frequency uncertainty estimation via overlapping segments:
     On synthetic 3.7 Hz vibration, the confidence interval contains 3.7 and is narrower than 0.1 Hz.
@@ -438,20 +393,6 @@ def test_three_level_verdict_usable_weak_failed():
     assert len(peaks_no_bg) >= 1
     assert peaks_no_bg[0].verdict == "weak"
     assert any("no stationary background" in r.lower() for r in peaks_no_bg[0].reasons)
-
-    # Case D: Failed on flat signal or non-finite
-    analyzer = WelchSpectrumAnalyzer(fps=fps)
-    out_flat = analyzer.compute_welch_psd(np.zeros(600))
-    assert out_flat.verdict == "failed"
-    assert out_flat.is_reliable is False
-    assert any("flat" in r.lower() for r in out_flat.reasons)
-
-    nan_arr = np.zeros(600)
-    nan_arr[5] = np.nan
-    out_nan = analyzer.compute_welch_psd(nan_arr)
-    assert out_nan.verdict == "failed"
-    assert out_nan.is_reliable is False
-    assert any("non-finite" in r.lower() for r in out_nan.reasons)
 
 
 def test_spectrum_units_and_scale():

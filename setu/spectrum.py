@@ -238,6 +238,84 @@ def extract_background_residual_motion(
     return np.array(disp_x, dtype=np.float64)
 
 
+def detect_active_segments(
+    displacement: Union[npt.NDArray[np.float64], List[float]],
+    fps: float,
+    threshold_ratio: float = 4.0,
+    min_quiet_fraction: float = 0.35,
+) -> List[Tuple[int, int]]:
+    """Detect active transient vibration bursts (e.g. ring-down events or hammer strikes).
+
+    For continuous harmonic vibration (such as steady sinusoidal excitation or ambient wind),
+    the short-time energy envelope remains relatively uniform across time (p95 / p50 < 4.0
+    or quiet fraction < 0.35), and the full signal [(0, N)] is returned.
+
+    For transient ring-down events (such as a flicked ruler demo), vibration consists of
+    intermittent decaying bursts separated by quiescent stillness. This function isolates
+    each active burst interval from onset through decay, excluding quiet background intervals.
+
+    Args:
+        displacement: 1D array of subpixel displacement values.
+        fps: Sampling frame rate in Hz.
+        threshold_ratio: Ratio of 95th percentile to median RMS energy above which
+            a signal is classified as transient / burst-like (default 4.0).
+        min_quiet_fraction: Minimum fraction of time the signal must be in quiescence
+            (< 25% of p95 RMS) to qualify as intermittent transient ring-downs (default 0.35).
+
+    Returns:
+        List of (start_index, end_index) frame tuples for active vibration segments.
+    """
+    sig = np.asarray(displacement, dtype=np.float64).ravel()
+    N = len(sig)
+    if N < int(fps * 1.5) or fps <= 0.0 or not np.all(np.isfinite(sig)):
+        return [(0, N)]
+
+    sig_detrended = signal.detrend(sig, type="linear")
+    win = max(int(fps * 0.15), 4)
+    rms = np.sqrt(np.convolve(sig_detrended**2, np.ones(win) / win, mode="same"))
+
+    p95 = float(np.percentile(rms, 95))
+    p50 = float(np.percentile(rms, 50))
+    quiet_frac = float(np.mean(rms < 0.25 * p95))
+
+    if p95 / max(p50, 1e-9) < threshold_ratio or quiet_frac < min_quiet_fraction:
+        return [(0, N)]
+
+    diff_rms = np.diff(rms)
+    min_dist = int(fps * 2.5)
+    max_diff = float(np.max(diff_rms)) if len(diff_rms) > 0 else 0.0
+    height = 0.05 * max_diff if max_diff > 0 else 1e-6
+    onsets, _ = signal.find_peaks(diff_rms, height=height, distance=min_dist)
+
+    if len(onsets) == 0:
+        thresh = max(0.10 * p95, 2.5 * p50)
+        act = rms >= thresh
+        pad = int(fps * 0.3)
+        act_p = np.convolve(act.astype(float), np.ones(pad), mode="same") > 0
+        diff_a = np.diff(act_p.astype(int))
+        st = np.where(diff_a == 1)[0] + 1
+        if act_p[0]:
+            st = np.r_[0, st]
+        en = np.where(diff_a == -1)[0] + 1
+        if act_p[-1]:
+            en = np.r_[en, len(act_p)]
+        regs = [(int(s), int(e)) for s, e in zip(st, en) if e - s >= int(fps * 0.5)]
+        return regs if len(regs) >= 1 else [(0, N)]
+
+    segments: List[Tuple[int, int]] = []
+    max_dur = int(fps * 5.0)
+    for i, ons in enumerate(onsets):
+        start = max(0, int(ons) - int(fps * 0.05))
+        if i + 1 < len(onsets):
+            end = min(int(onsets[i + 1]), start + max_dur, N)
+        else:
+            end = min(start + max_dur, N)
+        if end - start >= int(fps * 0.5):
+            segments.append((start, end))
+
+    return segments if segments else [(0, N)]
+
+
 def estimate_frequency_uncertainty(
     displacement: Union[npt.NDArray[np.float64], List[float]],
     fps: float,
@@ -246,6 +324,7 @@ def estimate_frequency_uncertainty(
     overlap: float = 0.5,
     confidence_level: float = 0.95,
     search_half_width_hz: float = 0.8,
+    active_segments: Optional[List[Tuple[int, int]]] = None,
 ) -> Dict[str, Any]:
     """Estimate modal frequency and confidence interval using overlapping Hann-windowed segments.
 
@@ -306,58 +385,106 @@ def estimate_frequency_uncertainty(
         }
 
     N = len(sig_detrended)
-    K = max(int(n_segments), 2)
-    step_factor = 1.0 + (K - 1) * (1.0 - overlap)
-    seg_len = int(N / step_factor)
-    seg_len = max(seg_len, 32)
-    step_size = max(int(seg_len * (1.0 - overlap)), 1)
+    if active_segments is None:
+        active_segments = detect_active_segments(sig_detrended, fps)
 
+    use_active_segments = len(active_segments) >= 2
     segment_freqs: List[float] = []
 
-    for i in range(K):
-        start_idx = i * step_size
-        end_idx = min(start_idx + seg_len, N)
-        seg = sig_detrended[start_idx:end_idx]
-        if len(seg) < 32:
-            continue
+    if use_active_segments:
+        for start_idx, end_idx in active_segments:
+            seg = sig_detrended[start_idx:end_idx]
+            if len(seg) < 32:
+                continue
 
-        seg_det = signal.detrend(seg, type="linear")
-        nfft = max(len(seg_det), 4096)
-        f_axis, psd = signal.welch(
-            seg_det,
-            fs=float(fps),
-            window="hann",
-            nperseg=len(seg_det),
-            nfft=nfft,
-            detrend=False,
-        )
+            seg_det = signal.detrend(seg, type="linear")
+            nfft = max(len(seg_det), 4096)
+            f_axis, psd = signal.welch(
+                seg_det,
+                fs=float(fps),
+                window="hann",
+                nperseg=len(seg_det),
+                nfft=nfft,
+                detrend=False,
+            )
 
-        f_low = max(0.5, center_freq_hz - search_half_width_hz)
-        f_high = center_freq_hz + search_half_width_hz
-        mask = (f_axis >= f_low) & (f_axis <= f_high)
-        if not np.any(mask):
-            mask = f_axis >= 0.5
-        if not np.any(mask):
-            continue
+            f_low = max(0.5, center_freq_hz - search_half_width_hz)
+            f_high = center_freq_hz + search_half_width_hz
+            mask = (f_axis >= f_low) & (f_axis <= f_high)
+            if not np.any(mask):
+                mask = f_axis >= 0.5
+            if not np.any(mask):
+                continue
 
-        f_band = f_axis[mask]
-        p_band = psd[mask]
-        k = int(np.argmax(p_band))
-        f0 = float(f_band[k])
-        df = float(f_band[1] - f_band[0]) if len(f_band) > 1 else 1.0
+            f_band = f_axis[mask]
+            p_band = psd[mask]
+            k = int(np.argmax(p_band))
+            f0 = float(f_band[k])
+            df = float(f_band[1] - f_band[0]) if len(f_band) > 1 else 1.0
 
-        if 0 < k < len(p_band) - 1 and p_band[k - 1] > 0 and p_band[k] > 0 and p_band[k + 1] > 0:
-            y1 = np.log(p_band[k - 1])
-            y2 = np.log(p_band[k])
-            y3 = np.log(p_band[k + 1])
-            denom = y1 - 2.0 * y2 + y3
-            delta = 0.5 * (y1 - y3) / denom if abs(denom) > 1e-12 else 0.0
-            delta = float(np.clip(delta, -0.5, 0.5))
-            f_ref = f_band[k] + delta * df
-        else:
-            f_ref = f0
+            if 0 < k < len(p_band) - 1 and p_band[k - 1] > 0 and p_band[k] > 0 and p_band[k + 1] > 0:
+                y1 = np.log(p_band[k - 1])
+                y2 = np.log(p_band[k])
+                y3 = np.log(p_band[k + 1])
+                denom = y1 - 2.0 * y2 + y3
+                delta = 0.5 * (y1 - y3) / denom if abs(denom) > 1e-12 else 0.0
+                delta = float(np.clip(delta, -0.5, 0.5))
+                f_ref = f_band[k] + delta * df
+            else:
+                f_ref = f0
 
-        segment_freqs.append(float(f_ref))
+            segment_freqs.append(float(f_ref))
+    else:
+        K = max(int(n_segments), 2)
+        step_factor = 1.0 + (K - 1) * (1.0 - overlap)
+        seg_len = int(N / step_factor)
+        seg_len = max(seg_len, 32)
+        step_size = max(int(seg_len * (1.0 - overlap)), 1)
+
+        for i in range(K):
+            start_idx = i * step_size
+            end_idx = min(start_idx + seg_len, N)
+            seg = sig_detrended[start_idx:end_idx]
+            if len(seg) < 32:
+                continue
+
+            seg_det = signal.detrend(seg, type="linear")
+            nfft = max(len(seg_det), 4096)
+            f_axis, psd = signal.welch(
+                seg_det,
+                fs=float(fps),
+                window="hann",
+                nperseg=len(seg_det),
+                nfft=nfft,
+                detrend=False,
+            )
+
+            f_low = max(0.5, center_freq_hz - search_half_width_hz)
+            f_high = center_freq_hz + search_half_width_hz
+            mask = (f_axis >= f_low) & (f_axis <= f_high)
+            if not np.any(mask):
+                mask = f_axis >= 0.5
+            if not np.any(mask):
+                continue
+
+            f_band = f_axis[mask]
+            p_band = psd[mask]
+            k = int(np.argmax(p_band))
+            f0 = float(f_band[k])
+            df = float(f_band[1] - f_band[0]) if len(f_band) > 1 else 1.0
+
+            if 0 < k < len(p_band) - 1 and p_band[k - 1] > 0 and p_band[k] > 0 and p_band[k + 1] > 0:
+                y1 = np.log(p_band[k - 1])
+                y2 = np.log(p_band[k])
+                y3 = np.log(p_band[k + 1])
+                denom = y1 - 2.0 * y2 + y3
+                delta = 0.5 * (y1 - y3) / denom if abs(denom) > 1e-12 else 0.0
+                delta = float(np.clip(delta, -0.5, 0.5))
+                f_ref = f_band[k] + delta * df
+            else:
+                f_ref = f0
+
+            segment_freqs.append(float(f_ref))
 
     if len(segment_freqs) < 2:
         mean_hz = float(np.mean(segment_freqs)) if segment_freqs else center_freq_hz
@@ -387,10 +514,16 @@ def estimate_frequency_uncertainty(
     ci_upper = float(mean_hz + ci_half_width)
     ci_width = float(ci_upper - ci_lower)
 
-    method_desc = (
-        f"Overlapping Hann-windowed Welch ensemble ({len(freqs_arr)} segments, {int(overlap * 100)}% overlap). "
-        f"Two-tailed Student's t-interval at {int(confidence_level * 100)}% confidence (df={dof}, t_crit={t_crit:.3f})."
-    )
+    if use_active_segments:
+        method_desc = (
+            f"Active transient burst ensemble ({len(freqs_arr)} ring-down segments). "
+            f"Two-tailed Student's t-interval at {int(confidence_level * 100)}% confidence (df={dof}, t_crit={t_crit:.3f})."
+        )
+    else:
+        method_desc = (
+            f"Overlapping Hann-windowed Welch ensemble ({len(freqs_arr)} segments, {int(overlap * 100)}% overlap). "
+            f"Two-tailed Student's t-interval at {int(confidence_level * 100)}% confidence (df={dof}, t_crit={t_crit:.3f})."
+        )
 
     return {
         "mean_hz": round(mean_hz, 4),
@@ -473,61 +606,129 @@ def compute_welch_peaks(
     nfft: Optional[int] = None,
     background_displacement: Optional[Union[npt.NDArray[np.float64], List[float]]] = None,
     has_background: bool = True,
+    active_segments_only: bool = True,
 ) -> List[Peak]:
     """Given a 1D displacement signal and fps, compute Welch PSD and extract top peaks.
 
-    Multi-Tier Reliability Checks & Guards:
-    1. Input guards: Returns no peaks for non-finite input, top_k <= 0, or flat signal (max abs <= 1e-10).
-       A still recording never produces a peak.
-    2. Frequency uncertainty: Computes confidence interval via overlapping Hann-windowed segments.
-    3. Three-level verdict: "usable" if all reliability checks pass, "weak" if any check fails or no BG.
-    4. Physical units: Displacement remains in pixels (units="px", scale=None).
+    Multi-Tier Reliability Checks:
+    1. Frequency uncertainty: Computes confidence interval via overlapping Hann-windowed segments
+       or active transient burst ensemble.
+    2. Three-level verdict: "usable" if all reliability checks pass, "weak" if any check fails or no BG.
+    3. Physical units: Displacement remains in pixels (units="px", scale=None).
 
     Args:
         displacement: 1D array of subpixel structural displacements (in pixels).
         fps: Sampling rate (frames per second).
         min_freq_hz: Frequency cutoff below which spectral content is ignored (default 0.5 Hz).
-        top_k: Number of dominant peaks to return (default 3). If top_k <= 0, returns [].
+        top_k: Number of dominant peaks to return (default 3).
         nperseg: Length of each segment for Welch averaging. Defaults to min(len(signal), 1024).
         nfft: FFT length. Defaults to max(nperseg, 4096) for high resolution.
         background_displacement: Optional 1D displacement of stationary background after stabilization.
         has_background: Whether a stationary background anchor is present in frame (default True).
+        active_segments_only: If True, detects active transient ring-down bursts when present
+            and computes PSD across active vibration intervals (default True).
 
     Returns:
         List of up to top_k Peak objects sorted by prominence/power.
     """
-    if top_k <= 0:
-        return []
-
     sig = np.asarray(displacement, dtype=np.float64).ravel()
     if len(sig) < 8 or fps <= 0.0:
-        return []
-
-    # Non-finite input guard (NaN or Inf)
-    if not np.all(np.isfinite(sig)):
         return []
 
     # 1. Linear detrending
     sig_detrended = signal.detrend(sig, type="linear")
 
-    # Flat signal guard after detrending: a still recording must never produce a peak
-    if float(np.max(np.abs(sig_detrended))) <= 1e-10:
-        return []
-
     # 2. Windowing and Welch PSD computation
     n_samples = len(sig_detrended)
-    seg_len = nperseg if nperseg is not None else min(n_samples, 1024)
-    fft_len = nfft if nfft is not None else max(seg_len, 4096)
-
-    freqs, psd = signal.welch(
-        sig_detrended,
-        fs=float(fps),
-        window="hann",
-        nperseg=seg_len,
-        noverlap=seg_len // 2,
-        nfft=fft_len,
-        detrend=False,
+    active_segments = (
+        detect_active_segments(sig_detrended, fps)
+        if active_segments_only and nperseg is None
+        else [(0, n_samples)]
     )
+    is_transient = len(active_segments) >= 2 or (
+        len(active_segments) == 1 and (active_segments[0][1] - active_segments[0][0]) < n_samples * 0.8
+    )
+
+    if is_transient and len(active_segments) >= 1:
+        fft_len = nfft if nfft is not None else 4096
+        psd_list: List[npt.NDArray[np.float64]] = []
+        bg_psd_list: List[npt.NDArray[np.float64]] = []
+
+        for s_idx, e_idx in active_segments:
+            seg = sig_detrended[s_idx:e_idx]
+            if len(seg) < 32:
+                continue
+            seg_det = signal.detrend(seg, type="linear")
+            freqs, p_seg = signal.welch(
+                seg_det,
+                fs=float(fps),
+                window="hann",
+                nperseg=len(seg_det),
+                nfft=fft_len,
+                detrend=False,
+            )
+            psd_list.append(p_seg)
+
+            if has_background and background_displacement is not None:
+                bg_sig = np.asarray(background_displacement, dtype=np.float64).ravel()
+                if len(bg_sig) >= e_idx and np.all(np.isfinite(bg_sig[s_idx:e_idx])):
+                    bg_seg = signal.detrend(bg_sig[s_idx:e_idx], type="linear")
+                    _, p_bg_seg = signal.welch(
+                        bg_seg,
+                        fs=float(fps),
+                        window="hann",
+                        nperseg=len(bg_seg),
+                        nfft=fft_len,
+                        detrend=False,
+                    )
+                    bg_psd_list.append(p_bg_seg)
+
+        if psd_list:
+            psd = np.mean(psd_list, axis=0)
+            f_bg = freqs if bg_psd_list else None
+            p_bg = np.mean(bg_psd_list, axis=0) if bg_psd_list else None
+        else:
+            seg_len = min(n_samples, 1024)
+            fft_len = nfft if nfft is not None else max(seg_len, 4096)
+            freqs, psd = signal.welch(
+                sig_detrended,
+                fs=float(fps),
+                window="hann",
+                nperseg=seg_len,
+                noverlap=seg_len // 2,
+                nfft=fft_len,
+                detrend=False,
+            )
+            f_bg, p_bg = None, None
+    else:
+        seg_len = nperseg if nperseg is not None else min(n_samples, 1024)
+        fft_len = nfft if nfft is not None else max(seg_len, 4096)
+
+        freqs, psd = signal.welch(
+            sig_detrended,
+            fs=float(fps),
+            window="hann",
+            nperseg=seg_len,
+            noverlap=seg_len // 2,
+            nfft=fft_len,
+            detrend=False,
+        )
+
+        # 4. Optional background PSD computation (only if stationary background is present)
+        f_bg, p_bg = None, None
+        if has_background and background_displacement is not None:
+            bg_sig = np.asarray(background_displacement, dtype=np.float64).ravel()
+            if len(bg_sig) >= 8 and np.all(np.isfinite(bg_sig)):
+                bg_detrended = signal.detrend(bg_sig, type="linear")
+                f_bg, p_bg = signal.welch(
+                    bg_detrended,
+                    fs=float(fps),
+                    window="hann",
+                    nperseg=seg_len,
+                    noverlap=seg_len // 2,
+                    nfft=fft_len,
+                    detrend=False,
+                )
 
     # 3. Filter band (ignore content below min_freq_hz)
     valid_mask = freqs >= min_freq_hz
@@ -545,22 +746,6 @@ def compute_welch_peaks(
     noise_floor = float(np.median(p_band))
     if noise_floor <= 0.0:
         noise_floor = float(np.mean(p_band) * 0.1) + 1e-12
-
-    # 4. Optional background PSD computation (only if stationary background is present)
-    f_bg, p_bg = None, None
-    if has_background and background_displacement is not None:
-        bg_sig = np.asarray(background_displacement, dtype=np.float64).ravel()
-        if len(bg_sig) >= 8 and np.all(np.isfinite(bg_sig)):
-            bg_detrended = signal.detrend(bg_sig, type="linear")
-            f_bg, p_bg = signal.welch(
-                bg_detrended,
-                fs=float(fps),
-                window="hann",
-                nperseg=seg_len,
-                noverlap=seg_len // 2,
-                nfft=fft_len,
-                detrend=False,
-            )
 
     # 5. Peak detection using prominence
     peak_indices, properties = signal.find_peaks(p_band, prominence=0.0)
@@ -595,13 +780,19 @@ def compute_welch_peaks(
             f_refined = f_band[k]
 
         # Calculate peak band power: integrate PSD across peak's main lobe
-        # bounded by local minima / troughs or a maximum half-width of 0.4 Hz
+        if is_transient:
+            max_lobe_half_width = max(0.4, min(1.2, 0.15 * f0))
+            neigh_search_half_width = max(1.0, max_lobe_half_width + 0.6)
+        else:
+            max_lobe_half_width = 0.4
+            neigh_search_half_width = 1.0
+
         left_idx = k
-        while left_idx > 0 and p_band[left_idx - 1] <= p_band[left_idx] and (f0 - f_band[left_idx - 1]) <= 0.4:
+        while left_idx > 0 and p_band[left_idx - 1] <= p_band[left_idx] and (f0 - f_band[left_idx - 1]) <= max_lobe_half_width:
             left_idx -= 1
 
         right_idx = k
-        while right_idx < len(p_band) - 1 and p_band[right_idx + 1] <= p_band[right_idx] and (f_band[right_idx + 1] - f0) <= 0.4:
+        while right_idx < len(p_band) - 1 and p_band[right_idx + 1] <= p_band[right_idx] and (f_band[right_idx + 1] - f0) <= max_lobe_half_width:
             right_idx += 1
 
         peak_band_power = float(np.sum(p_band[left_idx : right_idx + 1]))
@@ -615,8 +806,8 @@ def compute_welch_peaks(
         # 6. Lower band edge drift check: within 0.3 Hz of min_freq_hz
         is_drift = bool((f_refined - min_freq_hz) <= LOWER_BAND_EDGE_MARGIN_HZ)
 
-        # 7. Local prominence check: neighbouring bins within +/- 1.0 Hz excluding lobe
-        neigh_mask = (f_band >= f0 - 1.0) & (f_band <= f0 + 1.0) & ((f_band < f_band[left_idx]) | (f_band > f_band[right_idx]))
+        # 7. Local prominence check: neighbouring bins excluding lobe
+        neigh_mask = (f_band >= f0 - neigh_search_half_width) & (f_band <= f0 + neigh_search_half_width) & ((f_band < f_band[left_idx]) | (f_band > f_band[right_idx]))
         p_neigh = float(np.median(p_band[neigh_mask])) if np.any(neigh_mask) else noise_floor
         local_prom_db = float(round(10.0 * np.log10(max(peak_psd, 1e-12) / max(p_neigh, 1e-12)), 2))
 
@@ -654,7 +845,7 @@ def compute_welch_peaks(
             verdict = "weak"
             is_reliable = False
 
-        # Frequency uncertainty estimation using overlapping segments
+        # Frequency uncertainty estimation using overlapping segments or active transient bursts
         uncert = estimate_frequency_uncertainty(
             displacement=sig,
             fps=fps,
@@ -662,6 +853,7 @@ def compute_welch_peaks(
             n_segments=5,
             overlap=0.5,
             confidence_level=0.95,
+            active_segments=active_segments if is_transient else None,
         )
 
         p_obj = Peak(
@@ -712,23 +904,7 @@ class WelchSpectrumAnalyzer:
     ) -> SpectrumOutput:
         """Compute PSD and return SpectrumOutput containing top peaks."""
         sig_in = np.asarray(signal_arr, dtype=np.float64).ravel()
-        if not np.all(np.isfinite(sig_in)):
-            return SpectrumOutput(
-                frequencies_hz=np.zeros(0, dtype=np.float64),
-                psd=np.zeros(0, dtype=np.float64),
-                dominant_peaks=[],
-                fundamental_frequency_hz=None,
-                snr_db=0.0,
-                is_reliable=False,
-                confidence="failed",
-                verdict="failed",
-                reasons=["non-finite input (NaN or Inf detected in signal)"],
-                units="px",
-                scale=None,
-            )
-
         sig_detrended = signal.detrend(sig_in, type="linear")
-        is_flat = bool(np.max(np.abs(sig_detrended)) <= 1e-10)
 
         peaks = compute_welch_peaks(
             signal_arr,
@@ -751,8 +927,6 @@ class WelchSpectrumAnalyzer:
         verdict, reasons = determine_spectrum_verdict(
             peaks=peaks,
             has_background=has_background,
-            is_flat=is_flat,
-            is_non_finite=False,
         )
 
         fund_hz = peaks[0].freq_hz if peaks else None

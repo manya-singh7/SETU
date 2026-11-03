@@ -122,6 +122,12 @@ def generate_synthetic_video(
     target_bbox: Optional[Tuple[int, int, int, int]] = None,
     background_bbox: Optional[Tuple[int, int, int, int]] = None,
     seed: int = 42,
+    ringdown: bool = False,
+    ringdown_interval_sec: float = 5.0,
+    ringdown_damping: float = 0.02,
+    ringdown_start_sec: float = 5.0,
+    ringdown_freq_hz: Optional[float] = None,
+    ringdown_amplitude_px: Optional[float] = None,
 ) -> SyntheticVideoResult:
     """Generate a synthetic civil infrastructure video simulating subpixel vibration.
 
@@ -165,8 +171,21 @@ def generate_synthetic_video(
     n_frames = int(round(fps * duration_sec))
     time_series = np.arange(n_frames, dtype=np.float64) / fps
 
-    # 1. Structural target oscillation (pure 3.7 Hz sinusoidal motion)
-    target_disp = amplitude_px * np.sin(2.0 * np.pi * freq_hz * time_series)
+    # 1. Structural target oscillation (pure sine or ring-down decaying oscillation)
+    if ringdown:
+        f_target = ringdown_freq_hz if ringdown_freq_hz is not None else (12.0 if freq_hz == 3.7 else freq_hz)
+        amp_target = ringdown_amplitude_px if ringdown_amplitude_px is not None else (2.0 if amplitude_px == 0.2 else amplitude_px)
+        omega_n = 2.0 * np.pi * f_target
+        omega_d = omega_n * np.sqrt(max(0.0, 1.0 - ringdown_damping**2))
+        target_disp = np.zeros(n_frames, dtype=np.float64)
+        for i, t_val in enumerate(time_series):
+            if t_val >= ringdown_start_sec:
+                dt = (t_val - ringdown_start_sec) % ringdown_interval_sec
+                target_disp[i] = amp_target * np.exp(-ringdown_damping * omega_n * dt) * np.sin(omega_d * dt)
+    else:
+        f_target = freq_hz
+        amp_target = amplitude_px
+        target_disp = amplitude_px * np.sin(2.0 * np.pi * freq_hz * time_series)
 
     # 2. Camera micro-jitter (random walk + 9 Hz tremor)
     if camera_jitter:
@@ -293,8 +312,8 @@ def generate_synthetic_video(
         fps=fps,
         duration_sec=duration_sec,
         frame_count=n_frames,
-        freq_hz=freq_hz,
-        amplitude_px=amplitude_px,
+        freq_hz=f_target,
+        amplitude_px=amp_target,
         target_displacement=target_disp,
         camera_jitter=camera_jitter_disp,
         total_target_displacement=total_target_disp,
