@@ -176,3 +176,7 @@ Real benchmark numbers will be populated from field recording sessions.
 - **Relative Discrepancy (%)**: [TODO]
 - **Validation Verdict**: [TODO]
 - **Notes / Observations**: [TODO]
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).

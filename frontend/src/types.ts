@@ -194,6 +194,7 @@ export interface ScanResult {
   schema_version: string;
   scan_id: string;
   is_demo?: boolean;
+  is_showcase?: boolean;
   created_at: string;
   status: ScanStatus;
   verdict: Verdict;

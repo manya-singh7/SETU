@@ -1,0 +1,1 @@
+{"scan_id": "scan_test", "status": "complete", "is_demo": false, "video": {"filename": "source.mp4"}, "outputs": {"spectrum_plot": "spectrum.png", "displacement_plot": "displacement.png", "magnified_video": "magnified.mp4", "vibration_map": "vibration_map.png", "sound": "sound.wav"}, "traffic": {"response_plot": "traffic-response.png"}}

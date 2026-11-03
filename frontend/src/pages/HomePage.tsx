@@ -1,9 +1,8 @@
 import React, { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { getBridges, getScan, getFileUrl } from "../api";
+import { getBridges, getShowcaseScans, getFileUrl } from "../api";
 import { BridgeSummary, ScanResult } from "../types";
 import KmStone from "../components/KmStone";
-import RealWaveform from "../components/RealWaveform";
 
 interface HomePageProps {
   onNavigate: (page: "home" | "scan" | "result" | "map" | "proof", scanId?: string) => void;
@@ -12,8 +11,8 @@ interface HomePageProps {
 export default function HomePage({ onNavigate }: HomePageProps) {
   const { t } = useTranslation();
   const [realBridgeCount, setRealBridgeCount] = useState<number>(0);
-  const [sampleScan, setSampleScan] = useState<ScanResult | null>(null);
-  const [scanLoadFailed, setScanLoadFailed] = useState<boolean>(false);
+  const [showcaseScan, setShowcaseScan] = useState<ScanResult | null>(null);
+  const [showcaseLoaded, setShowcaseLoaded] = useState(false);
 
   useEffect(() => {
     // 1. Fetch real bridge count (hide if zero)
@@ -26,26 +25,25 @@ export default function HomePage({ onNavigate }: HomePageProps) {
         setRealBridgeCount(0);
       });
 
-    // 2. Fetch a real scan result for the asymmetric hero
-    getScan("scan_20261103_a1b2c3")
-      .then((scanData) => {
-        if (scanData && scanData.status === "complete") {
-          setSampleScan(scanData);
-        } else {
-          setScanLoadFailed(true);
-        }
+    getShowcaseScans()
+      .then((scans) => {
+        const scan = scans.find((item) => item.status === "complete" && (item.outputs?.magnified_video || item.outputs?.spectrum_plot));
+        setShowcaseScan(scan || null);
       })
-      .catch(() => {
-        setScanLoadFailed(true);
-      });
+      .catch(() => setShowcaseScan(null))
+      .finally(() => setShowcaseLoaded(true));
   }, []);
 
-  const magnifiedUrl = sampleScan?.outputs?.magnified_video
-    ? getFileUrl(sampleScan.scan_id, sampleScan.outputs.magnified_video)
+  const magnifiedUrl = showcaseScan?.outputs?.magnified_video
+    ? getFileUrl(showcaseScan.scan_id, showcaseScan.outputs.magnified_video)
     : null;
 
-  const spectrumUrl = sampleScan?.outputs?.spectrum_plot
-    ? getFileUrl(sampleScan.scan_id, sampleScan.outputs.spectrum_plot)
+  const spectrumUrl = showcaseScan?.outputs?.spectrum_plot
+    ? getFileUrl(showcaseScan.scan_id, showcaseScan.outputs.spectrum_plot)
+    : null;
+
+  const verdictLabel = showcaseScan?.verdict?.level
+    ? t(`result.verdict_${showcaseScan.verdict.level}`, showcaseScan.verdict.level.toUpperCase())
     : null;
 
   return (
@@ -76,27 +74,16 @@ export default function HomePage({ onNavigate }: HomePageProps) {
               {t("home.cta_film", "Film a bridge")}
             </button>
 
-            <button
-              type="button"
-              onClick={() => onNavigate("result", sampleScan?.scan_id || "scan_20261103_a1b2c3")}
-              className="inline-flex items-center justify-center px-6 py-3.5 bg-white hover:bg-concrete-light text-asphalt border border-concrete-rule font-medium text-sm rounded-[4px] transition focus-visible:outline-highway"
-            >
-              {t("home.cta_real_scan", "See a real scan")}
-            </button>
           </div>
 
-            <button
-              type="button"
-              onClick={() => onNavigate("proof")}
-              className="inline-flex items-center justify-center px-6 py-3.5 bg-white hover:bg-concrete-light text-asphalt border border-concrete-rule font-medium text-sm rounded-[4px] transition focus-visible:outline-highway"
-            >
-              {t("home.proof_link", "See validation results")}
-            </button>
+          <button
+            type="button"
+            onClick={() => onNavigate("proof")}
+            className="inline-flex items-center justify-center px-6 py-3.5 bg-white hover:bg-concrete-light text-asphalt border border-concrete-rule font-medium text-sm rounded-[4px] transition focus-visible:outline-highway"
+          >
+            {t("home.proof_link", "See validation results")}
+          </button>
 
-          {/* Real displacement waveform playback (only animated element) */}
-          <div className="pt-4 max-w-lg">
-            <RealWaveform height={75} />
-          </div>
         </div>
 
         {/* Right Column: Real Scan Display or Plain Text Explanation (Never a mockup) */}
@@ -108,69 +95,42 @@ export default function HomePage({ onNavigate }: HomePageProps) {
             </div>
           )}
 
-          {/* Real Scan Box or Text Fallback */}
-          <div className="w-full bg-white border border-concrete-rule rounded-[4px] p-4 space-y-3">
-            <div className="border-b border-concrete-rule pb-2">
-              <div className="text-xs font-bold uppercase tracking-wide text-asphalt">
-                {t("home.real_scan_title", "Actual scan result")}
+          {showcaseScan ? (
+            <div className="w-full bg-white border border-concrete-rule rounded-[4px] p-4 space-y-3">
+              <div className="border-b border-concrete-rule pb-2">
+                <div className="text-xs font-bold uppercase tracking-wide text-asphalt">
+                  {t("home.real_scan_title", "Actual scan result")}
+                </div>
+                <div className="text-xs text-asphalt-muted">{showcaseScan.scan_id}</div>
               </div>
-              <div className="text-xs text-asphalt-muted">
-                {sampleScan
-                  ? `${sampleScan.scan_id} (${sampleScan.location.lat.toFixed(4)}°N, ${sampleScan.location.lon.toFixed(4)}°E)`
-                  : "Napier Bridge Telemetry"}
+              {magnifiedUrl ? (
+                <video src={magnifiedUrl} controls className="w-full h-44 bg-asphalt object-contain rounded-[4px] border border-concrete-rule" />
+              ) : spectrumUrl ? (
+                <img src={spectrumUrl} alt={t("result.spectrum_image_alt", "Vibration spectrum plot")} className="w-full h-36 bg-concrete-light object-contain rounded-[4px] border border-concrete-rule" />
+              ) : null}
+              <div className="flex items-center justify-between text-xs pt-1 border-t border-concrete-rule font-sans">
+                <span className="text-asphalt-muted">{t("result.dominant_freq", "Dominant frequency")}</span>
+                <span className="font-bold text-highway font-mono">
+                  {showcaseScan.measurement?.dominant_frequency_hz != null
+                    ? `${showcaseScan.measurement.dominant_frequency_hz.toFixed(2)} Hz`
+                    : t("result.no_reliable_freq", "No reliable frequency detected")}
+                </span>
               </div>
+              {verdictLabel && <div className="flex items-center justify-between text-xs">
+                <span className="text-asphalt-muted">{t("result.verdict", "Verdict")}</span>
+                <span className="font-bold">{verdictLabel}</span>
+              </div>}
+              <button type="button" onClick={() => onNavigate("result", showcaseScan.scan_id)} className="text-xs font-semibold text-highway underline">
+                {t("home.cta_real_scan", "See a real scan")}
+              </button>
             </div>
-
-            {sampleScan && (magnifiedUrl || spectrumUrl) ? (
-              <div className="space-y-3">
-                {magnifiedUrl ? (
-                  <div>
-                    <div className="text-[11px] font-semibold text-asphalt-muted mb-1">
-                      Magnified video (15x deflection amplification)
-                    </div>
-                    <video
-                      src={magnifiedUrl}
-                      controls
-                      className="w-full h-44 bg-asphalt object-contain rounded-[4px] border border-concrete-rule"
-                    />
-                  </div>
-                ) : null}
-
-                {spectrumUrl ? (
-                  <div>
-                    <div className="text-[11px] font-semibold text-asphalt-muted mb-1">
-                      Power spectral density (Fourier transform)
-                    </div>
-                    <img
-                      src={spectrumUrl}
-                      alt="Spectrum decomposition plot from real scan"
-                      className="w-full h-36 bg-concrete-light object-contain rounded-[4px] border border-concrete-rule"
-                    />
-                  </div>
-                ) : null}
-
-                {sampleScan.measurement.dominant_frequency_hz && (
-                  <div className="flex items-center justify-between text-xs pt-1 border-t border-concrete-rule font-sans">
-                    <span className="text-asphalt-muted">Dominant frequency:</span>
-                    <span className="font-bold text-highway font-mono">
-                      {sampleScan.measurement.dominant_frequency_hz.toFixed(2)} Hz
-                    </span>
-                  </div>
-                )}
-              </div>
-            ) : scanLoadFailed ? (
-              <p className="text-xs text-asphalt-muted py-6 leading-relaxed">
-                {t(
-                  "home.real_scan_missing",
-                  "No completed scan is currently loaded. Film a bridge or choose an entry from the map to view real video and spectrum plots."
-                )}
-              </p>
-            ) : (
-              <p className="text-xs text-asphalt-muted py-6 leading-relaxed">
-                Loading actual scan telemetry from backend...
-              </p>
-            )}
-          </div>
+          ) : showcaseLoaded ? (
+            <p className="max-w-md text-sm text-asphalt-muted leading-relaxed">
+              {t("home.real_scan_missing", "No completed scan is currently loaded. Film a bridge or choose an entry from the map to view real video and spectrum plots.")}
+            </p>
+          ) : (
+            <p role="status" className="text-sm text-asphalt-muted">{t("common.loading", "Loading...")}</p>
+          )}
         </div>
       </section>
 

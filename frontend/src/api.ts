@@ -34,6 +34,17 @@ export function getFileUrl(scanId: string, name: string): string {
   return `/api/scans/${encodeURIComponent(scanId)}/files/${encodeURIComponent(name)}`;
 }
 
+/** Load backend-provided showcase scans and exclude any demos defensively. */
+export async function getShowcaseScans(): Promise<ScanResult[]> {
+  const response = await fetch("/api/showcase");
+  if (!response.ok) throw new Error(`Could not load showcase scans (${response.status}).`);
+  const payload: unknown = await response.json();
+  if (!Array.isArray(payload)) return [];
+  return payload.filter((scan): scan is ScanResult =>
+    Boolean(scan && typeof scan === "object" && (scan as ScanResult).is_showcase === true && !(scan as ScanResult).is_demo),
+  );
+}
+
 // Backward-compatible alias
 export const getScanFileUrl = getFileUrl;
 

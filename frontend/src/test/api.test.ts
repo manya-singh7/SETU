@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createScan, getScan } from "../api";
+import { createScan, getScan, getShowcaseScans } from "../api";
 import { ScanResult } from "../types";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -36,5 +36,19 @@ describe("createScan", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(result.magnification_status).toBe("done");
     vi.useRealTimers();
+  });
+});
+
+describe("getShowcaseScans", () => {
+  it("loads only explicitly marked, non-demo showcase scans", async () => {
+    const showcase = { scan_id: "real-1", is_showcase: true, is_demo: false };
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => [showcase, { scan_id: "demo", is_showcase: true, is_demo: true }, { scan_id: "other" }],
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getShowcaseScans()).resolves.toEqual([showcase]);
+    expect(fetchMock).toHaveBeenCalledWith("/api/showcase");
   });
 });
