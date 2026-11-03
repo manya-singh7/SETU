@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import logging
+import math
 import mimetypes
 import os
 from pathlib import Path
@@ -121,6 +122,9 @@ PUBLIC_MAX_VIDEO_SECONDS = 60
 PUBLIC_UPLOADS_PER_HOUR = 3
 PUBLIC_UPLOAD_WINDOW_SECONDS = 3600
 SHOWCASE_DIR = Path("demo_scans")
+DEFAULT_SETUP_REASON = "Prompts chosen automatically by default; AI setup unavailable."
+DEVICE_MOTION_MAX_SECONDS = 60.0
+DEVICE_MOTION_MAX_SAMPLES = 20_000
 _upload_lock = threading.Lock()
 _upload_times: Dict[str, List[float]] = {}
 
@@ -183,9 +187,19 @@ def cleanup_expired_uploads(now: Optional[float] = None) -> int:
     deleted = 0
     if not SCANS_DIR.is_dir():
         return deleted
-    for folder in SCANS_DIR.iterdir():
-        result = load_scan_result(folder.name) if folder.is_dir() else None
-        filename = (result or {}).get("video", {}).get("filename")
+    # Production layout is data/scans/<scan_id>/result.json. Accept a single
+    # scan directory as SCANS_DIR too, which is useful for isolated storage roots.
+    folders = [folder for folder in SCANS_DIR.iterdir() if folder.is_dir()]
+    if (SCANS_DIR / "result.json").is_file():
+        folders.insert(0, SCANS_DIR)
+    for folder in folders:
+        try:
+            with (folder / "result.json").open(encoding="utf-8") as source:
+                result = json.load(source)
+        except (OSError, ValueError, TypeError):
+            continue
+        video = result.get("video", {}) if isinstance(result, dict) else {}
+        filename = video.get("filename") if isinstance(video, dict) else None
         if not filename or Path(filename).name != filename:
             continue
         upload = folder / filename
@@ -199,10 +213,21 @@ def cleanup_expired_uploads(now: Optional[float] = None) -> int:
 
 
 def configure_public_meta_mode() -> None:
-    """Set cached mode and prevent cache misses from reaching Meta over the network."""
+    """Use Meta caches only in public mode and block every Meta network request."""
     settings.SETU_META_MODE = "cached"
     os.environ["SETU_META_MODE"] = "cached"
     import requests
+
+    # SAM's segmenter only checks its cache when the client has a key. This
+    # placeholder enables that cache lookup when no real key is configured;
+    # the request guard below prevents it from ever being sent over the wire.
+    from setu.meta_client import get_meta_client
+
+    client = get_meta_client()
+    client.mode = "cached"
+    if not client.api_key:
+        client.api_key = "public-demo-cache-only"
+
     if getattr(requests.post, "_setu_public_guard", False):
         return
     original_post = requests.post
@@ -212,6 +237,151 @@ def configure_public_meta_mode() -> None:
         return original_post(url, *args, **kwargs)
     guarded_post._setu_public_guard = True  # type: ignore[attr-defined]
     requests.post = guarded_post
+
+
+def _select_scan_setup(
+    video_path: Path,
+    target_prompt: str,
+    background_prompt: str,
+    language: str,
+    public_mode: bool,
+) -> tuple[str, str, Optional[bool], Dict[str, Any], bool]:
+    """Choose prompts and recording guidance, lazily invoking the director."""
+    target = target_prompt.strip()
+    background = background_prompt.strip()
+    if target:
+        return target, background or "building", None, {
+            "source": "user", "structure_type": None,
+            "recording_issues": [], "advice": None,
+        }, False
+
+    direct_result = None
+    if not public_mode and settings.META_API_KEY:
+        try:
+            # The director module is being added independently; keep API imports usable
+            # before it exists and fall back cleanly on setup errors.
+            from setu.director import direct_scan
+            direct_result = direct_scan(str(video_path), language)
+        except Exception as exc:
+            logger.warning("Automatic scan setup unavailable: %s", exc)
+
+    if isinstance(direct_result, dict) and direct_result.get("structure_visible") is False:
+        issues = direct_result.get("recording_issues") or []
+        setup = {
+            "source": "muse_spark",
+            "structure_type": direct_result.get("structure_type"),
+            "recording_issues": [str(issue) for issue in issues],
+            "advice": direct_result.get("advice"),
+        }
+        return "concrete pillar", "building", None, setup, True
+
+    if isinstance(direct_result, dict) and direct_result.get("structure_visible") is True:
+        target = str(direct_result.get("target_prompt") or "").strip()
+        background = str(direct_result.get("background_prompt") or "").strip()
+        if target and background:
+            return target, background, bool(direct_result.get("is_cable")), {
+                "source": "muse_spark",
+                "structure_type": direct_result.get("structure_type"),
+                "recording_issues": [str(issue) for issue in direct_result.get("recording_issues", [])],
+                "advice": direct_result.get("advice"),
+            }, False
+
+    return "concrete pillar", "building", None, {
+        "source": "default", "structure_type": None,
+        "recording_issues": [], "advice": DEFAULT_SETUP_REASON,
+    }, False
+
+
+def _parse_device_motion(raw: Optional[str]) -> Optional[List[Dict[str, float]]]:
+    """Validate browser accelerometer samples before writing them for analysis."""
+    if raw is None or not raw.strip():
+        return None
+    try:
+        samples = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="device_motion must be a JSON list of samples.") from exc
+    if not isinstance(samples, list):
+        raise HTTPException(status_code=400, detail="device_motion must be a JSON list of samples.")
+    if len(samples) > DEVICE_MOTION_MAX_SAMPLES:
+        raise HTTPException(status_code=413, detail="device_motion cannot exceed 20,000 samples.")
+    if not samples:
+        raise HTTPException(status_code=400, detail="device_motion must contain at least one sample.")
+    normalized: List[Dict[str, float]] = []
+    previous_t: Optional[float] = None
+    for index, sample in enumerate(samples):
+        if not isinstance(sample, dict) or not all(key in sample for key in ("t", "ax", "ay", "az")):
+            raise HTTPException(status_code=400, detail=f"device_motion sample {index} must contain t, ax, ay, and az.")
+        values: Dict[str, float] = {}
+        for key in ("t", "ax", "ay", "az"):
+            value = sample[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise HTTPException(status_code=400, detail=f"device_motion sample {index} field {key} must be a finite number.")
+            values[key] = float(value)
+        if values["t"] < 0 or (previous_t is not None and values["t"] <= previous_t):
+            raise HTTPException(status_code=400, detail="device_motion timestamps must be nonnegative and strictly increasing.")
+        previous_t = values["t"]
+        normalized.append(values)
+    if normalized[-1]["t"] - normalized[0]["t"] > DEVICE_MOTION_MAX_SECONDS:
+        raise HTTPException(status_code=413, detail="device_motion duration cannot exceed 60 seconds.")
+    return normalized
+
+
+def _ensure_schema_14_defaults(result: Dict[str, Any]) -> None:
+    result["schema_version"] = "1.4"
+    outputs = result.setdefault("outputs", {})
+    outputs.setdefault("sound", None)
+    result.setdefault("sonification", None)
+    result.setdefault("weather", None)
+    result.setdefault("device_check", {
+        "status": "not_recorded", "device_frequency_hz": None,
+        "device_ci_hz": None, "sample_rate_hz": None, "note": None,
+    })
+    result.setdefault("traffic", {"events": [], "response_plot": None})
+    result.setdefault("measurement", {}).setdefault("mode_shape", [])
+    outputs.setdefault("magnified_video", None)
+    result.setdefault("magnification_status", "done" if outputs.get("magnified_video") else "skipped")
+    result.setdefault("magnification_reason", None)
+    result.setdefault("segmentation", {}).setdefault("target_bbox", None)
+
+
+def _sound_summary(scan_id: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    import numpy as np
+    from scipy.io import wavfile
+
+    sound_name = ((result.get("outputs") or {}).get("sound"))
+    wav_path = get_scan_file_path(scan_id, sound_name)
+    sample_rate, audio = wavfile.read(wav_path)
+    duration = float(len(audio) / sample_rate) if sample_rate else 0.0
+    peaks = (result.get("measurement") or {}).get("peaks") or []
+    frequencies = [float(peak["frequency_hz"]) for peak in peaks
+                   if isinstance(peak, dict) and peak.get("frequency_hz") is not None]
+    dominant = (result.get("measurement") or {}).get("dominant_frequency_hz")
+    if not frequencies and dominant is not None:
+        frequencies = [float(dominant)]
+    speedup = (result.get("sonification") or {}).get("speedup")
+    return {
+        "peak_count": len(peaks) if peaks else len(frequencies),
+        "duration_seconds": duration,
+        "sample_rate_hz": int(sample_rate),
+        "frequency_min_hz": min(frequencies) if frequencies else None,
+        "frequency_max_hz": max(frequencies) if frequencies else None,
+        "playback_rate": float(speedup) if speedup is not None else None,
+        "explanation": "Measured displacement is played faster to make low-frequency vibration audible.",
+    }
+
+
+def _attach_sound_api_fields(scan_id: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(result)
+    outputs = result.get("outputs") or {}
+    sound_name = outputs.get("sound")
+    valid_name = isinstance(sound_name, str) and Path(sound_name).name == sound_name
+    sound_path = get_scan_dir(scan_id) / sound_name if valid_name else None
+    available = bool(valid_name and sound_path.is_file())
+    result["sound_available"] = available
+    result["sound_url"] = f"/api/scans/{scan_id}/sound.wav" if available else None
+    result["sonify_url"] = None
+    result["sound_summary"] = _sound_summary(scan_id, result) if available else None
+    return result
 
 
 def generate_scan_id() -> str:
@@ -319,7 +489,7 @@ def _load_demo_fixture() -> Dict[str, Any]:
 
     # Exact fallback example from specification if file cannot be read
     return {
-        "schema_version": "1.2",
+        "schema_version": "1.4",
         "scan_id": "scan_20261103_a1b2c3",
         "created_at": "2026-11-03T19:30:00+05:30",
         "status": "complete",
@@ -389,6 +559,87 @@ def _load_demo_fixture() -> Dict[str, Any]:
     }
 
 
+def _start_background_task(target: Any, *args: Any) -> threading.Thread:
+    """Run long secondary processing without keeping the request worker busy."""
+    worker = threading.Thread(target=target, args=args, daemon=True)
+    worker.start()
+    return worker
+
+
+def _execute_magnification_task(scan_id: str) -> None:
+    """Magnify a completed usable scan and update its artifact/status fields."""
+    scan_data = load_scan_result(scan_id)
+    if not scan_data:
+        return
+    if scan_data.get("status") != "complete" or (scan_data.get("verdict") or {}).get("level") != "usable":
+        scan_data["magnification_status"] = "skipped"
+        scan_data.setdefault("magnification_reason", "Weak or failed scan verdict")
+        save_scan_result(scan_id, scan_data)
+        _sync_scan_record_to_db(scan_id, scan_data)
+        return
+
+    target_bbox = ((scan_data.get("segmentation") or {}).get("target_bbox"))
+    if not isinstance(target_bbox, (list, tuple)) or len(target_bbox) != 4:
+        scan_data["magnification_status"] = "skipped"
+        scan_data["magnification_reason"] = "No target region recorded"
+        save_scan_result(scan_id, scan_data)
+        _sync_scan_record_to_db(scan_id, scan_data)
+        return
+    try:
+        target_bbox = [float(value) for value in target_bbox]
+        if not all(math.isfinite(value) for value in target_bbox) or min(target_bbox[:2]) < 0 or min(target_bbox[2:]) <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        scan_data["magnification_status"] = "skipped"
+        scan_data["magnification_reason"] = "No target region recorded"
+        save_scan_result(scan_id, scan_data)
+        _sync_scan_record_to_db(scan_id, scan_data)
+        return
+
+    scan_data["magnification_status"] = "running"
+    scan_data["magnification_reason"] = None
+    save_scan_result(scan_id, scan_data)
+    _sync_scan_record_to_db(scan_id, scan_data)
+    try:
+        video_name = ((scan_data.get("video") or {}).get("filename") or "")
+        if not video_name or Path(video_name).name != video_name:
+            raise ValueError("Original scan video is unavailable for magnification.")
+        video_path = get_scan_dir(scan_id) / video_name
+        if not video_path.is_file():
+            raise FileNotFoundError("Original scan video is unavailable for magnification.")
+        measurement = scan_data.get("measurement") or {}
+        target_frequency = measurement.get("dominant_frequency_hz")
+        if target_frequency is None:
+            raise ValueError("A dominant frequency is required for magnification.")
+        video = scan_data.get("video") or {}
+        fps = float(video.get("fps") or 0.0)
+        if fps <= 0 or not math.isfinite(fps):
+            raise ValueError("A valid video frame rate is required for magnification.")
+
+        from setu.evm import EVMDisplayConfig, magnify_video
+        output_path = get_scan_dir(scan_id) / "magnified.mp4"
+        magnify_video(
+            input_video_path=str(video_path),
+            output_video_path=str(output_path),
+            target_frequency_hz=float(target_frequency),
+            target_bbox=tuple(target_bbox),
+            amplification_factor=50.0,
+            config=EVMDisplayConfig(fps=fps, max_crop_dimension=480),
+        )
+        if not output_path.is_file():
+            raise RuntimeError("Magnification did not produce an output video.")
+        scan_data.setdefault("outputs", {})["magnified_video"] = output_path.name
+        scan_data["magnification_status"] = "done"
+        scan_data["magnification_reason"] = None
+    except Exception as exc:
+        logger.exception("Magnification failed for scan %s: %s", scan_id, exc)
+        scan_data.setdefault("outputs", {})["magnified_video"] = None
+        scan_data["magnification_status"] = "failed"
+        scan_data["magnification_reason"] = str(exc)
+    save_scan_result(scan_id, scan_data)
+    _sync_scan_record_to_db(scan_id, scan_data)
+
+
 def _execute_analysis_task(
     scan_id: str,
     video_path: str,
@@ -404,6 +655,7 @@ def _execute_analysis_task(
     scan_data = load_scan_result(scan_id)
     if scan_data:
         scan_data["status"] = "running"
+        scan_data["magnification_status"] = "pending"
         scan_data["verdict"] = {"level": "running", "reasons": []}
         save_scan_result(scan_id, scan_data)
         _sync_scan_record_to_db(scan_id, scan_data)
@@ -418,7 +670,7 @@ def _execute_analysis_task(
             lon=lon,
             target_prompt=target_prompt,
             background_prompt=background_prompt,
-            magnify=True,
+            magnify=False,
             out_dir=out_dir,
         )
 
@@ -433,19 +685,36 @@ def _execute_analysis_task(
         completed_result["scan_id"] = scan_id
         completed_result["status"] = "complete"
         completed_result["is_demo"] = False
-        completed_result["schema_version"] = "1.2"
+        completed_result["schema_version"] = "1.4"
+        completed_result.setdefault("outputs", {})["magnified_video"] = None
+        if scan_data and "setup" in scan_data:
+            completed_result["setup"] = scan_data["setup"]
+        for key in ("device_check", "weather", "traffic", "sonification"):
+            if key not in completed_result and scan_data and key in scan_data:
+                completed_result[key] = scan_data[key]
         completed_result.setdefault("field_notes", [])
         completed_result.setdefault("measurement", {}).setdefault("instances", [])
         completed_result.setdefault("outputs", {}).setdefault("vibration_map", None)
+        setup_advice = (scan_data or {}).get("setup", {}).get("advice")
+        if setup_advice and setup_advice == DEFAULT_SETUP_REASON:
+            completed_result.setdefault("verdict", {}).setdefault("reasons", []).append(setup_advice)
+        _ensure_schema_14_defaults(completed_result)
+        verdict_level = (completed_result.get("verdict") or {}).get("level")
+        completed_result["magnification_status"] = "pending" if verdict_level == "usable" else "skipped"
+        completed_result["magnification_reason"] = None if verdict_level == "usable" else "Weak or failed scan verdict"
         apply_cable_comparison(completed_result, _collect_all_scan_data(), is_cable_override)
         save_scan_result(scan_id, completed_result)
         _sync_scan_record_to_db(scan_id, completed_result)
+        if completed_result["magnification_status"] == "pending":
+            _start_background_task(_execute_magnification_task, scan_id)
 
     except Exception as exc:
         logger.exception("Analysis pipeline failed for scan %s: %s", scan_id, exc)
         curr = load_scan_result(scan_id) or {}
         curr["scan_id"] = scan_id
         curr["status"] = "error"
+        curr["magnification_status"] = "skipped"
+        curr["magnification_reason"] = "Scan pipeline failed"
         curr["is_demo"] = False
         curr["verdict"] = {"level": "failed", "reasons": [str(exc)]}
         if "measurement" not in curr or not isinstance(curr["measurement"], dict):
@@ -453,7 +722,8 @@ def _execute_analysis_task(
         curr["measurement"]["dominant_frequency_hz"] = None
         curr["measurement"]["frequency_ci_hz"] = None
         curr["measurement"]["peaks"] = []
-        curr["schema_version"] = "1.2"
+        curr["schema_version"] = "1.4"
+        _ensure_schema_14_defaults(curr)
         curr.setdefault("cable", {
             "is_cable": is_cable_scan(curr, is_cable_override),
             "tension_change_pct": None,
@@ -524,9 +794,14 @@ async def add_field_note(
             "english": note_data["english"], "tags": note_data["tags"],
         }
         scan.setdefault("field_notes", []).append(note)
-        scan["schema_version"] = "1.2"
+        scan["schema_version"] = "1.4"
+        scan.setdefault("setup", {
+            "source": "default", "structure_type": None,
+            "recording_issues": [], "advice": None,
+        })
         scan.setdefault("measurement", {}).setdefault("instances", [])
         scan.setdefault("outputs", {}).setdefault("vibration_map", None)
+        _ensure_schema_14_defaults(scan)
         save_scan_result(scan_id, scan)
         _sync_scan_record_to_db(scan_id, scan)
         return note
@@ -546,8 +821,10 @@ async def create_scan(
     latitude: Optional[float] = Form(None),
     lon: Optional[float] = Form(None),
     longitude: Optional[float] = Form(None),
-    target_prompt: str = Form("concrete pillar"),
-    background_prompt: str = Form("building"),
+    target_prompt: str = Form(""),
+    background_prompt: str = Form(""),
+    language: str = Form("en"),
+    device_motion: Optional[str] = Form(None),
     bridge_name: Optional[str] = Form(None),
     is_cable: Optional[bool] = Form(None),
     session: Session = Depends(get_session),
@@ -560,6 +837,8 @@ async def create_scan(
             detail="A video file (.mp4, .mov, .webm) is required.",
         )
 
+    device_samples = _parse_device_motion(device_motion)
+
     public_mode = is_public_demo_mode()
     if public_mode:
         configure_public_meta_mode()
@@ -570,6 +849,9 @@ async def create_scan(
 
     # Validate extension, size <= 200 MB, sanitize filename, save to data/scans/<scan_id>/
     dest_path, clean_filename = await save_uploaded_video(upload_file, scan_id)
+    if device_samples is not None:
+        motion_path = get_scan_dir(scan_id) / "device_motion.json"
+        motion_path.write_text(json.dumps(device_samples), encoding="utf-8")
 
     if public_mode:
         try:
@@ -581,8 +863,67 @@ async def create_scan(
             dest_path.unlink(missing_ok=True)
             raise HTTPException(status_code=413, detail="Public demo videos must be 60 seconds or shorter.")
 
+    target_prompt, background_prompt, director_is_cable, setup_info, setup_rejected = _select_scan_setup(
+        dest_path, target_prompt, background_prompt, language.strip() or "en", public_mode,
+    )
+    cable_override = is_cable if is_cable is not None else director_is_cable
+
     actual_lat = lat if lat is not None else (latitude if latitude is not None else 13.0827)
     actual_lon = lon if lon is not None else (longitude if longitude is not None else 80.2707)
+
+    if setup_rejected:
+        failed_setup_result: Dict[str, Any] = {
+            "schema_version": "1.4",
+            "magnification_status": "skipped",
+            "magnification_reason": "Setup rejected the recording",
+            "is_demo": is_demo_mode() and not public_mode,
+            "scan_id": scan_id,
+            "created_at": datetime.now(timezone.utc).astimezone().isoformat(),
+            "status": "complete",
+            "verdict": {"level": "failed", "reasons": [
+                *setup_info["recording_issues"],
+                *([setup_info["advice"]] if setup_info.get("advice") else []),
+            ]},
+            "location": {"lat": float(actual_lat), "lon": float(actual_lon)},
+            "video": {"filename": clean_filename, "fps": 0.0, "duration_s": 0.0,
+                      "width": 0, "height": 0, "frame_count": 0},
+            "segmentation": {"target_prompt": target_prompt,
+                             "background_prompt": background_prompt,
+                             "target_bbox": None,
+                             "target_source": "none", "background_source": "none",
+                             "target_persistence": None, "background_persistence": None,
+                             "warnings": []},
+            "setup": setup_info,
+            "sonification": None, "weather": None,
+            "device_check": {"status": "not_recorded", "device_frequency_hz": None,
+                             "device_ci_hz": None, "sample_rate_hz": None, "note": None},
+            "traffic": {"events": [], "response_plot": None},
+            "measurement": {"units": "px", "scale": None,
+                            "dominant_frequency_hz": None, "frequency_ci_hz": None,
+                            "peaks": [], "psd": None, "instances": [],
+                            "background_residual_px": None},
+            "interpretation": {"bridge": bridge_name,
+                               "bridge_warning": None if bridge_name else "No mapped bridge within 150 m",
+                               "quality_gate": {"is_structural_element": False,
+                                                "has_static_background": False,
+                                                "appears_stable": False,
+                                                "issues": setup_info["recording_issues"]},
+                               "assessment": {"severity": "none", "reasons": [],
+                                              "expected_range_hz": None, "confidence": "low",
+                                              "recommended_action": setup_info.get("advice") or "",
+                                              "assessor": "local_rules"}},
+            "outputs": {"magnified_video": None, "spectrum_plot": None,
+                        "displacement_plot": None, "vibration_map": None, "sound": None},
+            "field_notes": [],
+            "cable": {"is_cable": False, "tension_change_pct": None,
+                      "tension_change_range_pct": None,
+                      "compared_to_scan_id": None, "compared_to_date": None},
+            "costs_usd": {"sam": 0.0, "muse_spark": 0.0, "total": 0.0},
+            "disclaimer": "SETU does not assess safety. Flagged readings are for engineer review.",
+        }
+        save_scan_result(scan_id, failed_setup_result)
+        _sync_scan_record_to_db(scan_id, failed_setup_result)
+        return failed_setup_result
 
     # 5. Demo Mode Check
     if is_demo_mode() and not public_mode:
@@ -597,6 +938,8 @@ async def create_scan(
         if "segmentation" in demo_data:
             demo_data["segmentation"]["target_prompt"] = target_prompt
             demo_data["segmentation"]["background_prompt"] = background_prompt
+        if setup_info.get("advice") == DEFAULT_SETUP_REASON:
+            demo_data.setdefault("verdict", {}).setdefault("reasons", []).append(DEFAULT_SETUP_REASON)
         if bridge_name:
             if "interpretation" in demo_data:
                 demo_data["interpretation"]["bridge"] = bridge_name
@@ -607,17 +950,22 @@ async def create_scan(
             "spectrum_plot": None,
             "displacement_plot": None,
             "vibration_map": None,
+            "sound": None,
         }
-        demo_data["schema_version"] = "1.2"
+        demo_data["schema_version"] = "1.4"
+        demo_data["magnification_status"] = "skipped"
+        demo_data["magnification_reason"] = "Demo fixture has no magnified output"
+        demo_data["setup"] = setup_info
         demo_data.setdefault("field_notes", [])
         demo_data.setdefault("measurement", {}).setdefault("instances", [])
         demo_data["cable"] = {
-            "is_cable": is_cable_scan({"segmentation": {"target_prompt": target_prompt}}, is_cable),
+            "is_cable": is_cable_scan({"segmentation": {"target_prompt": target_prompt}}, cable_override),
             "tension_change_pct": None,
             "tension_change_range_pct": None,
             "compared_to_scan_id": None,
             "compared_to_date": None,
         }
+        _ensure_schema_14_defaults(demo_data)
 
         # Save result JSON and persist in DB
         save_scan_result(scan_id, demo_data)
@@ -627,12 +975,17 @@ async def create_scan(
 
     # Production / Full Pipeline Mode
     initial_result = {
-        "schema_version": "1.2",
+        "schema_version": "1.4",
         "is_demo": False,
         "scan_id": scan_id,
         "created_at": datetime.now(timezone.utc).astimezone().isoformat(),
         "status": "queued",
-        "verdict": {"level": "queued", "reasons": []},
+        "magnification_status": "pending",
+        "magnification_reason": None,
+        "verdict": {
+            "level": "queued",
+            "reasons": [DEFAULT_SETUP_REASON] if setup_info.get("advice") == DEFAULT_SETUP_REASON else [],
+        },
         "location": {"lat": float(actual_lat), "lon": float(actual_lon)},
         "video": {
             "filename": clean_filename,
@@ -645,12 +998,19 @@ async def create_scan(
         "segmentation": {
             "target_prompt": target_prompt,
             "background_prompt": background_prompt,
+            "target_bbox": None,
             "target_source": "sam",
             "background_source": "sam",
             "target_persistence": None,
             "background_persistence": None,
             "warnings": [],
         },
+        "setup": setup_info,
+        "sonification": None,
+        "weather": None,
+        "device_check": {"status": "not_recorded", "device_frequency_hz": None,
+                         "device_ci_hz": None, "sample_rate_hz": None, "note": None},
+        "traffic": {"events": [], "response_plot": None},
         "measurement": {
             "units": "px",
             "scale": None,
@@ -679,14 +1039,15 @@ async def create_scan(
             },
         },
         "outputs": {
-            "magnified_video": "magnified.mp4",
+            "magnified_video": None,
             "spectrum_plot": "spectrum.png",
             "displacement_plot": "displacement.png",
             "vibration_map": None,
+            "sound": None,
         },
         "field_notes": [],
         "cable": {
-            "is_cable": is_cable_scan({"segmentation": {"target_prompt": target_prompt}}, is_cable),
+            "is_cable": is_cable_scan({"segmentation": {"target_prompt": target_prompt}}, cable_override),
             "tension_change_pct": None,
             "tension_change_range_pct": None,
             "compared_to_scan_id": None,
@@ -711,7 +1072,7 @@ async def create_scan(
         target_prompt=target_prompt,
         background_prompt=background_prompt,
         out_dir=str(scan_dir),
-        is_cable_override=is_cable,
+        is_cable_override=cable_override,
     )
 
     return initial_result
@@ -727,7 +1088,7 @@ def get_scan(
     # 1. Attempt to load directly from data/scans/<id>/result.json
     result = load_scan_result(id)
     if result:
-        return result
+        return _attach_sound_api_fields(id, result)
 
     showcase = getattr(app.state, "showcase_scans", None) or load_showcase_scans()
     if id in showcase:
@@ -737,7 +1098,7 @@ def get_scan(
     record = session.get(ScanRecord, id)
     if record and record.result_json:
         try:
-            return json.loads(record.result_json)
+            return _attach_sound_api_fields(id, json.loads(record.result_json))
         except Exception:
             pass
 
@@ -747,11 +1108,27 @@ def get_scan(
     )
 
 
+@app.get("/api/scans/{id}/sound.wav")
+def download_scan_sound(id: str) -> FileResponse:
+    result = load_scan_result(id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Scan not found.")
+    sound_name = (result.get("outputs") or {}).get("sound")
+    if not isinstance(sound_name, str) or Path(sound_name).name != sound_name:
+        raise HTTPException(status_code=404, detail="Sound has not been generated.")
+    path = get_scan_file_path(id, sound_name)
+    return FileResponse(path, media_type="audio/wav", filename=sound_name)
+
+
 @app.get("/api/scans/{id}/files/{name}")
 @app.get("/scans/{id}/files/{name}")
 def get_scan_file(id: str, name: str) -> FileResponse:
     """Serve output files (magnified video, plots) with strict path-traversal protection."""
     showcase = getattr(app.state, "showcase_scans", None) or load_showcase_scans()
+    if name.lower().endswith(".wav"):
+        sound_result = load_scan_result(id) or showcase.get(id)
+        if not sound_result or (sound_result.get("outputs") or {}).get("sound") != name:
+            raise HTTPException(status_code=404, detail="Sound has not been generated.")
     if id in showcase:
         if ".." in name or "/" in name or "\\" in name:
             raise HTTPException(status_code=400, detail="Path traversal detected in file name")
@@ -778,7 +1155,9 @@ def get_scan_file(id: str, name: str) -> FileResponse:
 
     # Determine media type
     media_type, _ = mimetypes.guess_type(str(file_path))
-    if not media_type:
+    if name.lower().endswith(".wav"):
+        media_type = "audio/wav"
+    elif not media_type:
         if name.endswith(".mp4"):
             media_type = "video/mp4"
         elif name.endswith(".png"):

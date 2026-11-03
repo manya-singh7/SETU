@@ -135,7 +135,11 @@ def test_never_log_api_key(tmp_path, monkeypatch, capsys):
 
 def test_quality_gate_mock_mode():
     """Verify quality gate returns expected visual metrics in mock mode."""
-    gate = QualityGate()
+    # Use a dedicated mock client so the fixture and mode are independent of
+    # the process-wide MetaClient singleton mutated by other application tests.
+    gate = QualityGate(client=MetaClient(mode="mock", fixtures_dir=os.path.join(
+        os.path.dirname(os.path.dirname(__file__)), "tests", "fixtures"
+    )))
     # Dummy frame
     dummy_frame = np.zeros((100, 100, 3), dtype=np.uint8)
     result = gate.check_frame(dummy_frame)
@@ -157,3 +161,60 @@ def test_resize_frame_to_768():
     assert max(h, w) == 768
     assert w == 768
     assert h == 432  # 1080 * (768 / 1920) = 432
+
+
+def test_sam_video_mock_mode_loads_fixture_without_network(tmp_path, monkeypatch):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"mock video bytes")
+    client = MetaClient(mode="mock", usage_log_path=str(tmp_path / "usage.jsonl"))
+    fixture = {"status": "completed", "output_text": "<0f>0<|box;x1=1;y1=2;x2=3;y2=4;w=10;h=10|>"}
+    monkeypatch.setattr(client, "_load_fixture", lambda _name: fixture)
+    monkeypatch.setattr(requests, "post", lambda *_a, **_kw: pytest.fail("mock mode must not call network"))
+    assert client.track_video(video, "truck", frame_count=20) == fixture
+
+
+def test_sam_video_cached_mode_caches_and_logs_frame_cost(tmp_path, monkeypatch):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"mock video bytes")
+    usage = tmp_path / "usage.jsonl"
+    cache = tmp_path / "cache"
+    client = MetaClient(api_key="test-key", mode="cached", cache_dir=str(cache), usage_log_path=str(usage))
+    response = {"status": "completed", "output_text": "<0f>"}
+    calls = []
+
+    def mock_post(url, **kwargs):
+        calls.append((url, kwargs))
+        result = MagicMock(status_code=200)
+        result.json.return_value = response
+        return result
+
+    monkeypatch.setattr(requests, "post", mock_post)
+    assert client.track_video(video, "truck", frame_count=900) == response
+    assert client.track_video(video, "truck", frame_count=900) == response
+    assert len(calls) == 1
+    assert calls[0][0].endswith("/responses")
+    assert calls[0][1]["json"]["input"][0]["content"][0]["text"] == "truck"
+    assert calls[0][1]["json"]["input"][0]["content"][1]["type"] == "input_video"
+    entry = json.loads(usage.read_text(encoding="utf-8").strip())
+    assert entry["frames"] == 900
+    assert entry["estimated_cost"] == 0.18
+
+
+def test_sam_video_missing_key_returns_none_without_network(tmp_path, monkeypatch):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"mock video bytes")
+    client = MetaClient(api_key="", mode="live", usage_log_path=str(tmp_path / "usage.jsonl"))
+    client.api_key = ""
+    monkeypatch.setattr(requests, "post", lambda *_a, **_kw: pytest.fail("missing key must not call network"))
+    assert client.track_video(video, "truck", frame_count=900) is None
+
+
+def test_sam_video_budget_cap_checks_estimated_video_cost(tmp_path, monkeypatch):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"mock video bytes")
+    usage = tmp_path / "usage.jsonl"
+    usage.write_text(json.dumps({"estimated_cost": 1.0}) + "\n", encoding="utf-8")
+    client = MetaClient(api_key="test-key", mode="live", budget_cap=1.1, usage_log_path=str(usage))
+    monkeypatch.setattr(requests, "post", lambda *_a, **_kw: pytest.fail("over budget must not call network"))
+    with pytest.raises(BudgetExceededError):
+        client.track_video(video, "car", frame_count=1000)

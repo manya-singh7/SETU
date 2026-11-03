@@ -9,13 +9,17 @@ Tests full pipeline execution with SETU_DEMO_MODE=false and SETU_META_MODE=mock 
 """
 
 import io
+import json
 import os
+from pathlib import Path
 import tempfile
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
 from setu.api import app
 from setu.osm import OSMBridgeInfo
+import setu.storage as storage
 from tests.synth import generate_synthetic_video
 
 client = TestClient(app)
@@ -113,6 +117,118 @@ def test_end_to_end_synthetic_scan():
     finally:
         if os.path.exists(tmp_video_path):
             os.remove(tmp_video_path)
+
+
+@pytest.mark.slow
+def test_api_uploads_device_motion_and_saves_all_scan_artifacts(monkeypatch, tmp_path):
+    """Exercise schema 1.4 outputs through upload using offline model fixtures."""
+    from setu import api, meta_client
+    from setu.meta_client import MetaClient
+    import requests
+    import setu.evm as evm
+    import setu.weather as weather
+
+    monkeypatch.setenv("SETU_META_MODE", "mock")
+    monkeypatch.setattr(api.settings, "SETU_META_MODE", "mock")
+    monkeypatch.setattr(meta_client, "_default_client", None)
+    monkeypatch.setattr(requests, "post", lambda *_args, **_kwargs: pytest.fail("integration test must not use network"))
+    monkeypatch.setattr(weather, "get_weather", lambda *_args, **_kwargs: None)
+
+    original_fixture_loader = MetaClient._load_fixture
+    traffic_fixture = {
+        "output_text": "".join(
+            f"<{frame}f>0<|box;x1=30;y1=30;x2=90;y2=90|>" for frame in range(7)
+        )
+    }
+
+    def fixture_loader(self, fixture_name):
+        if fixture_name == "sam_3_1_video_response.json":
+            return traffic_fixture
+        return original_fixture_loader(self, fixture_name)
+
+    monkeypatch.setattr(MetaClient, "_load_fixture", fixture_loader)
+    monkeypatch.setattr(
+        MetaClient,
+        "segment_image",
+        lambda _self, _image, prompt, **_kwargs: {
+            "target_bbox": [270, 90, 100, 280] if "pillar" in prompt.lower() else [40, 360, 120, 80],
+            "confidence": 0.95,
+        },
+    )
+
+    generated_video = tmp_path / "synthetic_bridge.mp4"
+    generate_synthetic_video(
+        output_path=str(generated_video), fps=60.0, duration_sec=10.0,
+        width=640, height=480, freq_hz=3.7,
+    )
+    device_samples = [
+        {
+            "t": index / 50.0,
+            "ax": 0.08 * np.sin(2 * np.pi * 3.7 * index / 50.0),
+            "ay": 0.0,
+            "az": 9.81,
+        }
+        for index in range(500)
+    ]
+
+    mag_states = []
+    def fast_background_job(target, *args):
+        if target is api._execute_magnification_task:
+            scan_id = args[0]
+            pending = storage.load_scan_result(scan_id)
+            mag_states.append(pending["magnification_status"])
+            assert pending["status"] == "complete"
+            return target(*args)
+        return target(*args)
+
+    def fake_magnify(**kwargs):
+        scan_id = Path(kwargs["output_video_path"]).parent.name
+        running = storage.load_scan_result(scan_id)
+        mag_states.append(running["magnification_status"])
+        Path(kwargs["output_video_path"]).write_bytes(b"test magnified output")
+        return kwargs["output_video_path"]
+
+    monkeypatch.setattr(api, "_start_background_task", fast_background_job)
+    monkeypatch.setattr(evm, "magnify_video", fake_magnify)
+    with generated_video.open("rb") as video_file:
+        upload = client.post(
+            "/api/scans",
+            files={"file": ("synthetic_bridge.mp4", video_file, "video/mp4")},
+            data={
+                "target_prompt": "concrete pillar",
+                "background_prompt": "building",
+                "device_motion": json.dumps(device_samples),
+                "lat": "13.0827", "lon": "80.2707",
+            },
+        )
+    assert upload.status_code == 200, upload.text
+    scan_id = upload.json()["scan_id"]
+    result_response = client.get(f"/api/scans/{scan_id}")
+    assert result_response.status_code == 200
+    result = result_response.json()
+    scan_dir = storage.get_scan_dir(scan_id)
+
+    assert result["status"] == "complete"
+    assert result["verdict"]["level"] == "usable"
+    assert result["segmentation"]["target_bbox"] is not None
+    assert (scan_dir / "device_motion.json").is_file()
+    displacement = np.load(scan_dir / "displacement.npy", allow_pickle=False)
+    assert displacement.size > 0
+    assert result["device_check"]["status"] == "agrees"
+    assert result["weather"] is None or isinstance(result["weather"], dict)
+    assert result["traffic"]["events"]
+
+    sound_name = result["outputs"]["sound"]
+    assert sound_name
+    sound_response = client.get(f"/api/scans/{scan_id}/files/{sound_name}")
+    assert sound_response.status_code == 200
+    assert sound_response.headers["content-type"].startswith("audio/wav")
+
+    assert result["magnification_status"] in ("done", "skipped")
+    if result["magnification_status"] == "done":
+        assert mag_states == ["pending", "running"]
+    else:
+        assert result.get("magnification_reason")
 
 
 def test_corrupt_video_upload_fails_gracefully():

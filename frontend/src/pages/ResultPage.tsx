@@ -3,6 +3,8 @@ import { useTranslation } from "react-i18next";
 import {
   Activity,
   Mic,
+  Pause,
+  Play,
   Square,
   Share2,
   ArrowLeft,
@@ -19,6 +21,7 @@ import i18n from "../i18n";
 import { ScanResult, VerdictLevel, TriageSeverity } from "../types";
 import { formatLocaleNumber, formatLocaleDate } from "../i18n";
 import RealWaveform from "../components/RealWaveform";
+import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
 // Code-split heavy interactive Recharts spectrum chart
 const InteractiveSpectrumChart = lazy(() => import("../components/InteractiveSpectrumChart"));
@@ -37,6 +40,7 @@ export default function ResultPage({ scanId, onNavigate, initialScan }: ResultPa
   const [activeTab, setActiveTab] = useState<"image" | "chart">("image");
   const [showEngineerDetails, setShowEngineerDetails] = useState<boolean>(false);
   const [recording, setRecording] = useState(false);
+  const [sonificationPlaying, setSonificationPlaying] = useState(false);
   const [seconds, setSeconds] = useState(0);
   const [uploadingNote, setUploadingNote] = useState(false);
   const [noteError, setNoteError] = useState<string | null>(null);
@@ -44,13 +48,20 @@ export default function ResultPage({ scanId, onNavigate, initialScan }: ResultPa
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<number | null>(null);
+  const sonificationRef = useRef<HTMLAudioElement | null>(null);
 
   const loadScan = () => {
     let isMounted = true;
     setLoading(true);
     setError(null);
 
-    getScan(scanId)
+    getScan(scanId, (updated) => {
+      if (isMounted) {
+        setScan(updated);
+        setFieldNotes(updated.field_notes || []);
+        if (updated.status === "complete") setLoading(false);
+      }
+    }, true)
       .then((data) => {
         if (isMounted) {
           setScan(data);
@@ -76,6 +87,17 @@ export default function ResultPage({ scanId, onNavigate, initialScan }: ResultPa
       setFieldNotes(initialScan.field_notes || []);
       setLoading(false);
       setError(null);
+      if (initialScan.status === "complete" && (initialScan.magnification_status === "pending" || initialScan.magnification_status === "running")) {
+        let isMounted = true;
+        void getScan(scanId, (updated) => {
+          if (isMounted) setScan(updated);
+        }, true).then((updated) => {
+          if (isMounted) setScan(updated);
+        }).catch((err: unknown) => {
+          if (isMounted) setError(err instanceof Error ? err.message : t("common.error", "Failed to load scan"));
+        });
+        return () => { isMounted = false; };
+      }
       return;
     }
 
@@ -270,6 +292,19 @@ export default function ResultPage({ scanId, onNavigate, initialScan }: ResultPa
   const spectrumPlotUrl = scan.outputs?.spectrum_plot
     ? getFileUrl(scan.scan_id, scan.outputs.spectrum_plot)
     : null;
+  const soundUrl = scan.outputs?.sound ? getFileUrl(scan.scan_id, scan.outputs.sound) : null;
+  const trafficPlotUrl = scan.traffic?.response_plot ? getFileUrl(scan.scan_id, scan.traffic.response_plot) : null;
+  const modeShape = (scan.measurement?.mode_shape || []).filter((point) =>
+    Number.isFinite(point.position_norm) && Number.isFinite(point.amplitude_px)
+      && point.position_norm >= 0 && point.position_norm <= 1,
+  ).sort((a, b) => a.position_norm - b.position_norm);
+  const deviceCheckMessage = scan.device_check?.status === "agrees"
+    ? t("result.device_agrees", "Your phone's motion sensor agreed with the camera")
+    : scan.device_check?.status === "disagrees"
+      ? t("result.device_differs", "Your phone's motion sensor gave a different reading from the camera")
+      : scan.device_check?.status === "not_resting"
+        ? (scan.device_check.note || t("result.device_not_resting", "The phone moved during recording, so the sensor comparison could not be made."))
+        : null;
 
   return (
     <div className="max-w-5xl mx-auto space-y-6 py-2 px-1 font-sans text-asphalt">
@@ -403,6 +438,12 @@ export default function ResultPage({ scanId, onNavigate, initialScan }: ResultPa
         <p className="text-xs text-asphalt-muted">{t("result.voice_privacy", "Your voice is turned into text; the recording is deleted.")}</p>
         {fieldNotes.map((note) => <article key={note.note_id} className="border-t pt-3 space-y-2"><p>{note.transcript}</p>{note.english && <div><strong>{t("result.for_engineers_title", "For engineers (technical details)")}</strong><p>{note.english}</p></div>}<div className="flex flex-wrap gap-2">{note.tags.map((tag, i) => <span key={`${tag.tag}-${i}`} className="rounded bg-concrete px-2 py-1 text-xs">{t(`result.tag_${tag.tag}`, tag.tag)}: {"\u201c"}{tag.evidence}{"\u201d"}</span>)}</div></article>)}
       </div>
+      {(scan.setup?.advice || scan.setup?.recording_issues?.length) ? <section className="rounded-[4px] border border-concrete-rule bg-white p-5 space-y-2" aria-label={t("result.setup_title", "Recording setup")}>
+        <h2 className="font-bold text-base">{t("result.setup_title", "Recording setup")}</h2>
+        {scan.setup.advice && <p className="text-sm text-asphalt-muted">{scan.setup.advice}</p>}
+        {scan.setup.recording_issues?.length ? <div className="text-sm"><h3 className="font-semibold">{t("result.recording_issues", "Things to improve in the recording")}</h3><ul className="mt-1 list-disc list-inside space-y-1 text-asphalt-muted">{scan.setup.recording_issues.map((issue, index) => <li key={`${issue}-${index}`}>{issue}</li>)}</ul></div> : null}
+      </section> : null}
+      {deviceCheckMessage && <p className="rounded-[4px] border border-concrete-rule bg-white px-4 py-3 text-sm text-asphalt-muted">{deviceCheckMessage}</p>}
       <a href={`https://wa.me/?text=${encodeURIComponent(shareText)}`} target="_blank" rel="noreferrer" className="inline-flex items-center gap-2 rounded bg-highway px-4 py-3 text-white font-semibold"><Share2 className="h-4 w-4" />{t("result.share_whatsapp", "Share on WhatsApp")}</a>
       {scan.measurement?.instances?.length && scan.outputs?.vibration_map ? <div className="rounded-[4px] border border-concrete-rule bg-white p-5"><img src={getFileUrl(scan.scan_id, scan.outputs.vibration_map)} alt={t("result.vibration_map_alt", "Vibration map")} className="max-h-96 mx-auto"/><p className="text-xs text-center">{t("result.vibration_map_caption", "Each part is coloured by how it vibrates")}</p></div> : null}
 
@@ -418,6 +459,20 @@ export default function ResultPage({ scanId, onNavigate, initialScan }: ResultPa
           </span>
         </div>
 
+        {soundUrl && <div className="flex flex-wrap items-center gap-3 rounded border border-concrete-rule bg-concrete-light p-3">
+          <audio ref={sonificationRef} src={soundUrl} preload="none" onPlay={() => setSonificationPlaying(true)} onPause={() => setSonificationPlaying(false)} onEnded={() => setSonificationPlaying(false)} />
+          <button type="button" onClick={() => {
+            const audio = sonificationRef.current;
+            if (!audio) return;
+            if (sonificationPlaying) audio.pause();
+            else void audio.play();
+          }} className="inline-flex items-center gap-2 rounded bg-highway px-4 py-2 text-white text-sm font-semibold">
+            {sonificationPlaying ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+            {t("result.listen_bridge", "Listen to the bridge")}
+          </button>
+          {scan.sonification?.speedup != null && <p className="text-xs text-asphalt-muted">{t("result.sonification_caption", "The real vibration, sped up {{speedup}}x so you can hear it.", { speedup: formatLocaleNumber(scan.sonification.speedup, { maximumFractionDigits: 2 }) })}</p>}
+        </div>}
+
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {/* Magnified Video */}
           <div className="p-3 bg-concrete-light border border-concrete-rule rounded-[4px] space-y-2">
@@ -425,7 +480,11 @@ export default function ResultPage({ scanId, onNavigate, initialScan }: ResultPa
               <span className="font-bold text-asphalt">{t("result.evm_amplified", "Magnified movement (15x)")}</span>
               <span className="text-highway text-[11px] font-semibold">{t("result.motion_amplified_note", "Microscopic motion made visible")}</span>
             </div>
-            {magnifiedVideoUrl ? (
+            {scan.magnification_status === "pending" || scan.magnification_status === "running" ? (
+              <div role="status" className="h-44 rounded-[4px] bg-white border border-concrete-rule flex items-center justify-center p-4 text-center text-xs text-asphalt-muted">
+                {t("result.magnification_pending", "Preparing the slowed-down movement video...")}
+              </div>
+            ) : magnifiedVideoUrl ? (
               <video
                 src={magnifiedVideoUrl}
                 controls
@@ -537,6 +596,33 @@ export default function ResultPage({ scanId, onNavigate, initialScan }: ResultPa
 
         {showEngineerDetails && (
           <div className="p-5 space-y-6 border-t border-concrete-rule font-sans text-xs">
+            {scan.setup && <section className="border-b border-concrete-rule pb-4"><h3 className="font-bold text-sm">{t("result.setup_details", "Scan setup")}</h3><p>{t("result.setup_source", "Setup source")}: <code>{scan.setup.source}</code></p>{scan.setup.structure_type && <p>{t("scan.structure_type", "Structure type")}: <code>{scan.setup.structure_type}</code></p>}</section>}
+            {scan.weather && (scan.weather.temperature_c != null || scan.weather.humidity_pct != null || scan.weather.wind_speed_ms != null) && <section className="space-y-2 border-b border-concrete-rule pb-4">
+              <h3 className="font-bold text-sm">{t("result.weather_title", "Weather at the scan location")}</h3>
+              <dl className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                {scan.weather.temperature_c != null && <div><dt className="text-asphalt-muted">{t("result.temperature", "Temperature")}</dt><dd className="font-semibold">{formatLocaleNumber(scan.weather.temperature_c)} °C</dd></div>}
+                {scan.weather.humidity_pct != null && <div><dt className="text-asphalt-muted">{t("result.humidity", "Humidity")}</dt><dd className="font-semibold">{formatLocaleNumber(scan.weather.humidity_pct)}%</dd></div>}
+                {scan.weather.wind_speed_ms != null && <div><dt className="text-asphalt-muted">{t("result.wind_speed", "Wind speed")}</dt><dd className="font-semibold">{formatLocaleNumber(scan.weather.wind_speed_ms)} m/s</dd></div>}
+              </dl>
+            </section>}
+            {modeShape.length > 0 && <section className="space-y-2 border-b border-concrete-rule pb-4" aria-label={t("result.mode_shape_title", "Bridge mode shape")}>
+              <h3 className="font-bold text-sm">{t("result.mode_shape_title", "Bridge mode shape")}</h3>
+              <div className="h-64 w-full" role="img" aria-label={t("result.mode_shape_title", "Bridge mode shape")}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={modeShape} margin={{ top: 8, right: 16, bottom: 8, left: 8 }}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis type="number" dataKey="position_norm" domain={[0, 1]} name={t("result.position_axis", "Position along bridge")} />
+                    <YAxis type="number" dataKey="amplitude_px" name={t("result.amplitude", "Amplitude")} unit=" px" />
+                    <Tooltip formatter={(value) => [`${formatLocaleNumber(Number(value))} px`, t("result.amplitude", "Amplitude")]} labelFormatter={(value) => `${t("result.position_axis", "Position along bridge")}: ${formatLocaleNumber(Number(value))}`} />
+                    <Line type="monotone" dataKey="amplitude_px" name={t("result.amplitude", "Amplitude")} stroke="#0B6E4F" strokeWidth={2} dot={{ r: 3 }} isAnimationActive={false} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </section>}
+            {trafficPlotUrl && <section className="space-y-2 border-b border-concrete-rule pb-4">
+              <h3 className="font-bold text-sm">{t("result.traffic_title", "Traffic response")}</h3>
+              <figure className="space-y-1"><img src={trafficPlotUrl} alt={t("result.traffic_plot_alt", "Bridge vibration response during vehicle crossings")} className="max-h-80 w-full object-contain" /><figcaption className="text-asphalt-muted">{t("result.traffic_caption", "Shaded: vehicles crossing.")}</figcaption></figure>
+            </section>}
             {hasCableChange && <section id="cable-engineer-details" className="space-y-1 border-b border-concrete-rule pb-4">
               <h3 className="font-bold text-sm">{t("result.cable_change_title", "Cable tension estimate")}</h3>
               <p>{t("result.cable_change_estimate", "Estimated change in cable tension since {{date}}: {{change}}%", {

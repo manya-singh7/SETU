@@ -29,6 +29,7 @@ from setu.result import (
     QualityGateInfo,
     ScanResult,
     SegmentationInfo,
+    SetupInfo,
     Verdict,
     VideoInfo,
 )
@@ -211,16 +212,27 @@ def test_weak_result_allows_frequency_and_psd():
 def test_schema_11_additions_and_schema_10_compatibility():
     current = ScanResult()
     data = current.to_dict()
-    assert data["schema_version"] == "1.2"
+    assert data["schema_version"] == "1.4"
     assert data["field_notes"] == []
     assert data["measurement"]["instances"] == []
     assert data["outputs"]["vibration_map"] is None
+    assert data["outputs"]["sound"] is None
+    assert data["measurement"]["mode_shape"] == []
+    assert data["sonification"] is None
+    assert data["weather"] is None
+    assert data["device_check"]["status"] == "not_recorded"
+    assert data["traffic"] == {"events": [], "response_plot": None}
+    assert data["magnification_status"] == "skipped"
     assert data["cable"] == {
         "is_cable": False,
         "tension_change_pct": None,
         "tension_change_range_pct": None,
         "compared_to_scan_id": None,
         "compared_to_date": None,
+    }
+    assert data["setup"] == {
+        "source": "default", "structure_type": None,
+        "recording_issues": [], "advice": None,
     }
     legacy = ScanResult.from_dict({"schema_version": "1.0", "measurement": {}, "outputs": {}})
     legacy_data = legacy.to_dict()
@@ -231,6 +243,51 @@ def test_schema_11_additions_and_schema_10_compatibility():
     legacy_11 = ScanResult.from_dict({"schema_version": "1.1", "measurement": {}, "outputs": {}})
     assert legacy_11.to_dict()["schema_version"] == "1.1"
     assert "cable" not in legacy_11.to_dict()
+    legacy_12 = ScanResult.from_dict({"schema_version": "1.2", "measurement": {}, "outputs": {}})
+    assert "setup" not in legacy_12.to_dict()
+    legacy_13 = ScanResult.from_dict({"schema_version": "1.3", "measurement": {}, "outputs": {}})
+    assert "sound" not in legacy_13.to_dict()["outputs"]
+    assert "sonification" not in legacy_13.to_dict()
+    assert "magnification_status" not in legacy_13.to_dict()
+    assert "target_bbox" not in legacy_13.to_dict()["segmentation"]
+
+
+def test_schema_14_sound_environment_device_traffic_round_trip():
+    raw = {
+        "schema_version": "1.4",
+        "outputs": {"sound": "bridge_sound.wav"},
+        "segmentation": {"target_bbox": [10, 20, 30, 40]},
+        "sonification": {"speedup": 75.0, "pitch_hz": 300.0},
+        "weather": {"temperature_c": 26.5, "humidity_pct": 65.0,
+                    "wind_speed_ms": 2.0, "source": "open-meteo"},
+        "device_check": {"status": "agrees", "device_frequency_hz": 3.7,
+                         "device_ci_hz": [3.6, 3.8], "sample_rate_hz": 50.0,
+                         "note": "Frequency intervals overlap."},
+        "traffic": {"events": [{"t_start": 2.0, "t_end": 5.0, "type": "truck"}],
+                    "response_plot": "traffic-response.png"},
+        "measurement": {"mode_shape": [{"label": "midspan", "position_norm": 0.5,
+                                        "amplitude_px": 0.12}]},
+    }
+    current = ScanResult.from_dict(raw)
+    restored = ScanResult.from_json(current.to_json())
+    assert restored.to_dict() == current.to_dict()
+    assert restored.outputs.sound == "bridge_sound.wav"
+    assert restored.segmentation.target_bbox == [10.0, 20.0, 30.0, 40.0]
+    assert restored.measurement.mode_shape[0].position_norm == 0.5
+
+
+def test_schema_13_setup_metadata_round_trip():
+    current = ScanResult(
+        schema_version="1.3",
+        setup=SetupInfo(
+            source="muse_spark", structure_type="bridge pier",
+            recording_issues=["camera movement"], advice="Brace the phone.",
+        ),
+    )
+    restored = ScanResult.from_json(current.to_json())
+    assert restored.to_dict() == current.to_dict()
+    assert restored.setup.source == "muse_spark"
+    assert restored.setup.structure_type == "bridge pier"
 
 
 def test_schema_12_cable_round_trip():

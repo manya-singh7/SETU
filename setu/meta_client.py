@@ -10,6 +10,7 @@ Supports three execution modes:
 
 from datetime import datetime, timezone
 import hashlib
+import base64
 import json
 import logging
 import os
@@ -38,6 +39,7 @@ OUTPUT_COST_PER_1K_TOKENS = 0.0015
 
 # SAM 3.1 pricing: $2.50 per 1,000 images ($0.0025 per image)
 SAM_COST_PER_IMAGE = 0.0025
+SAM_VIDEO_COST_PER_FRAME = 0.20 / 1000.0
 MUSE_VOICE_COST_PER_HOUR = 0.18
 
 
@@ -311,6 +313,35 @@ class MetaClient:
             extra_inputs={"image_hash": image_hash, "prompt": prompt},
         )
 
+    def video_completion(
+        self,
+        video_path: Union[str, Path],
+        prompt: str,
+        model: Optional[str] = None,
+        fps: float = 5.0,
+        fixture_name: Optional[str] = "muse_spark_director.json",
+    ) -> Dict[str, Any]:
+        """Send an inline video data URL to Muse Spark through Chat Completions."""
+        video_bytes = Path(video_path).read_bytes()
+        video_b64 = base64.b64encode(video_bytes).decode("ascii")
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "video_url", "video_url": {
+                    "url": f"data:video/mp4;base64,{video_b64}", "fps": fps,
+                }},
+            ],
+        }]
+        video_hash = hashlib.sha256(video_bytes).hexdigest()
+        return self.chat_completion(
+            messages=messages,
+            model=model,
+            response_format={"type": "json_object"},
+            fixture_name=fixture_name,
+            extra_inputs={"video_sha256": video_hash, "prompt": prompt, "fps": fps},
+        )
+
     def transcribe_audio(self, wav_path: str, language: str, duration_s: float) -> str:
         """Transcribe a mono PCM WAV through Muse Voice Transcribe."""
         model = "muse-voice-transcribe-1.0"
@@ -514,6 +545,97 @@ class MetaClient:
             except Exception as exc:
                 logger.warning(f"Could not write Meta SAM cache to {cache_file}: {exc}")
 
+        return data
+
+    def track_video(
+        self,
+        video_path: Union[str, Path],
+        prompt: str,
+        model: Optional[str] = None,
+        fps: float = 10.0,
+        frame_count: Optional[int] = None,
+        fixture_name: Optional[str] = "sam_3_1_video_response.json",
+    ) -> Optional[Dict[str, Any]]:
+        """Track one prompted concept in a video with SAM 3.1 Responses API.
+
+        Video is supplied as a base64 data URL. ``frame_count`` is the number
+        of frames sent and is used for the documented per-frame cost estimate.
+        Public demo and missing-key calls return None without making a request.
+        """
+        from setu.config import settings
+
+        active_model = model or getattr(settings, "SAM_MODEL", "sam-3.1")
+        prompt = " ".join(prompt.strip().split()[:32])
+        path = Path(video_path)
+        video_bytes = path.read_bytes()
+        video_hash = hashlib.sha256(video_bytes).hexdigest()
+        nframes = max(0, int(frame_count or 0))
+        cache_key = self._compute_cache_key(
+            active_model, [{"prompt": prompt}],
+            {"video_sha256": video_hash, "fps": float(fps), "frame_count": nframes},
+        )
+        cache_file = os.path.join(self.cache_dir, f"{cache_key}.json")
+
+        if self.mode == "mock":
+            try:
+                return self._load_fixture(fixture_name or "sam_3_1_video_response.json")
+            except FileNotFoundError:
+                return {"id": "mock-sam-video-empty", "status": "completed", "output": [], "_mock_data": True}
+
+        if self.mode == "cached" and os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as exc:
+                logger.warning("Error reading Meta SAM video cache %s: %s", cache_file, exc)
+
+        # Demo deployments may read existing cache entries, but never call live.
+        public_demo = os.environ.get("SETU_PUBLIC_DEMO", "").strip().lower() in ("true", "1", "yes")
+        if public_demo or not self.api_key:
+            logger.info("SAM video tracking skipped: %s", "public demo mode" if public_demo else "META_API_KEY is not set")
+            return None
+
+        cost = round(nframes * SAM_VIDEO_COST_PER_FRAME, 6)
+        current_total = get_running_total_cost(self.usage_log_path)
+        if current_total + cost > self.budget_cap:
+            raise BudgetExceededError(
+                f"SETU budget cap of ${self.budget_cap:.2f} reached (Current spend: ${current_total:.4f}). Refusing live call."
+            )
+        payload = {
+            "model": active_model,
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": prompt},
+                {"type": "input_video", "video_url": f"data:video/mp4;base64,{base64.b64encode(video_bytes).decode('ascii')}"},
+            ]}],
+            "stream": False,
+            "metadata": {"propagation_direction": "both", "mask_encoding": "one_bit"},
+        }
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json", "User-Agent": "SETU-Civil-Telemetry/0.2.0"}
+        try:
+            resp = requests.post(f"{self.base_url.rstrip('/')}/responses", headers=headers, json=payload, timeout=self.timeout)
+            if resp.status_code != 200:
+                raise MetaAPIError(f"Meta SAM video API responded with HTTP {resp.status_code}: {resp.text[:300]}")
+            data = resp.json()
+        except requests.exceptions.RequestException as exc:
+            raise MetaAPIError(f"Meta SAM video API network request failed: {exc}") from exc
+
+        total = round(current_total + cost, 6)
+        entry = {"timestamp": datetime.now(timezone.utc).isoformat(), "model": active_model,
+                 "frames": nframes, "estimated_cost": cost}
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.usage_log_path)), exist_ok=True)
+            with open(self.usage_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception as exc:
+            logger.warning("Could not write Meta SAM video usage log: %s", exc)
+        print(f"[Meta API Usage] Model: {active_model} | Video frames: {nframes} | Call: ${cost:.6f} | Running Total: ${total:.6f} / Cap: ${self.budget_cap:.2f}")
+        if self.mode == "cached":
+            try:
+                os.makedirs(self.cache_dir, exist_ok=True)
+                with open(cache_file, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+            except Exception as exc:
+                logger.warning("Could not write Meta SAM video cache: %s", exc)
         return data
 
 

@@ -4,6 +4,7 @@ import io
 import os
 import wave
 import json
+from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
@@ -48,7 +49,7 @@ def test_scan_upload_demo_mode():
     result = response.json()
 
     # Verify shared result format
-    assert result["schema_version"] == "1.2"
+    assert result["schema_version"] == "1.4"
     assert result["scan_id"].startswith("scan_")
     assert result["status"] == "complete"
     assert result["is_demo"] is True
@@ -65,6 +66,8 @@ def test_scan_upload_demo_mode():
     assert result["outputs"]["spectrum_plot"] is None
     assert result["outputs"]["displacement_plot"] is None
     assert result["outputs"]["vibration_map"] is None
+    assert result["outputs"]["sound"] is None
+    assert result["outputs"]["sound"] is None
 
 
 def test_demo_result_has_is_demo_true_and_null_outputs():
@@ -84,12 +87,212 @@ def test_demo_result_has_is_demo_true_and_null_outputs():
     assert outputs["spectrum_plot"] is None
     assert outputs["displacement_plot"] is None
     assert outputs["vibration_map"] is None
+    assert outputs["sound"] is None
 
     # Assert no placeholder output files were created on disk
     scan_dir = storage.get_scan_dir(data["scan_id"])
     assert not (scan_dir / "magnified.mp4").exists()
     assert not (scan_dir / "spectrum.png").exists()
     assert not (scan_dir / "displacement.png").exists()
+
+
+def test_device_motion_is_validated_and_saved(tmp_path):
+    samples = [
+        {"t": 0.0, "ax": 0.1, "ay": 0.2, "az": 9.8},
+        {"t": 0.02, "ax": 0.11, "ay": 0.19, "az": 9.81},
+    ]
+    response = client.post(
+        "/api/scans",
+        files={"file": ("device.mp4", io.BytesIO(b"video"), "video/mp4")},
+        data={"target_prompt": "pier", "device_motion": json.dumps(samples)},
+    )
+    assert response.status_code == 200
+    saved = storage.get_scan_dir(response.json()["scan_id"]) / "device_motion.json"
+    assert json.loads(saved.read_text(encoding="utf-8")) == samples
+
+
+def test_device_motion_limits_and_malformed_data(monkeypatch):
+    video = {"file": ("device_limit.mp4", io.BytesIO(b"video"), "video/mp4")}
+    too_many = [{"t": i * 0.001, "ax": 0, "ay": 0, "az": 0} for i in range(20_001)]
+    response = client.post("/api/scans", files=video, data={"target_prompt": "pier", "device_motion": json.dumps(too_many)})
+    assert response.status_code == 413
+    assert "20,000" in response.json()["detail"]
+
+    malformed = client.post(
+        "/api/scans",
+        files={"file": ("device_bad.mp4", io.BytesIO(b"video"), "video/mp4")},
+        data={"target_prompt": "pier", "device_motion": "not-json"},
+    )
+    assert malformed.status_code == 400
+    assert "JSON list" in malformed.json()["detail"]
+
+    long_samples = [
+        {"t": 0.0, "ax": 0, "ay": 0, "az": 0},
+        {"t": 61.0, "ax": 0, "ay": 0, "az": 0},
+    ]
+    over_duration = client.post(
+        "/api/scans",
+        files={"file": ("device_long.mp4", io.BytesIO(b"video"), "video/mp4")},
+        data={"target_prompt": "pier", "device_motion": json.dumps(long_samples)},
+    )
+    assert over_duration.status_code == 413
+    assert "60 seconds" in over_duration.json()["detail"]
+
+
+def test_scan_sound_is_served_only_when_pipeline_output_exists():
+    scan_id = "scan_sound_api_test"
+    result = {
+        "schema_version": "1.4", "scan_id": scan_id, "is_demo": False,
+        "status": "complete", "video": {"fps": 100.0},
+        "measurement": {"dominant_frequency_hz": 4.0,
+                         "peaks": [{"frequency_hz": 4.0, "relative_power": 1.0, "snr_db": 20.0}]},
+        "outputs": {"sound": "bridge_sound.wav"},
+        "setup": {"source": "user", "structure_type": None, "recording_issues": [], "advice": None},
+    }
+    storage.save_scan_result(scan_id, result)
+    (storage.get_scan_dir(scan_id) / "bridge_sound.wav").write_bytes(_wav_bytes())
+
+    loaded = client.get(f"/api/scans/{scan_id}")
+    assert loaded.json()["sound_available"] is True
+    assert loaded.json()["sound_url"] == f"/api/scans/{scan_id}/sound.wav"
+    assert loaded.json()["sonify_url"] is None
+    assert loaded.json()["sound_summary"]["peak_count"] == 1
+
+    download = client.get(f"/api/scans/{scan_id}/sound.wav")
+    assert download.status_code == 200
+    assert download.headers["content-type"].startswith("audio/wav")
+    file_route = client.get(f"/api/scans/{scan_id}/files/bridge_sound.wav")
+    assert file_route.status_code == 200
+    assert file_route.headers["content-type"].startswith("audio/wav")
+
+    empty_id = "scan_sound_missing"
+    storage.save_scan_result(empty_id, {"scan_id": empty_id, "outputs": {"sound": None}})
+    absent = client.get(f"/api/scans/{empty_id}/sound.wav")
+    assert absent.status_code == 404
+    assert client.post(f"/api/scans/{scan_id}/sound").status_code == 405
+    assert client.get(f"/api/scans/{scan_id}/sonify").status_code == 404
+
+
+def test_analysis_completes_before_magnification_and_tracks_status(monkeypatch):
+    import setu.scan as scan_module
+    from setu import api
+
+    scan_id = "scan_magnification_flow_test"
+    scan_dir = storage.get_scan_dir(scan_id)
+    (scan_dir / "clip.mp4").write_bytes(b"source video")
+    storage.save_scan_result(scan_id, {
+        "schema_version": "1.4", "scan_id": scan_id, "status": "queued",
+        "is_demo": False, "video": {"filename": "clip.mp4", "fps": 30.0},
+        "setup": {"source": "user", "structure_type": None, "recording_issues": [], "advice": None},
+        "outputs": {"magnified_video": None},
+    })
+    pipeline_calls = []
+    def fake_analyze_video(**kwargs):
+        pipeline_calls.append(kwargs)
+        return {
+            "schema_version": "1.4", "status": "complete", "is_demo": False,
+            "verdict": {"level": "usable", "reasons": []},
+            "video": {"filename": "clip.mp4", "fps": 30.0},
+            "segmentation": {"target_bbox": [10, 20, 30, 40]},
+            "measurement": {"dominant_frequency_hz": 3.2, "peaks": [], "instances": []},
+            "outputs": {"magnified_video": None},
+        }
+    monkeypatch.setattr(scan_module, "analyze_video", fake_analyze_video)
+    queued_jobs = []
+    monkeypatch.setattr(api, "_start_background_task", lambda target, *args: queued_jobs.append((target, args)))
+
+    api._execute_analysis_task(
+        scan_id=scan_id, video_path=str(scan_dir / "clip.mp4"), lat=0.0, lon=0.0,
+        target_prompt="pier", background_prompt="building", out_dir=str(scan_dir),
+    )
+
+    complete_result = storage.load_scan_result(scan_id)
+    assert pipeline_calls[0]["magnify"] is False
+    assert complete_result["status"] == "complete"
+    assert complete_result["magnification_status"] == "pending"
+    assert complete_result["outputs"]["magnified_video"] is None
+    assert queued_jobs == [(api._execute_magnification_task, (scan_id,))]
+
+    import setu.evm as evm
+    def fake_magnify(**kwargs):
+        assert storage.load_scan_result(scan_id)["magnification_status"] == "running"
+        Path(kwargs["output_video_path"]).write_bytes(b"magnified")
+        return kwargs["output_video_path"]
+    monkeypatch.setattr(evm, "magnify_video", fake_magnify)
+    queued_jobs[0][0](*queued_jobs[0][1])
+    done_result = storage.load_scan_result(scan_id)
+    assert done_result["status"] == "complete"
+    assert done_result["magnification_status"] == "done"
+    assert done_result["outputs"]["magnified_video"] == "magnified.mp4"
+
+    missing_bbox_id = "scan_magnification_missing_bbox_test"
+    missing_bbox_dir = storage.get_scan_dir(missing_bbox_id)
+    (missing_bbox_dir / "clip.mp4").write_bytes(b"source video")
+    storage.save_scan_result(missing_bbox_id, {
+        "schema_version": "1.4", "scan_id": missing_bbox_id, "status": "complete",
+        "verdict": {"level": "usable", "reasons": []},
+        "video": {"filename": "clip.mp4", "fps": 30.0},
+        "measurement": {"dominant_frequency_hz": 3.0},
+        "segmentation": {"target_bbox": None},
+        "outputs": {"magnified_video": None},
+    })
+    magnify_calls = []
+    monkeypatch.setattr(evm, "magnify_video", lambda **kwargs: magnify_calls.append(kwargs))
+    api._execute_magnification_task(missing_bbox_id)
+    no_box_result = storage.load_scan_result(missing_bbox_id)
+    assert no_box_result["magnification_status"] == "skipped"
+    assert no_box_result["magnification_reason"] == "No target region recorded"
+    assert magnify_calls == []
+
+
+def test_weak_scan_skips_magnification_and_magnification_errors_fail_status(monkeypatch):
+    import setu.scan as scan_module
+    import setu.evm as evm
+    from setu import api
+
+    scan_id = "scan_magnification_weak_test"
+    scan_dir = storage.get_scan_dir(scan_id)
+    (scan_dir / "clip.mp4").write_bytes(b"source video")
+    storage.save_scan_result(scan_id, {
+        "schema_version": "1.4", "scan_id": scan_id, "status": "queued",
+        "is_demo": False, "video": {"filename": "clip.mp4", "fps": 30.0},
+        "outputs": {"magnified_video": None},
+    })
+    monkeypatch.setattr(scan_module, "analyze_video", lambda **_kwargs: {
+        "schema_version": "1.4", "status": "complete", "is_demo": False,
+        "verdict": {"level": "weak", "reasons": ["low quality"]},
+        "video": {"filename": "clip.mp4", "fps": 30.0},
+        "measurement": {"dominant_frequency_hz": 3.0, "peaks": [], "instances": []},
+        "outputs": {"magnified_video": None},
+    })
+    jobs = []
+    monkeypatch.setattr(api, "_start_background_task", lambda *args: jobs.append(args))
+    api._execute_analysis_task(
+        scan_id=scan_id, video_path=str(scan_dir / "clip.mp4"), lat=0.0, lon=0.0,
+        target_prompt="pier", background_prompt="building", out_dir=str(scan_dir),
+    )
+    weak_result = storage.load_scan_result(scan_id)
+    assert weak_result["status"] == "complete"
+    assert weak_result["magnification_status"] == "skipped"
+    assert jobs == []
+
+    failed_id = "scan_magnification_error_test"
+    failed_dir = storage.get_scan_dir(failed_id)
+    (failed_dir / "clip.mp4").write_bytes(b"source video")
+    storage.save_scan_result(failed_id, {
+        "schema_version": "1.4", "scan_id": failed_id, "status": "complete",
+        "verdict": {"level": "usable", "reasons": []},
+        "video": {"filename": "clip.mp4", "fps": 30.0},
+        "segmentation": {"target_bbox": [10, 10, 40, 40]},
+        "measurement": {"dominant_frequency_hz": 3.0},
+        "outputs": {"magnified_video": None},
+    })
+    monkeypatch.setattr(evm, "magnify_video", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("render failed")))
+    api._execute_magnification_task(failed_id)
+    failed_result = storage.load_scan_result(failed_id)
+    assert failed_result["status"] == "complete"
+    assert failed_result["magnification_status"] == "failed"
+    assert failed_result["outputs"]["magnified_video"] is None
 
 
 def _wav_bytes(seconds=1):
@@ -383,7 +586,7 @@ def test_upload_can_explicitly_mark_cable_scan():
         data={"target_prompt": "concrete structure", "is_cable": "true"},
     )
     assert response.status_code == 200
-    assert response.json()["schema_version"] == "1.2"
+    assert response.json()["schema_version"] == "1.4"
     assert response.json()["cable"]["is_cable"] is True
 
 
@@ -433,6 +636,141 @@ def test_public_demo_rate_limit_and_real_pipeline(monkeypatch):
     assert limited.status_code == 429
 
 
+def _mock_director(monkeypatch, result):
+    import sys
+    import types
+    module = types.ModuleType("setu.director")
+    calls = []
+    def direct_scan(video_path, language):
+        calls.append((video_path, language))
+        return result
+    module.direct_scan = direct_scan
+    monkeypatch.setitem(sys.modules, "setu.director", module)
+    return calls
+
+
+def test_empty_prompt_calls_director_and_uses_its_setup(monkeypatch):
+    from setu import api
+    monkeypatch.setenv("SETU_DEMO_MODE", "true")
+    monkeypatch.setattr(api.settings, "META_API_KEY", "test-key")
+    calls = _mock_director(monkeypatch, {
+        "structure_visible": True, "structure_type": "bridge pier",
+        "target_prompt": "concrete pier", "background_prompt": "distant building",
+        "is_cable": True, "recording_issues": [], "advice": "Hold the phone steady.",
+    })
+    response = client.post(
+        "/api/scans",
+        files={"file": ("director.mp4", io.BytesIO(b"video"), "video/mp4")},
+        data={"target_prompt": "", "background_prompt": "", "language": "hi", "is_cable": "false"},
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert len(calls) == 1 and calls[0][1] == "hi"
+    assert result["segmentation"]["target_prompt"] == "concrete pier"
+    assert result["segmentation"]["background_prompt"] == "distant building"
+    assert result["setup"]["source"] == "muse_spark"
+    assert result["setup"]["structure_type"] == "bridge pier"
+    assert result["cable"]["is_cable"] is False
+
+
+def test_user_prompt_skips_director(monkeypatch):
+    import sys
+    import types
+    from setu import api
+    monkeypatch.setenv("SETU_DEMO_MODE", "true")
+    module = types.ModuleType("setu.director")
+    module.direct_scan = lambda *_args: pytest.fail("director should not run for user prompts")
+    monkeypatch.setitem(sys.modules, "setu.director", module)
+    response = client.post(
+        "/api/scans",
+        files={"file": ("user.mp4", io.BytesIO(b"video"), "video/mp4")},
+        data={"target_prompt": "steel cable", "background_prompt": "sky"},
+    )
+    assert response.status_code == 200
+    assert response.json()["setup"]["source"] == "user"
+    assert response.json()["segmentation"]["target_prompt"] == "steel cable"
+
+
+def test_director_rejects_invisible_structure_without_pipeline(monkeypatch):
+    from setu import api
+    monkeypatch.setenv("SETU_DEMO_MODE", "false")
+    monkeypatch.setattr(api.settings, "META_API_KEY", "test-key")
+    _mock_director(monkeypatch, {
+        "structure_visible": False, "structure_type": None,
+        "target_prompt": "", "background_prompt": "", "is_cable": False,
+        "recording_issues": ["structure not visible"], "advice": "Move closer.",
+    })
+    pipeline_calls = []
+    monkeypatch.setattr(api, "_execute_analysis_task", lambda **kwargs: pipeline_calls.append(kwargs))
+    response = client.post(
+        "/api/scans",
+        files={"file": ("invisible.mp4", io.BytesIO(b"video"), "video/mp4")},
+        data={"target_prompt": "", "background_prompt": ""},
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert result["verdict"]["level"] == "failed"
+    assert result["verdict"]["reasons"] == ["structure not visible", "Move closer."]
+    assert pipeline_calls == []
+
+
+def test_director_none_uses_defaults_and_adds_reason(monkeypatch):
+    from setu import api
+    monkeypatch.setenv("SETU_DEMO_MODE", "true")
+    monkeypatch.setattr(api.settings, "META_API_KEY", "test-key")
+    _mock_director(monkeypatch, None)
+    response = client.post(
+        "/api/scans",
+        files={"file": ("defaults.mp4", io.BytesIO(b"video"), "video/mp4")},
+        data={"target_prompt": "", "background_prompt": ""},
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert result["segmentation"]["target_prompt"] == "concrete pillar"
+    assert result["segmentation"]["background_prompt"] == "building"
+    assert result["setup"]["source"] == "default"
+    assert result["setup"]["advice"] == "Prompts chosen automatically by default; AI setup unavailable."
+    assert "Prompts chosen automatically by default; AI setup unavailable." in result["verdict"]["reasons"]
+
+
+def test_missing_meta_key_skips_director_and_uses_defaults(monkeypatch):
+    import sys
+    import types
+    from setu import api
+    monkeypatch.setenv("SETU_DEMO_MODE", "true")
+    monkeypatch.delenv("META_API_KEY", raising=False)
+    monkeypatch.setattr(api.settings, "META_API_KEY", None)
+    module = types.ModuleType("setu.director")
+    module.direct_scan = lambda *_args: pytest.fail("director must not call Meta without a key")
+    monkeypatch.setitem(sys.modules, "setu.director", module)
+    response = client.post(
+        "/api/scans",
+        files={"file": ("no_key.mp4", io.BytesIO(b"video"), "video/mp4")},
+        data={"target_prompt": "", "background_prompt": ""},
+    )
+    assert response.status_code == 200
+    assert response.json()["setup"]["source"] == "default"
+    assert response.json()["setup"]["advice"] == "Prompts chosen automatically by default; AI setup unavailable."
+
+
+def test_public_mode_skips_director_even_when_key_is_configured(monkeypatch):
+    import sys
+    import types
+    from setu import api
+    api._upload_times.clear()
+    monkeypatch.setattr(api.settings, "META_API_KEY", "test-key")
+    module = types.ModuleType("setu.director")
+    module.direct_scan = lambda *_args: pytest.fail("public mode must not invoke live setup")
+    monkeypatch.setitem(sys.modules, "setu.director", module)
+    response = client.post(
+        "/api/scans",
+        files=_public_video(monkeypatch, name="public_setup.mp4"),
+        data={"target_prompt": "", "background_prompt": ""},
+    )
+    assert response.status_code == 200
+    assert response.json()["setup"]["source"] == "default"
+
+
 def test_public_demo_rejects_over_60_seconds_and_deletes_video(monkeypatch):
     from setu import api
     monkeypatch.setenv("SETU_PUBLIC_DEMO", "true")
@@ -445,6 +783,39 @@ def test_public_demo_rejects_over_60_seconds_and_deletes_video(monkeypatch):
     assert not list(storage.SCANS_DIR.glob("scan_*/long.mp4"))
 
 
+def test_public_cache_miss_never_calls_network_and_labels_fallback(monkeypatch, tmp_path):
+    import numpy as np
+    import requests
+    from setu import api
+    from setu.assess import get_assessor
+    from setu.meta_client import get_meta_client
+    from setu.segment import MetaSAM31Segmenter
+
+    monkeypatch.setenv("SETU_PUBLIC_DEMO", "true")
+    monkeypatch.delenv("META_API_KEY", raising=False)
+    monkeypatch.setattr(api.settings, "META_API_KEY", None)
+    client = get_meta_client()
+    monkeypatch.setattr(client, "cache_dir", str(tmp_path / "empty-cache"))
+    monkeypatch.setattr(client, "api_key", None)
+    monkeypatch.setattr(client, "mode", "cached")
+    network_calls = []
+    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: network_calls.append(args))
+
+    api.configure_public_meta_mode()
+    segmented = MetaSAM31Segmenter(meta_client=client).segment(
+        np.zeros((96, 128, 3), dtype=np.uint8),
+        target_prompt="concrete pillar",
+        background_prompt="building",
+    )
+    assessment = get_assessor().assess()
+
+    assert network_calls == []
+    assert segmented.method == "fallback"
+    assert segmented.target_source == "fallback"
+    assert segmented.background_source == "fallback"
+    assert assessment.assessor == "local_rules"
+
+
 def test_public_upload_cleanup_removes_only_old_original(tmp_path, monkeypatch):
     from setu import api
     import time
@@ -454,7 +825,7 @@ def test_public_upload_cleanup_removes_only_old_original(tmp_path, monkeypatch):
     output = scan_dir / "magnified.mp4"; output.write_bytes(b"output")
     old = time.time() - 90000
     os.utime(upload, (old, old))
-    monkeypatch.setattr(api, "SCANS_DIR", tmp_path)
+    monkeypatch.setattr(api, "SCANS_DIR", scan_dir)
     assert api.cleanup_expired_uploads() == 1
     assert not upload.exists()
     assert output.exists()
@@ -470,7 +841,7 @@ def test_scan_pipeline_non_demo_mode(monkeypatch):
     response = client.post("/api/scans", files=files, data=data)
     assert response.status_code == 200
     res = response.json()
-    assert res["schema_version"] == "1.2"
+    assert res["schema_version"] == "1.4"
     scan_id = res["scan_id"]
 
     # In TestClient, background tasks execute before returning

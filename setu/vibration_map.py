@@ -55,11 +55,24 @@ def _record_instance(
     displacement: Optional[np.ndarray],
     peaks: list,
     verdict: str,
+    fps: float,
+    amplitude_frequency_hz: Optional[float] = None,
 ) -> Dict[str, Any]:
     peak = peaks[0] if peaks else None
     amp = None
     if displacement is not None and len(displacement) and np.all(np.isfinite(displacement)):
-        amp = float((np.max(displacement) - np.min(displacement)) / 2.0)
+        if peak is not None or amplitude_frequency_hz is not None:
+            # Fit the shared spectral component, rather than using total trace
+            # range (which includes noise and other modes).
+            times = np.arange(len(displacement), dtype=np.float64)
+            if fps > 0:
+                fit_frequency = amplitude_frequency_hz if amplitude_frequency_hz is not None else float(peak.freq_hz)
+                phase = 2.0 * np.pi * fit_frequency * times / fps
+                design = np.column_stack((np.sin(phase), np.cos(phase), np.ones_like(phase)))
+                coeff, *_ = np.linalg.lstsq(design, displacement, rcond=None)
+                amp = float(np.hypot(coeff[0], coeff[1]))
+        if amp is None:
+            amp = float((np.max(displacement) - np.min(displacement)) / 2.0)
     return {
         "label": label,
         "bbox": [int(v) for v in bbox],
@@ -67,6 +80,46 @@ def _record_instance(
         "amplitude_px": amp,
         "verdict": verdict,
     }
+
+
+def mode_shape_from_instances(
+    instances: Sequence[Mapping[str, Any]],
+    dominant_frequency_hz: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """Return normalized mode-shape points for at least three collinear records."""
+    usable = [item for item in instances
+              if item.get("verdict") == "usable"
+              and item.get("amplitude_px") is not None
+              and item.get("frequency_hz") is not None]
+    if dominant_frequency_hz is not None:
+        usable = [item for item in usable
+                  if abs(float(item["frequency_hz"]) - dominant_frequency_hz)
+                  <= max(0.15, dominant_frequency_hz * 0.03)]
+    if len(usable) < 3:
+        return []
+    centers = np.asarray([
+        (float(item["bbox"][0]) + float(item["bbox"][2]) / 2.0,
+         float(item["bbox"][1]) + float(item["bbox"][3]) / 2.0)
+        for item in usable
+    ], dtype=np.float64)
+    centered = centers - centers.mean(axis=0)
+    eigenvalues, eigenvectors = np.linalg.eigh(centered.T @ centered / len(usable))
+    if eigenvalues[-1] <= 1e-12 or eigenvalues[0] / eigenvalues[-1] > 0.10:
+        return []
+    axis = eigenvectors[:, -1]
+    if axis[0] < 0.0 or (abs(axis[0]) <= 1e-12 and axis[1] < 0.0):
+        axis = -axis
+    projection = centered @ axis
+    lo, hi = float(np.min(projection)), float(np.max(projection))
+    if hi - lo <= 1e-9:
+        return []
+    result = [
+        {"label": str(item.get("label", "instance")),
+         "position_norm": float((position - lo) / (hi - lo)),
+         "amplitude_px": float(item["amplitude_px"])}
+        for item, position in zip(usable, projection)
+    ]
+    return sorted(result, key=lambda item: item["position_norm"])
 
 
 def _hex_bgr(value: str) -> Tuple[int, int, int]:
@@ -147,6 +200,7 @@ def build_vibration_map(
     instances: Sequence[Tuple[str, np.ndarray]],
     background_mask: np.ndarray,
     out_png: Union[str, os.PathLike[str]],
+    shared_frequency_hz: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """Measure up to 16 segmented instances and draw their usable frequencies.
 
@@ -216,7 +270,10 @@ def build_vibration_map(
             verdict = "failed"
             peaks = []
             displacement = None
-        record = _record_instance(label, bbox, displacement, peaks, verdict)
+        record = _record_instance(
+            label, bbox, displacement, peaks, verdict, fps,
+            amplitude_frequency_hz=shared_frequency_hz,
+        )
         rendered.append((label, mask, record))
 
     _draw_map(frame, rendered, out_png)

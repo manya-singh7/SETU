@@ -43,6 +43,53 @@ describe("ResultPage Smoke Tests", () => {
     expect(Array.from(container.querySelectorAll("article span")).some((el) => el.textContent?.includes("Visible crack"))).toBe(true);
   });
 
+  it("shows setup advice and recording issues for drivers and setup source for engineers", () => {
+    const scan = { ...mockUsableScan, setup: {
+      source: "muse_spark" as const,
+      structure_type: "deck",
+      recording_issues: ["The camera moved during the clip."],
+      advice: "Rest the phone on a firm surface.",
+    } };
+    render(<ResultPage scanId="scan_usable_001" onNavigate={mockNavigate} initialScan={scan} />);
+    expect(screen.getByText("Rest the phone on a firm surface.")).toBeInTheDocument();
+    expect(screen.getByText("The camera moved during the clip.")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("For engineers (technical details)"));
+    expect(screen.getByText("muse_spark")).toBeInTheDocument();
+  });
+
+  it("renders sonification, device agreement, traffic plot, weather, and real mode-shape points", () => {
+    const scan = {
+      ...mockUsableScan,
+      outputs: { ...mockUsableScan.outputs, sound: "vibration.wav" },
+      sonification: { speedup: 20, pitch_hz: 3.7 },
+      device_check: { status: "agrees" as const, device_frequency_hz: 3.7, device_ci_hz: [3.6, 3.8] as [number, number], sample_rate_hz: 50, note: null },
+      weather: { temperature_c: 24, humidity_pct: 65, wind_speed_ms: 2.5, source: "open-meteo" },
+      traffic: { events: [], response_plot: "traffic.png" },
+      measurement: { ...mockUsableScan.measurement, mode_shape: [
+        { label: "Pier A", position_norm: 0, amplitude_px: 0.4 },
+        { label: "Pier B", position_norm: 1, amplitude_px: 0.8 },
+      ] },
+    };
+    render(<ResultPage scanId="scan_usable_001" onNavigate={mockNavigate} initialScan={scan} />);
+
+    expect(screen.getByRole("button", { name: "Listen to the bridge" })).toBeInTheDocument();
+    expect(screen.getByText("The real vibration, sped up 20x so you can hear it.")).toBeInTheDocument();
+    expect(screen.getByText("Your phone's motion sensor agreed with the camera")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("For engineers (technical details)"));
+    expect(screen.getByText("24 °C")).toBeInTheDocument();
+    expect(screen.getByText("65%")).toBeInTheDocument();
+    expect(screen.getByAltText("Bridge vibration response during vehicle crossings")).toBeInTheDocument();
+    expect(screen.getByText("Shaded: vehicles crossing.")).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "Bridge mode shape" })).toBeInTheDocument();
+  });
+
+  it("shows the magnification preparation message for pending work and hides unrecorded device checks", () => {
+    const scan = { ...mockUsableScan, magnification_status: "running", device_check: { status: "not_recorded" as const, device_frequency_hz: null, device_ci_hz: null, sample_rate_hz: null, note: null } };
+    render(<ResultPage scanId="scan_usable_001" onNavigate={mockNavigate} initialScan={scan} />);
+    expect(screen.getByText("Preparing the slowed-down movement video...")).toBeInTheDocument();
+    expect(screen.queryByText("Your phone's motion sensor agreed with the camera")).not.toBeInTheDocument();
+  });
+
   it("shows a clear message when microphone permission is refused", async () => {
     Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: { getUserMedia: vi.fn().mockRejectedValue(new Error("denied")) } });
     render(<ResultPage scanId="scan_usable_001" onNavigate={mockNavigate} initialScan={mockUsableScan} />);

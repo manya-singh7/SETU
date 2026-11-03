@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Tuple
 import pytest
 import numpy as np
 
-from setu.motion import track_motion
+from setu.motion import _select_phase_patches, track_motion
 from setu.spectrum import (
     compute_welch_peaks,
     extract_background_residual_motion,
@@ -35,6 +35,21 @@ from setu.types import MotionResult, SegmentResult
 from tests.synth import generate_synthetic_video
 
 CACHE_DIR = Path("tests/.cache")
+
+
+def test_phase_patch_selection_is_textured_masked_and_non_overlapping():
+    image = np.zeros((384, 384), dtype=np.uint8)
+    image[::2, :] = 255
+    mask = np.ones(image.shape, dtype=bool)
+    mask[:128, :128] = False
+
+    patches = _select_phase_patches(image, mask)
+
+    assert 1 <= len(patches) <= 5
+    assert all(np.all(mask[y : y + h, x : x + w]) for x, y, w, h in patches)
+    for i, (x1, y1, w1, h1) in enumerate(patches):
+        for x2, y2, w2, h2 in patches[i + 1 :]:
+            assert x1 + w1 <= x2 or x2 + w2 <= x1 or y1 + h1 <= y2 or y2 + h2 <= y1
 
 
 def test_roi_affine_warp_matches_full_frame_crop():

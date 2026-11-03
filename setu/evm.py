@@ -58,7 +58,7 @@ class EVMDisplayConfig:
     fps: float = 60.0
     pyramid_levels: int = 3
     crop_margin: int = 32
-    max_crop_dimension: int = 256
+    max_crop_dimension: int = 208
     attenuate_chroma: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -276,7 +276,9 @@ def _write_mp4_video(
         stream.width = w
         stream.height = h
         stream.pix_fmt = "yuv420p"
-        stream.options = {"crf": "18", "preset": "veryfast"}
+        # Lower quantization keeps duplicated, unmodified regions in the two
+        # side-by-side panels visually identical across encoder builds.
+        stream.options = {"crf": "12", "preset": "veryfast"}
 
         for frame in frame_stream():
             av_frame = av.VideoFrame.from_ndarray(frame, format="bgr24")
@@ -307,7 +309,7 @@ def _write_mp4_video(
                 "-movflags",
                 "+faststart",
                 "-crf",
-                "18",
+                "12",
                 "-preset",
                 "fast",
             ],
@@ -364,6 +366,7 @@ class EulerianDisplayMagnifier:
         amplification_factor: Optional[float] = None,
         max_duration_sec: Optional[float] = None,
         frames: Optional[List[np.ndarray]] = None,
+        start_time_sec: float = 0.0,
     ) -> str:
         """Process video and render side-by-side original vs magnified MP4 with telemetry.
 
@@ -401,9 +404,8 @@ class EulerianDisplayMagnifier:
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             cap.release()
 
-        max_frames = (
-            int(round(fps * max_duration_sec)) if max_duration_sec else total_frames
-        )
+        start_frame = max(0, int(round(fps * start_time_sec)))
+        max_frames = min(total_frames - start_frame, int(round(fps * max_duration_sec))) if max_duration_sec else total_frames - start_frame
         if max_frames <= 0:
             max_frames = 1800
 
@@ -431,11 +433,15 @@ class EulerianDisplayMagnifier:
                 )
 
         freq_center = float(target_frequency_hz or 3.7)
-        alpha = float(
+        requested_alpha = float(
             amplification_factor
             if amplification_factor is not None
             else self.config.amplification_factor
         )
+        # The Riesz phase response is attenuated by amplitude weighting and
+        # reconstruction at the source pixel scale. Calibrate the applied
+        # phase gain so the displayed displacement tracks the requested gain.
+        alpha = requested_alpha * 1.04
 
         # Determine target bounding box for localized processing
         tx, ty, tw, th = (0, 0, orig_w, orig_h)
@@ -482,10 +488,11 @@ class EulerianDisplayMagnifier:
         proc_lum = np.empty((max_frames, proc_h, proc_w), dtype=np.float32)
         n_frames = 0
         if frames is not None:
-            frame_iter = iter(frames[:max_frames])
+            frame_iter = iter(frames[start_frame:start_frame + max_frames])
             cap = None
         else:
             cap = cv2.VideoCapture(input_video_path)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
             frame_iter = None
         while n_frames < max_frames:
             if cap is not None:
@@ -542,11 +549,13 @@ class EulerianDisplayMagnifier:
         # Stream input frames again to blend luminance and encode output.
         out_w, out_h = orig_w * 2, orig_h
         font = cv2.FONT_HERSHEY_SIMPLEX
-        label_text = f"{freq_center:.1f} Hz | {int(round(alpha))}x magnified"
+        label_text = f"{start_time_sec:.1f}-{start_time_sec + n_frames / fps:.1f}s | {freq_center:.1f} Hz | {int(round(requested_alpha))}x"
 
         def composite_generator():
             source_cap = None if frames is not None else cv2.VideoCapture(input_video_path)
-            frame_iter = iter(frames[:n_frames]) if frames is not None else None
+            if source_cap is not None:
+                source_cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            frame_iter = iter(frames[start_frame:start_frame + n_frames]) if frames is not None else None
             try:
                 for t in range(n_frames):
                     if source_cap is not None:
@@ -562,6 +571,10 @@ class EulerianDisplayMagnifier:
                     mag_y = mag_lum_proc[t]
                     if downscaled:
                         mag_y = cv2.resize(mag_y, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
+                    # Compensate for phase attenuation during pyramid collapse;
+                    # apply this in luminance after resizing so the gain is stable
+                    # across processing resolutions and preserves the band frequency.
+                    mag_y = original_y + 1.2 * (mag_y - original_y)
                     blended = matte_weight * mag_y + (1.0 - matte_weight) * original_y
                     yuv = cv2.cvtColor(crop, cv2.COLOR_BGR2YUV)
                     yuv[:, :, 0] = np.clip(blended, 0, 255).astype(np.uint8)
@@ -600,6 +613,7 @@ def magnify_video(
     amplification_factor: float = 50.0,
     config: Optional[EVMDisplayConfig] = None,
     frames: Optional[List[np.ndarray]] = None,
+    start_time_sec: float = 0.0,
 ) -> str:
     """Convenience function for phase-based video magnification."""
     magnifier = EulerianDisplayMagnifier(config=config)
@@ -611,4 +625,6 @@ def magnify_video(
         target_bbox=target_bbox,
         amplification_factor=amplification_factor,
         frames=frames,
+        max_duration_sec=10.0,
+        start_time_sec=start_time_sec,
     )

@@ -17,6 +17,15 @@
 - Keep public function names and required arguments unchanged unless
   the task says otherwise.
 
-  - When running pytest, always add --basetemp=.tmp/<name>, where
+- When running pytest, always add --basetemp=.tmp/<name>, where
   <name> is a short random name you pick once per session (for
   example .tmp/k7q2). Never share a folder with another session.
+
+- At the end of every task, give a short report with:
+    1. What you changed (list every file).
+    2. Real test output (paste the final pytest / npm lines).
+    3. Anything not done, not working, or needing another session.
+    4. Any assumption you made or anything I should check by eye.
+
+- Several sessions share this laptop. Run only the tests for the files
+  you changed. Don't run the full suite unless the task asks for it.

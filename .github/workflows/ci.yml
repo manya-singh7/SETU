@@ -55,7 +55,17 @@ jobs:
               (r'AIza[0-9A-Za-z-_]{35}', 'Google API key'),
               (r'ghp_[a-zA-Z0-9]{36}', 'GitHub personal access token'),
           ]
-          EXCLUDED_WORDS = {'your_meta_api_key_here', 'placeholder', 'none', 'null', 'false', 'true', 'mock', 'dummy'}
+          # Exact synthetic values used by tests and documentation. Keep this
+          # list narrow so a real credential containing words like "test" or
+          # "mock" is still reported.
+          SAFE_EXAMPLE_VALUES = {
+              'your_meta_api_key_here',
+              'meta_test_secret_12345',
+              'meta_key_fake',
+              'meta_test_key_live',
+              'meta_key_valid',
+              'meta_key_live',
+          }
 
           tracked = subprocess.check_output(['git', 'ls-files'], text=True).splitlines()
           violations = []
@@ -70,7 +80,8 @@ jobs:
               for pattern, desc in SECRET_PATTERNS:
                   for m in re.finditer(pattern, content):
                       matched_str = m.group(0)
-                      if any(ex in matched_str.lower() for ex in EXCLUDED_WORDS):
+                      value_match = re.search(r'[=:]\s*[\'\"]([^\'\"]+)[\'\"]$', matched_str)
+                      if value_match and value_match.group(1).lower() in SAFE_EXAMPLE_VALUES:
                           continue
                       violations.append(f'{path}: {desc} ({matched_str[:12]}...)')
 

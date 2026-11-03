@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
+import math
 from typing import Any, Dict, List, Literal, Optional, Sequence, Union
 
 DEFAULT_DISCLAIMER: str = (
@@ -55,6 +56,7 @@ class SegmentationInfo:
     target_persistence: float = 1.0
     background_persistence: Optional[float] = 1.0
     warnings: List[str] = field(default_factory=list)
+    target_bbox: Optional[List[float]] = None
 
 
 @dataclass
@@ -86,6 +88,14 @@ class MeasurementInfo:
     psd: Optional[PSDData] = None
     background_residual_px: float = 0.0
     instances: List["MeasurementInstance"] = field(default_factory=list)
+    mode_shape: List["ModeShapePoint"] = field(default_factory=list)
+
+
+@dataclass
+class ModeShapePoint:
+    label: str = ""
+    position_norm: float = 0.0
+    amplitude_px: float = 0.0
 
 
 @dataclass
@@ -153,6 +163,7 @@ class OutputsInfo:
     spectrum_plot: Optional[str] = None
     displacement_plot: Optional[str] = None
     vibration_map: Optional[str] = None
+    sound: Optional[str] = None
 
 
 @dataclass
@@ -176,10 +187,56 @@ class CableInfo:
 
 
 @dataclass
+class SetupInfo:
+    """Prompt selection and recording guidance provenance."""
+
+    source: Literal["muse_spark", "user", "default"] = "default"
+    structure_type: Optional[str] = None
+    recording_issues: List[str] = field(default_factory=list)
+    advice: Optional[str] = None
+
+
+@dataclass
+class SonificationInfo:
+    speedup: Optional[float] = None
+    pitch_hz: Optional[float] = None
+
+
+@dataclass
+class WeatherInfo:
+    temperature_c: Optional[float] = None
+    humidity_pct: Optional[float] = None
+    wind_speed_ms: Optional[float] = None
+    source: Optional[Literal["open-meteo"]] = None
+
+
+@dataclass
+class DeviceCheckInfo:
+    status: Literal["agrees", "disagrees", "not_resting", "not_recorded"] = "not_recorded"
+    device_frequency_hz: Optional[float] = None
+    device_ci_hz: Optional[List[float]] = None
+    sample_rate_hz: Optional[float] = None
+    note: Optional[str] = None
+
+
+@dataclass
+class TrafficEvent:
+    t_start: float = 0.0
+    t_end: float = 0.0
+    type: Literal["truck", "bus", "car"] = "car"
+
+
+@dataclass
+class TrafficInfo:
+    events: List[TrafficEvent] = field(default_factory=list)
+    response_plot: Optional[str] = None
+
+
+@dataclass
 class ScanResult:
     """Canonical scan result representation for Project SETU."""
 
-    schema_version: str = "1.2"
+    schema_version: str = "1.4"
     scan_id: str = ""
     is_demo: bool = False
     created_at: str = ""
@@ -195,6 +252,13 @@ class ScanResult:
     disclaimer: str = DEFAULT_DISCLAIMER
     field_notes: List[FieldNote] = field(default_factory=list)
     cable: CableInfo = field(default_factory=CableInfo)
+    setup: SetupInfo = field(default_factory=SetupInfo)
+    sonification: Optional[SonificationInfo] = None
+    weather: Optional[WeatherInfo] = None
+    device_check: DeviceCheckInfo = field(default_factory=DeviceCheckInfo)
+    traffic: TrafficInfo = field(default_factory=TrafficInfo)
+    magnification_status: Literal["pending", "running", "done", "failed", "skipped"] = "skipped"
+    magnification_reason: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.validate()
@@ -227,6 +291,15 @@ class ScanResult:
                     f"Failed scan result must have null measurement.psd, "
                     f"got {self.measurement.psd}"
                 )
+        for point in self.measurement.mode_shape:
+            if not 0.0 <= point.position_norm <= 1.0:
+                raise ValueError("measurement.mode_shape.position_norm must be between 0 and 1")
+        if self.segmentation.target_bbox is not None:
+            if len(self.segmentation.target_bbox) != 4:
+                raise ValueError("segmentation.target_bbox must contain [x, y, w, h]")
+            x, y, width, height = self.segmentation.target_bbox
+            if not all(math.isfinite(value) for value in (x, y, width, height)) or min(x, y) < 0 or min(width, height) <= 0:
+                raise ValueError("segmentation.target_bbox must contain finite nonnegative coordinates and positive size")
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert result object to dictionary matching shared result format schema."""
@@ -238,6 +311,18 @@ class ScanResult:
             result["outputs"].pop("vibration_map", None)
         if self.schema_version in ("1.0", "1.1"):
             result.pop("cable", None)
+        if self.schema_version in ("1.0", "1.1", "1.2"):
+            result.pop("setup", None)
+        if self.schema_version in ("1.0", "1.1", "1.2", "1.3"):
+            result["outputs"].pop("sound", None)
+            result["measurement"].pop("mode_shape", None)
+            result["segmentation"].pop("target_bbox", None)
+            result.pop("sonification", None)
+            result.pop("weather", None)
+            result.pop("device_check", None)
+            result.pop("traffic", None)
+            result.pop("magnification_status", None)
+            result.pop("magnification_reason", None)
         return result
 
     def to_json(self, indent: Optional[int] = 2) -> str:
@@ -302,6 +387,8 @@ class ScanResult:
                 target_persistence=float(seg_val.get("target_persistence", 1.0)),
                 background_persistence=float(bg_p) if bg_p is not None else None,
                 warnings=list(seg_val.get("warnings", [])),
+                target_bbox=([float(x) for x in seg_val["target_bbox"]]
+                             if seg_val.get("target_bbox") is not None else None),
             )
         elif isinstance(seg_val, SegmentationInfo):
             segmentation = seg_val
@@ -349,6 +436,11 @@ class ScanResult:
                 psd=psd_obj,
                 background_residual_px=float(meas_val.get("background_residual_px", 0.0)),
                 instances=[MeasurementInstance(**i) for i in meas_val.get("instances", [])],
+                mode_shape=[ModeShapePoint(
+                    label=str(i.get("label", "")),
+                    position_norm=float(i.get("position_norm", 0.0)),
+                    amplitude_px=float(i.get("amplitude_px", 0.0)),
+                ) for i in meas_val.get("mode_shape", [])],
             )
         elif isinstance(meas_val, MeasurementInfo):
             measurement = meas_val
@@ -406,6 +498,7 @@ class ScanResult:
                 spectrum_plot=out_val.get("spectrum_plot"),
                 displacement_plot=out_val.get("displacement_plot"),
                 vibration_map=out_val.get("vibration_map"),
+                sound=out_val.get("sound"),
             )
         elif isinstance(out_val, OutputsInfo):
             outputs = out_val
@@ -441,6 +534,72 @@ class ScanResult:
         else:
             cable = CableInfo()
 
+        setup_val = d.get("setup", {})
+        if isinstance(setup_val, dict):
+            setup = SetupInfo(
+                source=setup_val.get("source", "default"),
+                structure_type=setup_val.get("structure_type"),
+                recording_issues=[str(issue) for issue in setup_val.get("recording_issues", [])],
+                advice=setup_val.get("advice"),
+            )
+        elif isinstance(setup_val, SetupInfo):
+            setup = setup_val
+        else:
+            setup = SetupInfo()
+
+        sonification_val = d.get("sonification")
+        if isinstance(sonification_val, dict):
+            sonification = SonificationInfo(
+                speedup=float(sonification_val["speedup"]) if sonification_val.get("speedup") is not None else None,
+                pitch_hz=float(sonification_val["pitch_hz"]) if sonification_val.get("pitch_hz") is not None else None,
+            )
+        elif isinstance(sonification_val, SonificationInfo):
+            sonification = sonification_val
+        else:
+            sonification = None
+
+        weather_val = d.get("weather")
+        if isinstance(weather_val, dict):
+            weather = WeatherInfo(
+                temperature_c=float(weather_val["temperature_c"]) if weather_val.get("temperature_c") is not None else None,
+                humidity_pct=float(weather_val["humidity_pct"]) if weather_val.get("humidity_pct") is not None else None,
+                wind_speed_ms=float(weather_val["wind_speed_ms"]) if weather_val.get("wind_speed_ms") is not None else None,
+                source=weather_val.get("source"),
+            )
+        elif isinstance(weather_val, WeatherInfo):
+            weather = weather_val
+        else:
+            weather = None
+
+        device_val = d.get("device_check", {})
+        if isinstance(device_val, dict):
+            device_check = DeviceCheckInfo(
+                status=device_val.get("status", "not_recorded"),
+                device_frequency_hz=float(device_val["device_frequency_hz"]) if device_val.get("device_frequency_hz") is not None else None,
+                device_ci_hz=[float(x) for x in device_val["device_ci_hz"]] if device_val.get("device_ci_hz") is not None else None,
+                sample_rate_hz=float(device_val["sample_rate_hz"]) if device_val.get("sample_rate_hz") is not None else None,
+                note=device_val.get("note"),
+            )
+        elif isinstance(device_val, DeviceCheckInfo):
+            device_check = device_val
+        else:
+            device_check = DeviceCheckInfo()
+
+        traffic_val = d.get("traffic", {})
+        if isinstance(traffic_val, dict):
+            traffic = TrafficInfo(
+                events=[TrafficEvent(
+                    t_start=float(item.get("t_start", 0.0)),
+                    t_end=float(item.get("t_end", 0.0)),
+                    type=item.get("type", "car"),
+                ) for item in traffic_val.get("events", [])],
+                response_plot=traffic_val.get("response_plot"),
+            )
+        elif isinstance(traffic_val, TrafficInfo):
+            traffic = traffic_val
+        else:
+            traffic = TrafficInfo()
+
         return cls(
             schema_version=str(d.get("schema_version", "1.0")),
             scan_id=str(d.get("scan_id", "")),
@@ -462,6 +621,13 @@ class ScanResult:
                 english=n.get("english"), tags=[FieldNoteTag(**t) for t in n.get("tags", [])]
             ) for n in d.get("field_notes", [])],
             cable=cable,
+            setup=setup,
+            sonification=sonification,
+            weather=weather,
+            device_check=device_check,
+            traffic=traffic,
+            magnification_status=d.get("magnification_status", "skipped"),
+            magnification_reason=d.get("magnification_reason"),
         )
 
     @classmethod

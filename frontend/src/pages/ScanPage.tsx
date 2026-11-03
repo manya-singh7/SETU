@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Camera,
@@ -9,24 +9,31 @@ import {
   Layers,
   AlertTriangle,
   Play,
+  Square,
 } from "lucide-react";
 import { createScan, getScan } from "../api";
 import { ScanResult } from "../types";
+import { DeviceMotionSample, toDeviceMotionSample } from "../deviceMotion";
 
 interface ScanPageProps {
   onScanComplete: (scanId: string) => void;
 }
 
 export default function ScanPage({ onScanComplete }: ScanPageProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
 
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [videoPreview, setVideoPreview] = useState<string | null>(null);
+  const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
+  const [isVideoRecording, setIsVideoRecording] = useState(false);
+  const [recordingError, setRecordingError] = useState<string | null>(null);
+  const [deviceMotionJson, setDeviceMotionJson] = useState("");
   const [lat, setLat] = useState("13.0827");
   const [lon, setLon] = useState("80.2707");
   const [bridgeName, setBridgeName] = useState("Napier Bridge Pier #2");
-  const [targetPrompt, setTargetPrompt] = useState("concrete pillar");
-  const [backgroundPrompt, setBackgroundPrompt] = useState("building"); // Default "building"
+  const [targetPrompt, setTargetPrompt] = useState("");
+  const [backgroundPrompt, setBackgroundPrompt] = useState("");
+  const [manualPrompts, setManualPrompts] = useState(false);
   const [isCable, setIsCable] = useState(false);
   const [gpsStatus, setGpsStatus] = useState<"idle" | "fetching" | "success" | "error">("idle");
 
@@ -35,14 +42,102 @@ export default function ScanPage({ onScanComplete }: ScanPageProps) {
   const [pollMessage, setPollMessage] = useState<string>("");
   const [pollCount, setPollCount] = useState<number>(0);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const liveVideoRef = useRef<HTMLVideoElement | null>(null);
+  const cameraStreamRef = useRef<MediaStream | null>(null);
+  const videoRecorderRef = useRef<MediaRecorder | null>(null);
+  const videoChunksRef = useRef<Blob[]>([]);
+  const deviceMotionSamplesRef = useRef<DeviceMotionSample[]>([]);
+  const deviceMotionListenerRef = useRef<((event: DeviceMotionEvent) => void) | null>(null);
+  const recordingStartedRef = useRef(0);
+
+  useEffect(() => {
+    if (liveVideoRef.current && cameraStream) {
+      liveVideoRef.current.srcObject = cameraStream;
+      void liveVideoRef.current.play().catch(() => undefined);
+    }
+  }, [cameraStream]);
+
+  useEffect(() => () => {
+    if (deviceMotionListenerRef.current) window.removeEventListener("devicemotion", deviceMotionListenerRef.current);
+    cameraStreamRef.current?.getTracks().forEach((track) => track.stop());
+    if (videoRecorderRef.current?.state === "recording") videoRecorderRef.current.stop();
+  }, []);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
+      if (videoPreview?.startsWith("blob:")) URL.revokeObjectURL(videoPreview);
       setVideoFile(file);
       setVideoPreview(URL.createObjectURL(file));
+      setDeviceMotionJson("");
       setErrorMessage(null);
     }
+  };
+
+  const startVideoRecording = async () => {
+    setRecordingError(null);
+    let stream: MediaStream | null = null;
+    try {
+      const motionConstructor = window.DeviceMotionEvent as typeof DeviceMotionEvent & {
+        requestPermission?: () => Promise<PermissionState>;
+      };
+      if (typeof motionConstructor?.requestPermission === "function") {
+        const permission = await motionConstructor.requestPermission();
+        if (permission !== "granted") {
+          setRecordingError(t("scan.motion_permission_denied", "Motion sensor access was not granted. The video can still be recorded without it."));
+        }
+      }
+      if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+        throw new Error("unsupported");
+      }
+      const activeStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } }, audio: false });
+      stream = activeStream;
+      cameraStreamRef.current = activeStream;
+      setCameraStream(activeStream);
+      videoChunksRef.current = [];
+      deviceMotionSamplesRef.current = [];
+      recordingStartedRef.current = performance.now();
+      const motionListener = (event: DeviceMotionEvent) => {
+        const sample = toDeviceMotionSample(event, performance.now() - recordingStartedRef.current);
+        if (sample) deviceMotionSamplesRef.current.push(sample);
+      };
+      deviceMotionListenerRef.current = motionListener;
+      window.addEventListener("devicemotion", motionListener);
+
+      const mimeType = MediaRecorder.isTypeSupported("video/mp4") ? "video/mp4" : "video/webm";
+      const recorder = new MediaRecorder(activeStream, MediaRecorder.isTypeSupported(mimeType) ? { mimeType } : undefined);
+      videoRecorderRef.current = recorder;
+      recorder.ondataavailable = (event) => { if (event.data.size > 0) videoChunksRef.current.push(event.data); };
+      recorder.onerror = () => setRecordingError(t("scan.video_recording_error", "The video could not be recorded. Please try again."));
+      recorder.onstop = () => {
+        if (deviceMotionListenerRef.current) window.removeEventListener("devicemotion", deviceMotionListenerRef.current);
+        deviceMotionListenerRef.current = null;
+        const blob = new Blob(videoChunksRef.current, { type: recorder.mimeType || mimeType });
+        if (blob.size > 0) {
+          const extension = blob.type.includes("mp4") ? "mp4" : "webm";
+          const file = new File([blob], `setu-recording.${extension}`, { type: blob.type });
+          if (videoPreview?.startsWith("blob:")) URL.revokeObjectURL(videoPreview);
+          setVideoFile(file);
+          setVideoPreview(URL.createObjectURL(file));
+          setDeviceMotionJson(deviceMotionSamplesRef.current.length ? JSON.stringify(deviceMotionSamplesRef.current) : "");
+        }
+        activeStream.getTracks().forEach((track) => track.stop());
+        cameraStreamRef.current = null;
+        setCameraStream(null);
+        setIsVideoRecording(false);
+      };
+      recorder.start(1000);
+      setIsVideoRecording(true);
+    } catch {
+      stream?.getTracks().forEach((track) => track.stop());
+      cameraStreamRef.current = null;
+      setRecordingError(t("scan.video_camera_unavailable", "Camera recording is unavailable. You can upload a video instead."));
+      setCameraStream(null);
+    }
+  };
+
+  const stopVideoRecording = () => {
+    if (videoRecorderRef.current?.state === "recording") videoRecorderRef.current.stop();
   };
 
   const handleGetGps = () => {
@@ -85,6 +180,8 @@ export default function ScanPage({ onScanComplete }: ScanPageProps) {
         lon: parseFloat(lon),
         target_prompt: targetPrompt,
         background_prompt: backgroundPrompt,
+        language: (i18n.resolvedLanguage || i18n.language || "en").split("-")[0],
+        device_motion: deviceMotionJson || undefined,
         bridge_name: bridgeName,
         is_cable: isCable,
       });
@@ -233,7 +330,12 @@ export default function ScanPage({ onScanComplete }: ScanPageProps) {
             </div>
 
             <div className="p-4 bg-concrete-light border border-concrete-rule rounded-[4px] flex flex-col items-center space-y-4">
-              {videoPreview ? (
+              {isVideoRecording ? (
+                <div className="w-full max-w-md">
+                  <video ref={liveVideoRef} autoPlay muted playsInline className="w-full rounded-[4px] max-h-56 bg-black object-contain border border-concrete-rule" />
+                  <p className="mt-2 text-xs text-asphalt-muted">{t("scan.recording_video", "Recording video and phone motion")}</p>
+                </div>
+              ) : videoPreview ? (
                 <div className="w-full max-w-md">
                   <video
                     src={videoPreview}
@@ -283,7 +385,13 @@ export default function ScanPage({ onScanComplete }: ScanPageProps) {
                     className="hidden"
                   />
                 </label>
+
+                <button type="button" onClick={isVideoRecording ? stopVideoRecording : startVideoRecording} className={`min-h-[48px] inline-flex items-center justify-center space-x-2 px-6 py-3 rounded-[4px] text-xs font-semibold border transition focus-visible:outline-highway ${isVideoRecording ? "bg-asphalt text-white border-asphalt" : "bg-white hover:bg-concrete text-asphalt border-concrete-rule"}`}>
+                  {isVideoRecording ? <Square className="h-4 w-4" /> : <Camera className="h-4 w-4 text-highway" />}
+                  <span>{isVideoRecording ? t("scan.stop_recording", "Stop recording") : t("scan.record_in_app", "Record video with phone sensors")}</span>
+                </button>
               </div>
+              {recordingError && <p role="status" className="max-w-md text-xs text-asphalt-muted">{recordingError}</p>}
             </div>
           </div>
 
@@ -369,6 +477,21 @@ export default function ScanPage({ onScanComplete }: ScanPageProps) {
                 </button>
               </div>
 
+              {!manualPrompts ? (
+                <div className="pt-2 md:col-span-2 rounded border border-concrete-rule bg-concrete-light p-3 text-sm">
+                  <p className="font-semibold text-asphalt">{t("scan.ai_choice", "Let SETU choose (an AI watches your video)")}</p>
+                  <p className="mt-1 text-xs text-asphalt-muted">{t("scan.ai_description", "SETU will suggest scan prompts from the selected clip. If it cannot identify them, you can enter them manually.")}</p>
+                  <button type="button" onClick={() => setManualPrompts(true)} className="mt-2 text-xs font-semibold text-highway underline">
+                    {t("scan.manual_prompts_link", "Type them manually instead")}
+                  </button>
+                </div>
+              ) : <>
+              <div className="pt-2 md:col-span-2">
+                <p className="mb-2 text-xs text-asphalt-muted">{t("scan.manual_choice", "Enter scan prompts yourself")}</p>
+                <button type="button" onClick={() => { setManualPrompts(false); setTargetPrompt(""); setBackgroundPrompt(""); }} className="text-xs font-semibold text-highway underline">
+                  {t("scan.ai_choice_link", "Let SETU choose instead")}
+                </button>
+              </div>
               {/* Target Prompt in Driver Words */}
               <div className="pt-2">
                 <label className="flex items-center space-x-1.5 text-asphalt font-semibold mb-1">
@@ -411,6 +534,7 @@ export default function ScanPage({ onScanComplete }: ScanPageProps) {
                   {t("scan.background_prompt_desc", "Keep a building or hill in view so SETU can cancel your hand shake.")}
                 </span>
               </div>
+              </>}
             </div>
           </div>
 

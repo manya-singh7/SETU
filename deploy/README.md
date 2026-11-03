@@ -67,7 +67,7 @@ platform details.
 
 1. Put this project in a GitHub repository and push the files you want to
    deploy. Do not commit `.env` files, credentials, or private recordings.
-2. Create a [Render](https://render.com/) account and choose **New** →
+2. Create a [Render](https://render.com/) account and choose **New** >
    **Web Service**. Connect the repository.
 3. Select **Docker** as the runtime. Leave the Dockerfile path as
    `./Dockerfile` and the root directory blank if the Dockerfile is at the

@@ -2,9 +2,10 @@
 
 import cv2
 import numpy as np
+import pytest
 
 from scripts.vibration_map_demo import FREQUENCIES_HZ, generate_synthetic_video
-from setu.vibration_map import MAX_INSTANCES, build_vibration_map
+from setu.vibration_map import MAX_INSTANCES, build_vibration_map, mode_shape_from_instances
 
 
 def test_four_post_frequencies_recovered_and_map_written(tmp_path):
@@ -45,3 +46,31 @@ def test_instance_cap_is_sixteen(tmp_path, monkeypatch):
     assert len(records) == MAX_INSTANCES
     assert records[-1]["label"] == "target 15"
     assert output.is_file()
+
+
+def test_mode_shape_projects_collinear_instances_and_uses_shared_frequency():
+    records = [
+        {"label": "A", "bbox": [0, 10, 10, 10], "frequency_hz": 3.7,
+         "amplitude_px": 0.02, "verdict": "usable"},
+        {"label": "B", "bbox": [20, 11, 10, 10], "frequency_hz": 3.72,
+         "amplitude_px": 0.05, "verdict": "usable"},
+        {"label": "C", "bbox": [40, 9, 10, 10], "frequency_hz": 3.69,
+         "amplitude_px": 0.03, "verdict": "usable"},
+    ]
+    shape = mode_shape_from_instances(records, dominant_frequency_hz=3.7)
+    assert [point["label"] for point in shape] == ["A", "B", "C"]
+    assert [point["position_norm"] for point in shape] == pytest.approx([0.0, 0.5, 1.0], abs=0.002)
+    assert [point["amplitude_px"] for point in shape] == [0.02, 0.05, 0.03]
+
+
+def test_mode_shape_skips_non_collinear_or_too_few_instances():
+    records = [
+        {"label": "A", "bbox": [0, 0, 10, 10], "frequency_hz": 3.7,
+         "amplitude_px": 0.02, "verdict": "usable"},
+        {"label": "B", "bbox": [30, 0, 10, 10], "frequency_hz": 3.7,
+         "amplitude_px": 0.02, "verdict": "usable"},
+        {"label": "C", "bbox": [15, 30, 10, 10], "frequency_hz": 3.7,
+         "amplitude_px": 0.02, "verdict": "usable"},
+    ]
+    assert mode_shape_from_instances(records, 3.7) == []
+    assert mode_shape_from_instances(records[:2], 3.7) == []

@@ -254,9 +254,11 @@ export async function createScan(payload: CreateScanPayload): Promise<ScanResult
   formData.append("longitude", String(payload.lon));
   formData.append("lat", String(payload.lat));
   formData.append("lon", String(payload.lon));
-  formData.append("target_prompt", payload.target_prompt || "concrete pillar");
+  formData.append("target_prompt", payload.target_prompt || "");
   formData.append("is_cable", String(Boolean(payload.is_cable)));
-  formData.append("background_prompt", payload.background_prompt || "building");
+  formData.append("background_prompt", payload.background_prompt || "");
+  if (payload.language) formData.append("language", payload.language);
+  if (payload.device_motion) formData.append("device_motion", payload.device_motion);
   if (payload.bridge_name) {
     formData.append("bridge_name", payload.bridge_name);
   }
@@ -287,7 +289,8 @@ export async function createScan(payload: CreateScanPayload): Promise<ScanResult
  */
 export async function getScan(
   id: string,
-  onProgress?: (scan: ScanResult) => void
+  onProgress?: (scan: ScanResult) => void,
+  waitForMagnification = false,
 ): Promise<ScanResult> {
   const POLL_INTERVAL_MS = 2000;
 
@@ -299,7 +302,8 @@ export async function getScan(
         if (onProgress) {
           onProgress(scan);
         }
-        if (scan.status === "complete" || scan.status === "error") {
+        const magnificationPending = scan.magnification_status === "pending" || scan.magnification_status === "running";
+        if (scan.status === "error" || (scan.status === "complete" && !(waitForMagnification && magnificationPending))) {
           return scan;
         }
       } else if (response.status === 404) {

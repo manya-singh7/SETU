@@ -1,6 +1,6 @@
 /**
  * TypeScript Type Definitions for SETU Telemetry Platform
- * Matching Shared Result Format (schema_version 1.2)
+ * Matching Shared Result Format, including setup details in schema 1.3.
  */
 
 export type ScanStatus = "queued" | "running" | "complete" | "error";
@@ -99,6 +99,13 @@ export interface MeasurementDetails {
   background_residual_px: number;
   psd?: PowerSpectralDensity | null;
   instances?: MeasurementInstance[];
+  mode_shape?: ModeShapePoint[];
+}
+
+export interface ModeShapePoint {
+  label: string;
+  position_norm: number;
+  amplitude_px: number;
 }
 
 export interface QualityGateDetails {
@@ -141,7 +148,39 @@ export interface ScanOutputs {
   spectrum_plot?: string | null;
   displacement_plot?: string | null;
   vibration_map?: string | null;
+  sound?: string | null;
   [key: string]: string | null | undefined;
+}
+
+export interface SonificationDetails {
+  speedup: number | null;
+  pitch_hz: number | null;
+}
+
+export interface WeatherDetails {
+  temperature_c: number | null;
+  humidity_pct: number | null;
+  wind_speed_ms: number | null;
+  source: string | null;
+}
+
+export interface DeviceCheckDetails {
+  status: "agrees" | "disagrees" | "not_resting" | "not_recorded";
+  device_frequency_hz: number | null;
+  device_ci_hz: [number, number] | null;
+  sample_rate_hz: number | null;
+  note: string | null;
+}
+
+export interface TrafficEvent {
+  t_start: number;
+  t_end: number;
+  type: "truck" | "bus" | "car";
+}
+
+export interface TrafficDetails {
+  events: TrafficEvent[];
+  response_plot: string | null;
 }
 
 export interface CostBreakdown {
@@ -161,6 +200,17 @@ export interface ScanResult {
   location: LocationCoordinates;
   video: VideoMetadata;
   segmentation: SegmentationDetails;
+  setup?: {
+    source: "muse_spark" | "user" | "default";
+    structure_type: string;
+    recording_issues: string[];
+    advice: string;
+  } | null;
+  sonification?: SonificationDetails | null;
+  weather?: WeatherDetails | null;
+  device_check?: DeviceCheckDetails | null;
+  traffic?: TrafficDetails | null;
+  magnification_status?: string | null;
   measurement: MeasurementDetails;
   interpretation: InterpretationDetails;
   outputs: ScanOutputs;
@@ -245,4 +295,6 @@ export interface CreateScanPayload {
   background_prompt?: string;
   city?: string;
   is_cable?: boolean;
+  language?: string;
+  device_motion?: string;
 }

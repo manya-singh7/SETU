@@ -1,0 +1,9 @@
+{
+  "structure_visible": true,
+  "structure_type": "pillar",
+  "target_prompt": "weathered concrete bridge support pillar surface",
+  "background_prompt": "textured distant stone building",
+  "is_cable": false,
+  "recording_issues": [],
+  "advice": "Keep the phone steady and include a fixed background."
+}

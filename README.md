@@ -4,7 +4,7 @@ SETU is a vision-based screening tool that measures natural structural vibration
 
 ## Core Principle
 
-SETU never declares a bridge safe. It only flags anomalous or suspicious readings for human civil engineer review and on-site physical inspection.
+SETU never declares a bridge safe. It flags readings that need human civil engineer review and on-site physical inspection. Weak or failed verdicts are not anomalies.
 
 ## How It Works
 

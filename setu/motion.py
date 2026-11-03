@@ -44,6 +44,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 import cv2
 import numpy as np
 import numpy.typing as npt
+import av
 
 from setu.types import MotionResult, SegmentResult
 
@@ -79,6 +80,47 @@ def _extract_bounding_box(mask: npt.NDArray[np.uint8]) -> Tuple[int, int, int, i
     return (0, 0, w, h)
 
 
+def _select_phase_patches(
+    gray: npt.NDArray[np.uint8], mask: npt.NDArray[np.bool_]
+) -> List[Tuple[int, int, int, int]]:
+    """Select three disjoint, textured DFT-friendly windows when the ROI allows."""
+    height, width = gray.shape[:2]
+
+    def optimal_not_larger_than(limit: int) -> int:
+        size = min(128, limit)
+        while size > 16 and cv2.getOptimalDFTSize(size) > limit:
+            size -= 1
+        return cv2.getOptimalDFTSize(size) if size > 16 else limit
+
+    # Small segmentation boxes can include stationary pixels beside a moving
+    # structure. Keep those on the full-ROI estimator; use compact patches only
+    # when the ROI is large enough to provide separated interior windows.
+    desired_size = 64 if min(width, height) >= 192 else 128
+    patch_size = min(desired_size, optimal_not_larger_than(min(width, height)))
+    patch_w = patch_h = patch_size
+    if patch_w < 16 or patch_h < 16:
+        return [(0, 0, width, height)]
+
+    image = gray.astype(np.float32)
+    gx = cv2.Sobel(image, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(image, cv2.CV_32F, 0, 1, ksize=3)
+    energy = gx * gx + gy * gy
+    candidates: List[Tuple[float, int, int]] = []
+    # Tiling makes candidates non-overlapping by construction. Require each
+    # candidate window to lie inside the supplied target mask.
+    for y in range(0, height - patch_h + 1, patch_h):
+        for x in range(0, width - patch_w + 1, patch_w):
+            patch_mask = mask[y : y + patch_h, x : x + patch_w]
+            if not np.all(patch_mask):
+                continue
+            candidates.append((float(np.sum(energy[y : y + patch_h, x : x + patch_w])), x, y))
+
+    candidates.sort(reverse=True)
+    if len(candidates) < 3:
+        return [(0, 0, width, height)]
+    return [(x, y, patch_w, patch_h) for _, x, y in candidates[:3]]
+
+
 def track_motion(
     video_path: str,
     segment_result: Optional[SegmentResult] = None,
@@ -110,23 +152,19 @@ def track_motion(
     Returns:
         MotionResult containing 1D displacement time series, frame rate, and quality diagnostics.
     """
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise ValueError(f"Could not open video file: '{video_path}'")
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0.0 or np.isnan(fps):
-        fps = 60.0
-
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    ret, frame0 = cap.read()
-    if not ret or frame0 is None:
-        cap.release()
-        raise ValueError(f"Failed to read reference frame 0 from '{video_path}'")
-
-    gray0 = cv2.cvtColor(frame0, cv2.COLOR_BGR2GRAY)
+    try:
+        container = av.open(video_path)
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        fps = float(stream.average_rate or 60.0)
+        width, height = int(stream.width), int(stream.height)
+        decoded = container.decode(stream)
+        frame0_av = next(decoded, None)
+        if frame0_av is None:
+            raise ValueError(f"Failed to read reference frame 0 from '{video_path}'")
+        gray0 = frame0_av.to_ndarray(format="gray")
+    except Exception as exc:
+        raise ValueError(f"Could not open video file: '{video_path}'") from exc
     warnings: List[str] = []
 
     # 1. Establish frame 0 target and background masks
@@ -182,9 +220,12 @@ def track_motion(
         warnings.append("No stationary background found; skipping camera micro-jitter stabilisation.")
         p_bg0 = None
     else:
+        bx, by, bw, bh = b_box
+        bg_roi0 = gray0[by:by + bh, bx:bx + bw]
+        bg_mask_roi = bg_mask0[by:by + bh, bx:bx + bw]
         p_bg0 = cv2.goodFeaturesToTrack(
-            gray0,
-            mask=bg_mask0,
+            bg_roi0,
+            mask=bg_mask_roi,
             maxCorners=max_corners_bg,
             qualityLevel=0.01,
             minDistance=6,
@@ -197,11 +238,11 @@ def track_motion(
             )
             # Fallback to general grid points inside background box
             ys, xs = np.mgrid[b_box[1] + 10 : b_box[1] + b_box[3] - 10 : 15, b_box[0] + 10 : b_box[0] + b_box[2] - 10 : 15]
-            grid_pts = np.vstack((xs.flatten(), ys.flatten())).T.astype(np.float32)
+            grid_pts = np.vstack((xs.flatten() - b_box[0], ys.flatten() - b_box[1])).T.astype(np.float32)
             p_bg0 = grid_pts[:, np.newaxis, :]
         else:
             p_bg0 = cv2.cornerSubPix(
-                gray0,
+                bg_roi0,
                 p_bg0,
                 (5, 5),
                 (-1, -1),
@@ -210,8 +251,13 @@ def track_motion(
 
     # 3. Setup method-specific targets
     if method == "phase_correlation":
-        target_roi0 = gray0[ty : ty + th, tx : tx + tw].astype(np.float64)
-        hanning_win = cv2.createHanningWindow((tw, th), cv2.CV_64F)
+        target_roi_gray = gray0[ty : ty + th, tx : tx + tw]
+        phase_patches = _select_phase_patches(target_roi_gray, target_roi_mask)
+        phase_references = []
+        phase_windows = []
+        for px, py, pw, ph in phase_patches:
+            phase_references.append(target_roi_gray[py : py + ph, px : px + pw].astype(np.float32))
+            phase_windows.append(cv2.createHanningWindow((pw, ph), cv2.CV_32F))
     else:
         # Lucas-Kanade target points
         p_tgt0 = cv2.goodFeaturesToTrack(
@@ -244,13 +290,14 @@ def track_motion(
     background_displacement: List[float] = [0.0]
     M_prev = np.float32([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
 
-    while True:
-        ret, frame_curr = cap.read()
-        if not ret or frame_curr is None:
+    bx, by, bw, bh = b_box if b_box is not None else (0, 0, 0, 0)
+    try:
+      for frame_av in decoded:
+        gray_curr = frame_av.to_ndarray(format="gray")
+        if gray_curr is None:
             break
 
         total_frames_count += 1
-        gray_curr = cv2.cvtColor(frame_curr, cv2.COLOR_BGR2GRAY)
 
         # Target mask saturation/clipping check on current frame
         roi_curr = gray_curr[ty : ty + th, tx : tx + tw]
@@ -262,8 +309,8 @@ def track_motion(
         if has_background and p_bg0 is not None:
             # A. Track background features from frame 0 to current frame
             p_bg_curr, st_bg, _ = cv2.calcOpticalFlowPyrLK(
-                gray0,
-                gray_curr,
+                gray0[by:by + bh, bx:bx + bw],
+                gray_curr[by:by + bh, bx:bx + bw],
                 p_bg0,
                 None,
                 winSize=(21, 21),
@@ -274,6 +321,8 @@ def track_motion(
             st_bg_flat = (st_bg.ravel() == 1) if st_bg is not None else np.zeros(len(p_bg0), dtype=bool)
             good_bg0 = p_bg0[st_bg_flat]
             good_bg_curr = p_bg_curr[st_bg_flat]
+            good_bg0 = good_bg0 + np.array([bx, by], dtype=np.float32)
+            good_bg_curr = good_bg_curr + np.array([bx, by], dtype=np.float32)
 
             # B. Estimate affine warp matrix to align current frame to frame 0
             if len(good_bg_curr) >= 4:
@@ -312,7 +361,7 @@ def track_motion(
                 gray_curr,
                 roi_M,
                 (tw, th),
-                flags=cv2.INTER_LANCZOS4,
+                flags=cv2.INTER_LINEAR,
                 borderMode=cv2.BORDER_REFLECT,
             )
 
@@ -340,8 +389,12 @@ def track_motion(
 
         # E. Measure target motion using FIXED frame 0 mask
         if method == "phase_correlation":
-            target_roi_curr = warped_curr.astype(np.float64)
-            (dx_step, dy_step), _ = cv2.phaseCorrelate(target_roi0, target_roi_curr, hanning_win)
+            shifts = []
+            for (px, py, pw, ph), reference, window in zip(phase_patches, phase_references, phase_windows):
+                current_patch = warped_curr[py : py + ph, px : px + pw].astype(np.float32)
+                shift, _ = cv2.phaseCorrelate(reference, current_patch, window)
+                shifts.append(shift)
+            dx_step, dy_step = np.median(np.asarray(shifts, dtype=np.float32), axis=0)
             dx_raw_list.append(float(dx_step))
             dy_raw_list.append(float(dy_step))
         else:
@@ -370,7 +423,8 @@ def track_motion(
             dx_raw_list.append(dx_step)
             dy_raw_list.append(dy_step)
 
-    cap.release()
+    finally:
+        container.close()
 
     dx_arr = np.array(dx_raw_list, dtype=np.float64)
     dy_arr = np.array(dy_raw_list, dtype=np.float64)

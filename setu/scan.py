@@ -22,6 +22,7 @@ Guarantees:
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import logging
 import os
 from pathlib import Path
@@ -48,17 +49,24 @@ from setu.result import (
     CostsUSD,
     InterpretationInfo,
     Location,
+    DeviceCheckInfo,
     MeasurementInfo,
+    MeasurementInstance,
     MeasurementPeak,
+    ModeShapePoint,
     OutputsInfo,
     PSDData,
     QualityGateInfo,
     ScanResult,
     SegmentationInfo,
+    SonificationInfo,
+    TrafficEvent,
+    TrafficInfo,
     Verdict,
     VideoInfo,
+    WeatherInfo,
 )
-from setu.segment import compute_persistence, get_segmenter
+from setu.segment import compute_persistence, get_segmenter, mask_to_bbox
 from setu.spectrum import (
     compute_welch_peaks,
     determine_spectrum_verdict,
@@ -68,6 +76,12 @@ from setu.types import SegmentResult
 from setu.video_checks import check_video
 
 logger = logging.getLogger(__name__)
+
+
+def _feature_warning(warnings: List[str], feature: str, exc: object) -> None:
+    message = f"Optional {feature} feature unavailable: {exc}"
+    logger.warning(message)
+    warnings.append(message)
 
 
 def _boxes_overlap(
@@ -107,7 +121,7 @@ def _build_failed_result(
     """Construct a schema-compliant failed ScanResult and optionally write to out_dir."""
     failed_reasons = list(reasons) if reasons else ["Pipeline processing failed."]
     result = ScanResult(
-        schema_version="1.0",
+        schema_version="1.4",
         scan_id=scan_id,
         is_demo=is_demo,
         created_at=created_at,
@@ -282,7 +296,11 @@ def analyze_video(
             out_dir=out_dir,
         )
 
-    target_box = seg_output.target_bbox
+    frame0_target_mask = np.asarray(getattr(seg_output, "target_mask", np.zeros((height, width), dtype=bool)), dtype=bool)
+    if frame0_target_mask.shape == (height, width) and np.any(frame0_target_mask):
+        target_box = mask_to_bbox(frame0_target_mask)
+    else:
+        target_box = seg_output.target_bbox
     if not target_box or target_box[2] <= 0 or target_box[3] <= 0:
         return _build_failed_result(
             scan_id=scan_id,
@@ -385,9 +403,10 @@ def analyze_video(
     # STAGE 3: Subpixel Motion Tracking & Micro-Jitter Compensation
     # -------------------------------------------------------------------------
     t_stage3_start = time.perf_counter()
-    target_mask = np.zeros((height, width), dtype=bool)
-    tx, ty, tw, th = target_box
-    target_mask[ty : ty + th, tx : tx + tw] = True
+    target_mask = frame0_target_mask.copy() if frame0_target_mask.shape == (height, width) and np.any(frame0_target_mask) else np.zeros((height, width), dtype=bool)
+    if not np.any(target_mask):
+        tx, ty, tw, th = target_box
+        target_mask[ty : ty + th, tx : tx + tw] = True
 
     has_background = bg_box is not None and bg_box[2] > 0 and bg_box[3] > 0
     bg_masks: List[np.ndarray] = []
@@ -698,19 +717,186 @@ def analyze_video(
         try:
             os.makedirs(str(out_dir), exist_ok=True)
             mag_dest = os.path.join(str(out_dir), "magnified.mp4")
+            window_frames = max(1, int(round(fps * 10.0)))
+            disp_arr = np.asarray(disp, dtype=np.float64)
+            if len(disp_arr) > window_frames:
+                sums = np.concatenate(([0.0], np.cumsum(disp_arr * disp_arr)))
+                window_start = int(np.argmax(sums[window_frames:] - sums[:-window_frames]))
+            else:
+                window_start = 0
+            window_start_sec = window_start / fps
             magnify_video(
                 input_video_path=video_path_str,
                 output_video_path=mag_dest,
                 target_frequency_hz=dom_freq,
                 target_bbox=target_box,
                 amplification_factor=50.0,
-                config=EVMDisplayConfig(max_crop_dimension=208),
+                config=EVMDisplayConfig(max_crop_dimension=480),
+                start_time_sec=window_start_sec,
             )
             magnified_file = "magnified.mp4"
         except Exception as evm_exc:
             logger.warning("Stage 6 EVM magnification skipped (%s)", evm_exc)
             magnified_file = None
     t_magnification = time.perf_counter() - t_stage6_start
+
+    # -------------------------------------------------------------------------
+    # Optional schema 1.4 features. Imports stay local because these modules
+    # can be absent while their implementation or platform dependencies load.
+    # Each feature owns its errors and cannot change the scan verdict.
+    # -------------------------------------------------------------------------
+    feature_warnings: List[str] = []
+    vibration_map_file: Optional[str] = None
+    sound_file: Optional[str] = None
+    sonification_info: Optional[SonificationInfo] = None
+    weather_info: Optional[WeatherInfo] = None
+    device_check_info = DeviceCheckInfo()
+    traffic_info = TrafficInfo()
+
+    if out_dir:
+        try:
+            os.makedirs(str(out_dir), exist_ok=True)
+            np.save(os.path.join(str(out_dir), "displacement.npy"), np.asarray(disp, dtype=np.float64))
+        except Exception as exc:
+            _feature_warning(feature_warnings, "displacement trace export", exc)
+
+    metadata = getattr(seg_output, "metadata", {}) or {}
+    target_instances = metadata.get("all_target_instances", []) if isinstance(metadata, dict) else []
+    if seg_output.target_source == "sam" and isinstance(target_instances, list) and len(target_instances) >= 2:
+        try:
+            from setu import vibration_map as vibration_map_module
+
+            if not out_dir:
+                raise ValueError("scan output directory is required for the map artifact")
+            if not has_background:
+                raise ValueError("stationary background mask is unavailable")
+            map_inputs = []
+            for index, instance in enumerate(target_instances):
+                if not isinstance(instance, dict) or instance.get("mask") is None:
+                    continue
+                label = str(instance.get("label") or instance.get("text") or f"instance {index + 1}")
+                map_inputs.append((label, instance["mask"]))
+            if len(map_inputs) >= 2:
+                vibration_map_file = "vibration_map.png"
+                map_path = os.path.join(str(out_dir), vibration_map_file)
+                map_records = vibration_map_module.build_vibration_map(
+                    video_path_str, map_inputs, bg_mask, map_path,
+                    shared_frequency_hz=dom_freq,
+                )
+                measurement.instances = [
+                    MeasurementInstance(
+                        label=str(item["label"]),
+                        bbox=[float(v) for v in item["bbox"]],
+                        frequency_hz=(float(item["frequency_hz"]) if item.get("frequency_hz") is not None else None),
+                        amplitude_px=(float(item["amplitude_px"]) if item.get("amplitude_px") is not None else None),
+                        verdict=str(item.get("verdict", "failed")),
+                    )
+                    for item in map_records
+                ]
+                mode_shape = vibration_map_module.mode_shape_from_instances(
+                    map_records, dominant_frequency_hz=dom_freq,
+                )
+                measurement.mode_shape = [ModeShapePoint(**point) for point in mode_shape]
+            else:
+                raise ValueError("SAM target instances did not include two usable masks")
+        except Exception as exc:
+            vibration_map_file = None
+            _feature_warning(feature_warnings, "vibration map", exc)
+
+    if verdict_level == "usable":
+        try:
+            if not out_dir:
+                raise ValueError("scan output directory is required for the sound artifact")
+            from setu.sonify import make_sonification
+
+            sound_file = "sound.wav"
+            speedup, pitch_hz = make_sonification(
+                disp, fps, os.path.join(str(out_dir), sound_file),
+            )
+            sonification_info = SonificationInfo(speedup=float(speedup), pitch_hz=float(pitch_hz))
+        except Exception as exc:
+            sound_file = None
+            sonification_info = None
+            _feature_warning(feature_warnings, "sonification", exc)
+
+    try:
+        from setu.weather import get_weather
+
+        raw_weather = get_weather(lat, lon, created_at) or {}
+        wind_kmh = raw_weather.get("wind_speed_kmh")
+        weather_info = WeatherInfo(
+            temperature_c=raw_weather.get("temperature_c"),
+            humidity_pct=raw_weather.get("humidity_pct"),
+            wind_speed_ms=(float(wind_kmh) / 3.6 if wind_kmh is not None else None),
+            source="open-meteo" if any(
+                raw_weather.get(key) is not None
+                for key in ("temperature_c", "humidity_pct", "wind_speed_kmh")
+            ) else None,
+        )
+    except Exception as exc:
+        weather_info = WeatherInfo()
+        _feature_warning(feature_warnings, "weather", exc)
+
+    if out_dir:
+        device_path = Path(out_dir) / "device_motion.json"
+        if device_path.is_file():
+            try:
+                from setu.device_motion import analyze_device_motion
+
+                device_payload = json.loads(device_path.read_text(encoding="utf-8"))
+                samples = device_payload.get("samples", device_payload) if isinstance(device_payload, dict) else device_payload
+                device_result = analyze_device_motion(
+                    samples,
+                    camera_frequency_hz=dom_freq,
+                    camera_ci_hz=freq_ci,
+                )
+                comparison = device_result.get("comparison") or {}
+                if not device_result.get("resting_on_structure", True):
+                    device_status = "not_resting"
+                elif comparison.get("agreement") is True:
+                    device_status = "agrees"
+                elif comparison.get("agreement") is False:
+                    device_status = "disagrees"
+                else:
+                    device_status = "not_recorded"
+                device_check_info = DeviceCheckInfo(
+                    status=device_status,
+                    device_frequency_hz=device_result.get("dominant_frequency_hz"),
+                    device_ci_hz=device_result.get("confidence_interval_hz"),
+                    sample_rate_hz=device_result.get("sampling_rate_hz"),
+                    note=device_result.get("message"),
+                )
+            except Exception as exc:
+                device_check_info = DeviceCheckInfo(note=str(exc))
+                _feature_warning(feature_warnings, "device check", exc)
+
+    try:
+        from setu.traffic import track_traffic
+
+        traffic_result = track_traffic(video_path_str, meta_client=meta_client)
+        if isinstance(traffic_result, dict):
+            raw_events = traffic_result.get("events", [])
+            response_plot = traffic_result.get("response_plot")
+        else:
+            raw_events = getattr(traffic_result, "events", [])
+            response_plot = getattr(traffic_result, "response_plot", None)
+        if isinstance(traffic_result, (dict, TrafficInfo)) or hasattr(traffic_result, "events"):
+            traffic_info = TrafficInfo(
+                events=[
+                    item if isinstance(item, TrafficEvent) else TrafficEvent(
+                        t_start=float(item["t_start"]),
+                        t_end=float(item["t_end"]),
+                        type=item["type"],
+                    )
+                    for item in raw_events
+                ],
+                response_plot=response_plot,
+            )
+    except ImportError as exc:
+        _feature_warning(feature_warnings, "traffic", exc)
+    except Exception as exc:
+        traffic_info = TrafficInfo()
+        _feature_warning(feature_warnings, "traffic", exc)
 
     # -------------------------------------------------------------------------
     # STAGE 7: Plot Generation (if out_dir provided)
@@ -779,6 +965,8 @@ def analyze_video(
         magnified_video=magnified_file,
         spectrum_plot=spec_plot_name,
         displacement_plot=disp_plot_name,
+        vibration_map=vibration_map_file,
+        sound=sound_file,
     )
     segmentation = SegmentationInfo(
         target_prompt=target_prompt,
@@ -787,11 +975,12 @@ def analyze_video(
         background_source=seg_output.background_source,
         target_persistence=target_pers_val,
         background_persistence=bg_pers_val,
-        warnings=list(seg_output.warnings),
+        warnings=list(seg_output.warnings) + feature_warnings,
+        target_bbox=[float(value) for value in target_box],
     )
 
     final_result = ScanResult(
-        schema_version="1.0",
+        schema_version="1.4",
         scan_id=scan_id,
         is_demo=is_demo,
         created_at=created_at,
@@ -804,6 +993,10 @@ def analyze_video(
         interpretation=interpretation,
         outputs=outputs,
         costs_usd=costs,
+        sonification=sonification_info,
+        weather=weather_info,
+        device_check=device_check_info,
+        traffic=traffic_info,
     )
 
     if out_dir:
