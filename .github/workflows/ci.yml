@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run fast test suite
+        env:
+          SETU_DEMO_MODE: "false"
+          SETU_META_MODE: "mock"
+        run: |
+          python -m pytest tests -m "not slow"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: "frontend/package-lock.json"
+
+      - name: Install frontend dependencies and build
+        run: |
+          npm ci --prefix frontend
+          npm run build --prefix frontend
+
+      - name: Verify no real API keys in tracked files
+        run: |
+          python -c "
+          import re, subprocess, sys
+
+          SECRET_PATTERNS = [
+              (r'(?i)(meta|api)[_-]?key\s*[:=]\s*[\'\"][a-zA-Z0-9_\-]{20,}[\'\"]', 'API key definition'),
+              (r'sk-[a-zA-Z0-9]{20,}', 'OpenAI format key'),
+              (r'AIza[0-9A-Za-z-_]{35}', 'Google API key'),
+              (r'ghp_[a-zA-Z0-9]{36}', 'GitHub personal access token'),
+          ]
+          EXCLUDED_WORDS = {'your_meta_api_key_here', 'placeholder', 'none', 'null', 'false', 'true', 'mock', 'dummy'}
+
+          tracked = subprocess.check_output(['git', 'ls-files'], text=True).splitlines()
+          violations = []
+
+          for path in tracked:
+              try:
+                  with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                      content = f.read()
+              except Exception:
+                  continue
+
+              for pattern, desc in SECRET_PATTERNS:
+                  for m in re.finditer(pattern, content):
+                      matched_str = m.group(0)
+                      if any(ex in matched_str.lower() for ex in EXCLUDED_WORDS):
+                          continue
+                      violations.append(f'{path}: {desc} ({matched_str[:12]}...)')
+
+          if violations:
+              print('FAIL: Found potential API key or secret in tracked files:', file=sys.stderr)
+              for v in violations:
+                  print(f'  - {v}', file=sys.stderr)
+              sys.exit(1)
+
+          print('PASS: No API keys or high-entropy credentials found in tracked files.')
+          "

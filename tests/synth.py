@@ -128,6 +128,7 @@ def generate_synthetic_video(
     ringdown_start_sec: float = 5.0,
     ringdown_freq_hz: Optional[float] = None,
     ringdown_amplitude_px: Optional[float] = None,
+    still: bool = False,
 ) -> SyntheticVideoResult:
     """Generate a synthetic civil infrastructure video simulating subpixel vibration.
 
@@ -172,7 +173,12 @@ def generate_synthetic_video(
     time_series = np.arange(n_frames, dtype=np.float64) / fps
 
     # 1. Structural target oscillation (pure sine or ring-down decaying oscillation)
-    if ringdown:
+    if still:
+        f_target = 0.0
+        amp_target = 0.0
+        target_disp = np.zeros(n_frames, dtype=np.float64)
+        camera_jitter = False
+    elif ringdown:
         f_target = ringdown_freq_hz if ringdown_freq_hz is not None else (12.0 if freq_hz == 3.7 else freq_hz)
         amp_target = ringdown_amplitude_px if ringdown_amplitude_px is not None else (2.0 if amplitude_px == 0.2 else amplitude_px)
         omega_n = 2.0 * np.pi * f_target

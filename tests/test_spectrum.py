@@ -410,3 +410,31 @@ def test_spectrum_units_and_scale():
     out = analyzer.compute_welch_psd(sig)
     assert out.units == "px"
     assert out.scale is None
+
+
+def test_spectrum_nan_inf_input_raises_value_error():
+    """Verify that spectrum analysis functions raise a clear ValueError when called with NaN or Inf."""
+    fps = 60.0
+    sig_nan = np.array([0.0, 1.0, np.nan, 2.0, 1.0, 0.0, -1.0, 0.0])
+    sig_inf = np.array([0.0, 1.0, np.inf, 2.0, 1.0, 0.0, -1.0, 0.0])
+    sig_valid = np.sin(np.linspace(0, 10, 100))
+
+    # compute_welch_peaks raises ValueError
+    with pytest.raises(ValueError, match="Motion tracking produced invalid values"):
+        compute_welch_peaks(sig_nan, fps=fps)
+
+    with pytest.raises(ValueError, match="Motion tracking produced invalid values"):
+        compute_welch_peaks(sig_inf, fps=fps)
+
+    # Invalid background displacement raises ValueError
+    with pytest.raises(ValueError, match="Motion tracking produced invalid values"):
+        compute_welch_peaks(sig_valid, fps=fps, background_displacement=sig_nan)
+
+    # WelchSpectrumAnalyzer raises ValueError
+    analyzer = WelchSpectrumAnalyzer(fps=fps)
+    with pytest.raises(ValueError, match="Motion tracking produced invalid values"):
+        analyzer.compute_welch_psd(sig_nan)
+
+    with pytest.raises(ValueError, match="Motion tracking produced invalid values"):
+        analyzer.analyze(sig_inf)
+

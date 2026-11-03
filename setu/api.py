@@ -104,12 +104,24 @@ def _sync_scan_record_to_db(scan_id: str, scan_data: Dict[str, Any]) -> None:
     try:
         with Session(engine) as session:
             record = session.get(ScanRecord, scan_id)
-            loc = scan_data.get("location", {})
+            loc = scan_data.get("location") or {}
             lat = float(loc.get("lat", 0.0))
             lon = float(loc.get("lon", 0.0))
-            bridge = scan_data.get("interpretation", {}).get("bridge")
-            verdict = scan_data.get("verdict", {}).get("level")
-            dominant_hz = scan_data.get("measurement", {}).get("dominant_frequency_hz")
+            raw_bridge = (
+                scan_data.get("interpretation", {}).get("bridge")
+                or scan_data.get("bridge_name")
+            )
+            if isinstance(raw_bridge, dict):
+                bridge_str = raw_bridge.get("name")
+            elif raw_bridge:
+                bridge_str = str(raw_bridge)
+            else:
+                bridge_str = None
+
+            verdict_obj = scan_data.get("verdict") or {}
+            verdict = verdict_obj.get("level")
+            meas_obj = scan_data.get("measurement") or {}
+            dominant_hz = meas_obj.get("dominant_frequency_hz")
             status_val = scan_data.get("status", "complete")
 
             if not record:
@@ -118,7 +130,7 @@ def _sync_scan_record_to_db(scan_id: str, scan_data: Dict[str, Any]) -> None:
                     status=status_val,
                     latitude=lat,
                     longitude=lon,
-                    bridge_name=bridge,
+                    bridge_name=bridge_str,
                     verdict_level=verdict,
                     dominant_frequency_hz=dominant_hz,
                     result_json=json.dumps(scan_data),
@@ -129,7 +141,7 @@ def _sync_scan_record_to_db(scan_id: str, scan_data: Dict[str, Any]) -> None:
                 record.status = status_val
                 record.latitude = lat
                 record.longitude = lon
-                record.bridge_name = bridge
+                record.bridge_name = bridge_str
                 record.verdict_level = verdict
                 record.dominant_frequency_hz = dominant_hz
                 record.result_json = json.dumps(scan_data)
@@ -531,12 +543,20 @@ def get_bridges(
         if scan.get("is_demo") is True:
             continue
 
-        bridge_name = (
-            scan.get("interpretation", {}).get("bridge")
+        raw_bridge = (
+            (scan.get("interpretation") or {}).get("bridge")
             or scan.get("bridge_name")
         )
-        lat = float(scan.get("location", {}).get("lat", 0.0))
-        lon = float(scan.get("location", {}).get("lon", 0.0))
+        if isinstance(raw_bridge, dict):
+            bridge_name = raw_bridge.get("name")
+        elif raw_bridge:
+            bridge_name = str(raw_bridge)
+        else:
+            bridge_name = None
+
+        loc = scan.get("location") or {}
+        lat = float(loc.get("lat", 0.0))
+        lon = float(loc.get("lon", 0.0))
 
         if bridge_name and str(bridge_name).strip():
             b_clean = str(bridge_name).strip()
@@ -578,10 +598,10 @@ def get_bridges(
             "verdict", {"level": "unknown", "reasons": []}
         )
         last_time = latest_scan.get("created_at")
-        coords = latest_scan.get("location", group_coords[key])
-        latest_meas = latest_scan.get("measurement", {})
+        coords = latest_scan.get("location") or group_coords[key]
+        latest_meas = latest_scan.get("measurement") or {}
         dom_freq = latest_meas.get("dominant_frequency_hz")
-        assessment = latest_scan.get("interpretation", {}).get("assessment", {})
+        assessment = (latest_scan.get("interpretation") or {}).get("assessment") or {}
 
         bridge_summary = {
             "id": f"bridge-{hashlib.md5(key.encode('utf-8')).hexdigest()[:8]}",

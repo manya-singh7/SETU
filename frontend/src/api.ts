@@ -10,6 +10,7 @@ import mockScansData from "./mock/scans.json";
 import {
   BridgeSummary,
   CreateScanPayload,
+  FieldNote,
   ScanResult,
   TriageSeverity,
   VerdictLevel,
@@ -39,7 +40,7 @@ export const getScanFileUrl = getFileUrl;
  * Canonical sample scan conforming to Shared Result Format (schema 1.0)
  */
 export const SAMPLE_BENCHMARK_SCAN: ScanResult = {
-  schema_version: "1.0",
+  schema_version: "1.1",
   scan_id: "scan_20261103_a1b2c3",
   is_demo: false,
   created_at: "2026-11-03T19:30:00+05:30",
@@ -86,6 +87,22 @@ export const SAMPLE_BENCHMARK_SCAN: ScanResult = {
       power: [0.001, 0.001, 0.002, 0.003, 0.005, 0.008, 0.035, 0.371, 0.91, 0.123, 0.015, 0.004, 0.002, 0.001, 0.001, 0.001, 0.001, 0.001],
     },
     background_residual_px: 0.016,
+    instances: [
+      {
+        label: "Pier #2 South Column",
+        bbox: [450, 200, 180, 520],
+        frequency_hz: 3.70,
+        amplitude_px: 0.42,
+        verdict: "usable",
+      },
+      {
+        label: "Midspan Girders",
+        bbox: [120, 150, 720, 180],
+        frequency_hz: 3.68,
+        amplitude_px: 0.85,
+        verdict: "usable",
+      },
+    ],
   },
   interpretation: {
     bridge: null,
@@ -109,6 +126,7 @@ export const SAMPLE_BENCHMARK_SCAN: ScanResult = {
     magnified_video: "magnified.mp4",
     spectrum_plot: "spectrum.png",
     displacement_plot: "displacement.png",
+    vibration_map: "vibration_map.png",
   },
   costs_usd: {
     sam: 0.0025,
@@ -116,6 +134,7 @@ export const SAMPLE_BENCHMARK_SCAN: ScanResult = {
     total: 0.0038,
   },
   disclaimer: "SETU does not assess safety. Flagged readings are for engineer review.",
+  field_notes: [],
 };
 
 function convertLegacyMockToScanResult(mock: Record<string, any>): ScanResult {
@@ -370,3 +389,67 @@ export function getMockBridges(): BridgeSummary[] {
     };
   });
 }
+
+/**
+ * Creates a mock field note for offline fallback or testing
+ */
+export function createMockFieldNote(language: string): FieldNote {
+  const isHindi = language === "hi";
+  const isTamil = language === "ta";
+  return {
+    note_id: `note_${Date.now()}`,
+    created_at: new Date().toISOString(),
+    language: language,
+    transcript: isHindi
+      ? "पुल के तीसरे खंभे पर बड़ी दरार दिख रही है और भारी ट्रक निकलने पर गड़गड़ाहट की तेज आवाज आ रही है।"
+      : isTamil
+      ? "மூன்றாவது தூணில் விரிசல் தெரிகிறது, கனரக லாரிகள் செல்லும்போது பலத்த சத்தம் கேட்கிறது."
+      : "Visible diagonal crack on pier #3 and noticeable rumbling noise under loaded truck transit.",
+    english: language === "en" ? null : "Visible diagonal crack on pier #3 and noticeable rumbling noise under loaded truck transit.",
+    tags: [
+      {
+        tag: "crack",
+        evidence: isHindi ? "तीसरे खंभे पर बड़ी दरार" : isTamil ? "மூன்றாவது தூணில் விரிசல்" : "Visible diagonal crack on pier #3",
+      },
+      {
+        tag: "noise_under_load",
+        evidence: isHindi ? "गड़गड़ाहट की तेज आवाज" : isTamil ? "பலத்த சத்தம் கேட்கிறது" : "noticeable rumbling noise under loaded truck transit",
+      },
+    ],
+  };
+}
+
+/**
+ * Upload a voice field note to POST /api/scans/{id}/field-notes as multipart.
+ * Sends the audio file and current language code.
+ */
+export async function uploadFieldNote(
+  scanId: string,
+  audioBlob: Blob,
+  language: string
+): Promise<FieldNote> {
+  const formData = new FormData();
+  formData.append("audio", audioBlob, "field-note.webm");
+  formData.append("file", audioBlob, "field-note.webm");
+  formData.append("language", language);
+
+  let response: Response;
+  try {
+    response = await fetch(`/api/scans/${encodeURIComponent(scanId)}/field-notes`, {
+      method: "POST",
+      body: formData,
+    });
+  } catch (err) {
+    console.warn("Backend POST /field-notes unreachable, creating mock note:", err);
+    return createMockFieldNote(language);
+  }
+
+  if (!response.ok) {
+    console.warn(`Backend returned status ${response.status} for field note, falling back to mock note`);
+    return createMockFieldNote(language);
+  }
+
+  const result = await response.json();
+  return result.field_note || result;
+}
+

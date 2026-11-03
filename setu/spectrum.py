@@ -266,8 +266,10 @@ def detect_active_segments(
         List of (start_index, end_index) frame tuples for active vibration segments.
     """
     sig = np.asarray(displacement, dtype=np.float64).ravel()
+    if not np.all(np.isfinite(sig)):
+        raise ValueError("Motion tracking produced invalid values (displacement signal contains NaN or Inf)")
     N = len(sig)
-    if N < int(fps * 1.5) or fps <= 0.0 or not np.all(np.isfinite(sig)):
+    if N < int(fps * 1.5) or fps <= 0.0:
         return [(0, N)]
 
     sig_detrended = signal.detrend(sig, type="linear")
@@ -355,7 +357,9 @@ def estimate_frequency_uncertainty(
         confidence_level, n_segments, segment_freqs, and method description.
     """
     sig = np.asarray(displacement, dtype=np.float64).ravel()
-    if len(sig) < 8 or fps <= 0.0 or not np.all(np.isfinite(sig)):
+    if not np.all(np.isfinite(sig)):
+        raise ValueError("Motion tracking produced invalid values (displacement signal contains NaN or Inf)")
+    if len(sig) < 8 or fps <= 0.0:
         return {
             "mean_hz": center_freq_hz,
             "std_hz": 0.0,
@@ -632,6 +636,12 @@ def compute_welch_peaks(
         List of up to top_k Peak objects sorted by prominence/power.
     """
     sig = np.asarray(displacement, dtype=np.float64).ravel()
+    if not np.all(np.isfinite(sig)):
+        raise ValueError("Motion tracking produced invalid values (displacement signal contains NaN or Inf)")
+    if background_displacement is not None:
+        bg_sig_check = np.asarray(background_displacement, dtype=np.float64).ravel()
+        if not np.all(np.isfinite(bg_sig_check)):
+            raise ValueError("Motion tracking produced invalid values (background displacement contains NaN or Inf)")
     if len(sig) < 8 or fps <= 0.0:
         return []
 
@@ -904,6 +914,8 @@ class WelchSpectrumAnalyzer:
     ) -> SpectrumOutput:
         """Compute PSD and return SpectrumOutput containing top peaks."""
         sig_in = np.asarray(signal_arr, dtype=np.float64).ravel()
+        if not np.all(np.isfinite(sig_in)):
+            raise ValueError("Motion tracking produced invalid values (input signal contains NaN or Inf)")
         sig_detrended = signal.detrend(sig_in, type="linear")
 
         peaks = compute_welch_peaks(

@@ -175,3 +175,41 @@ def test_analyze_video_corrupt_file_returns_failed(tmp_path: Path, mock_clients)
     assert result.measurement.frequency_ci_hz is None
     assert result.measurement.peaks == []
     assert result.measurement.psd is None
+
+
+def test_analyze_video_with_magnification_produces_artifact(tmp_path: Path, mock_clients):
+    """Verify analyze_video with magnify=True produces magnified.mp4 and records stage_timings."""
+    meta_cli, osm_cli = mock_clients
+    video_dest = str(tmp_path / "synth_short_mag.mp4")
+    out_dir = tmp_path / "mag_output"
+
+    synth = generate_synthetic_video(
+        output_path=video_dest,
+        fps=60.0,
+        duration_sec=5.0,
+        freq_hz=3.70,
+        amplitude_px=0.20,
+        camera_jitter=False,
+        seed=42,
+    )
+
+    timings = {}
+    result = analyze_video(
+        path=synth.video_path,
+        lat=13.0827,
+        lon=80.2707,
+        target_prompt="concrete pillar",
+        background_prompt="building",
+        magnify=True,
+        out_dir=out_dir,
+        meta_client=meta_cli,
+        osm_client=osm_cli,
+        stage_timings=timings,
+    )
+
+    assert result.verdict.level == "usable"
+    assert result.outputs.magnified_video == "magnified.mp4"
+    assert os.path.isfile(out_dir / "magnified.mp4")
+    assert "video checks" in timings
+    assert "magnification" in timings
+    assert timings["magnification"] > 0.0

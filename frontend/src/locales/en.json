@@ -15,7 +15,8 @@
     "cancel": "Cancel",
     "footer_text": "Project SETU. Bridge Vibration Telemetry. Made in India.",
     "fastapi_online": "System online",
-    "fastapi_standby": "Offline mode (Sample data)"
+    "fastapi_standby": "Offline mode (Sample data)",
+    "retry": "Retry"
   },
   "nav": {
     "home": "Home",
@@ -130,7 +131,7 @@
     "expected_baseline": "Expected baseline:",
     "triage_findings": "Findings:",
     "recommended_action": "Recommended action:",
-    "no_flags": "No structural anomalies flagged.",
+    "no_flags": "No structural flags.",
     "quality_gate_title": "Quality gate",
     "bridge_correlation": "Bridge correlation:",
     "mapped_bridge": "Matched bridge:",
@@ -152,7 +153,11 @@
     "for_engineers_title": "For engineers (technical details)",
     "show_details": "Show technical details",
     "hide_details": "Hide details",
-    "no_peaks_found": "No resonant peaks extracted."
+    "no_peaks_found": "No resonant peaks extracted.",
+    "pipeline_error": "An error occurred while processing the scan.",
+    "weak_review_title": "Signal review",
+    "weak_engineer_note": "Low vibration amplitude or marginal signal quality. This reading does not meet criteria for reliable frequency extraction.",
+    "spectrum_image_alt": "Vibration spectrum plot"
   },
   "map": {
     "title": "Engineer bridge map",

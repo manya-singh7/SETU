@@ -416,3 +416,75 @@ def test_motion_result_units_and_scale(benchmark_suite):
     assert res.quality.get("scale") is None
     assert res.verdict in ("usable", "weak", "failed")
     assert isinstance(res.reasons, list)
+
+
+def test_still_synthetic_video_gives_failed_verdict(tmp_path):
+    """Verify that a synthetic video of a completely still target:
+    - Results in target displacement RMS within the tracking noise floor.
+    - Sets verdict to 'failed'.
+    - Sets failure reason to 'No measurable motion above tracking noise'.
+    """
+    video_path = str(tmp_path / "still_target.mp4")
+    res = generate_synthetic_video(
+        output_path=video_path,
+        fps=60.0,
+        duration_sec=3.0,
+        amplitude_px=0.0,
+        camera_jitter=False,
+        crf=23,
+        seed=42,
+    )
+
+    # 1. Phase correlation
+    res_pc = track_motion(
+        video_path=video_path,
+        target_bbox=res.target_bbox,
+        background_bbox=res.background_bbox,
+        method="phase_correlation",
+    )
+    assert res_pc.verdict == "failed", f"Expected verdict 'failed', got {res_pc.verdict}"
+    assert "No measurable motion above tracking noise" in res_pc.reasons
+    assert res_pc.quality["verdict"] == "failed"
+    assert "No measurable motion above tracking noise" in res_pc.quality["reasons"]
+
+    # 2. Lucas-Kanade
+    res_lk = track_motion(
+        video_path=video_path,
+        target_bbox=res.target_bbox,
+        background_bbox=res.background_bbox,
+        method="lucas_kanade",
+    )
+    assert res_lk.verdict == "failed", f"Expected verdict 'failed', got {res_lk.verdict}"
+    assert "No measurable motion above tracking noise" in res_lk.reasons
+    assert res_lk.quality["verdict"] == "failed"
+
+
+def test_motion_tracking_nan_inf_gives_failed_verdict(tmp_path, monkeypatch):
+    """Verify that if displacement contains NaN or Inf, verdict is 'failed' with reason
+    'Motion tracking produced invalid values'.
+    """
+    video_path = str(tmp_path / "nan_motion.mp4")
+    res = generate_synthetic_video(
+        output_path=video_path,
+        fps=30.0,
+        duration_sec=1.0,
+        amplitude_px=0.2,
+        camera_jitter=False,
+        seed=42,
+    )
+    # Monkeypatch cv2.phaseCorrelate to simulate invalid tracking values
+    monkeypatch.setattr(
+        "cv2.phaseCorrelate",
+        lambda *args, **kwargs: ((float("nan"), float("nan")), 0.0),
+    )
+    motion_res = track_motion(
+        video_path=video_path,
+        target_bbox=res.target_bbox,
+        background_bbox=res.background_bbox,
+        method="phase_correlation",
+    )
+    assert motion_res.verdict == "failed", f"Expected verdict 'failed', got {motion_res.verdict}"
+    assert "Motion tracking produced invalid values" in motion_res.reasons
+    assert motion_res.quality["verdict"] == "failed"
+    assert "Motion tracking produced invalid values" in motion_res.quality["reasons"]
+

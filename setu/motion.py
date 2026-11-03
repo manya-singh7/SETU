@@ -57,6 +57,16 @@ CLIPPING_FRAME_FRACTION: float = 0.10
 verdict reason for sensor saturation.
 """
 
+TRACKING_NOISE_FLOOR_RMS_PX: float = 0.008
+"""Empirical subpixel tracking noise floor RMS in pixels, measured on a synthetic video
+of a completely still target under H.264 compression (CRF 23).
+"""
+
+NOISE_FLOOR_FACTOR: float = 3.0
+"""Safety factor above the tracking noise floor required to confirm measurable physical motion
+(justified by the Rose detection criterion and 3-sigma IUPAC limit of detection).
+"""
+
 
 def _extract_bounding_box(mask: npt.NDArray[np.uint8]) -> Tuple[int, int, int, int]:
     """Find the bounding box (x, y, w, h) of a binary mask."""
@@ -78,6 +88,8 @@ def track_motion(
     axis: Literal["auto", "x", "y"] = "auto",
     max_corners_bg: int = 150,
     max_corners_target: int = 100,
+    noise_floor_rms: float = TRACKING_NOISE_FLOOR_RMS_PX,
+    noise_factor: float = NOISE_FLOOR_FACTOR,
 ) -> MotionResult:
     """Track subpixel target motion cancelled against background micro-jitter.
 
@@ -366,15 +378,21 @@ def track_motion(
 
     # 6. Quality diagnostics
     bg_residual_px = float(np.mean(bg_residuals))
-    disp_std = float(np.std(displacement))
+    is_valid_disp = len(displacement) > 0 and bool(np.all(np.isfinite(displacement)))
+    if is_valid_disp:
+        disp_std = float(np.std(displacement))
+        disp_rms = float(np.sqrt(np.mean(displacement**2)))
+    else:
+        disp_std = 0.0
+        disp_rms = 0.0
 
     # Signal to noise ratio calculation
     noise_est = max(bg_residual_px, 1e-4)
-    snr_val = float(np.clip((disp_std / noise_est) ** 2, 0.01, 1e6))
+    snr_val = float(np.clip((disp_std / noise_est) ** 2, 0.01, 1e6)) if is_valid_disp else 0.0
 
     # Check if camera motion is substantially larger than target structural motion
     cam_rms = float(np.sqrt(np.mean(np.array(camera_shifts_x) ** 2 + np.array(camera_shifts_y) ** 2)))
-    if cam_rms > 5.0 * max(disp_std, 0.05):
+    if is_valid_disp and cam_rms > 5.0 * max(disp_std, 0.05):
         warnings.append(
             f"Camera micro-jitter motion (RMS: {cam_rms:.2f} px) is significantly larger than "
             f"target structural displacement (RMS: {disp_std:.3f} px). Subpixel accuracy may be degraded."
@@ -402,16 +420,21 @@ def track_motion(
         reasons.append("unverified: no stationary background in frame")
     if clipping_detected:
         reasons.append("target mask pixel saturation/clipping detected (saturation reduces sub-pixel accuracy)")
-    if cam_rms > 5.0 * max(disp_std, 0.05):
+    if is_valid_disp and cam_rms > 5.0 * max(disp_std, 0.05):
         reasons.append(
             f"camera micro-jitter motion ({cam_rms:.2f} px) significantly exceeds target motion ({disp_std:.3f} px)"
         )
     if bg_residual_px > 0.08:
         reasons.append(f"elevated background stabilization residual ({bg_residual_px:.3f} px)")
 
-    if len(displacement) == 0 or not np.all(np.isfinite(displacement)):
+    min_motion_thresh = float(noise_floor_rms * noise_factor)
+
+    if not is_valid_disp:
         verdict: Literal["usable", "weak", "failed"] = "failed"
-        reasons.insert(0, "non-finite or empty displacement tracking output")
+        reasons.insert(0, "Motion tracking produced invalid values")
+    elif disp_rms <= min_motion_thresh:
+        verdict = "failed"
+        reasons.insert(0, "No measurable motion above tracking noise")
     elif len(reasons) > 0:
         verdict = "weak"
     else:
@@ -432,6 +455,9 @@ def track_motion(
         "method": method,
         "warnings": warnings,
         "confidence": verdict,
+        "displacement_rms_px": round(disp_rms, 6),
+        "noise_floor_rms_px": round(noise_floor_rms, 6),
+        "min_motion_threshold_px": round(min_motion_thresh, 6),
     }
 
     motion_result = MotionResult(
@@ -454,15 +480,21 @@ class SubpixelMotionTracker:
         self,
         fps: float = 60.0,
         method: Literal["phase_correlation", "lucas_kanade"] = "phase_correlation",
+        noise_floor_rms: float = TRACKING_NOISE_FLOOR_RMS_PX,
+        noise_factor: float = NOISE_FLOOR_FACTOR,
     ) -> None:
         self.fps = fps
         self.method = method
+        self.noise_floor_rms = noise_floor_rms
+        self.noise_factor = noise_factor
 
     def track(
         self,
         video_path: str,
         target_bbox: Optional[Tuple[int, int, int, int]] = None,
         background_bbox: Optional[Tuple[int, int, int, int]] = None,
+        noise_floor_rms: Optional[float] = None,
+        noise_factor: Optional[float] = None,
     ) -> MotionResult:
         """Execute subpixel motion tracking on a video file."""
         return track_motion(
@@ -470,6 +502,8 @@ class SubpixelMotionTracker:
             target_bbox=target_bbox,
             background_bbox=background_bbox,
             method=self.method,
+            noise_floor_rms=self.noise_floor_rms if noise_floor_rms is None else noise_floor_rms,
+            noise_factor=self.noise_factor if noise_factor is None else noise_factor,
         )
 
     def track_displacement_series(

@@ -7,6 +7,7 @@ import {
   Clock,
   Eye,
   MapPin,
+  RotateCw,
   Sliders,
 } from "lucide-react";
 import { getScan, getFileUrl } from "../api";
@@ -20,17 +21,18 @@ const InteractiveSpectrumChart = lazy(() => import("../components/InteractiveSpe
 interface ResultPageProps {
   scanId: string;
   onNavigate: (page: "home" | "scan" | "result" | "map", scanId?: string) => void;
+  initialScan?: ScanResult;
 }
 
-export default function ResultPage({ scanId, onNavigate }: ResultPageProps) {
+export default function ResultPage({ scanId, onNavigate, initialScan }: ResultPageProps) {
   const { t } = useTranslation();
-  const [scan, setScan] = useState<ScanResult | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [scan, setScan] = useState<ScanResult | null>(initialScan || null);
+  const [loading, setLoading] = useState<boolean>(!initialScan);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"image" | "chart">("image");
   const [showEngineerDetails, setShowEngineerDetails] = useState<boolean>(false);
 
-  useEffect(() => {
+  const loadScan = () => {
     let isMounted = true;
     setLoading(true);
     setError(null);
@@ -52,7 +54,18 @@ export default function ResultPage({ scanId, onNavigate }: ResultPageProps) {
     return () => {
       isMounted = false;
     };
-  }, [scanId, t]);
+  };
+
+  useEffect(() => {
+    if (initialScan) {
+      setScan(initialScan);
+      setLoading(false);
+      setError(null);
+      return;
+    }
+
+    return loadScan();
+  }, [scanId, initialScan]);
 
   // Real measurement.psd only (no synthetic curves from peaks!)
   const realPsdData = useMemo(() => {
@@ -76,19 +89,60 @@ export default function ResultPage({ scanId, onNavigate }: ResultPageProps) {
     );
   }
 
-  if (error || !scan) {
+  // Error state: shows error details and a prominent RETRY option
+  if (error || !scan || scan.status === "error") {
     return (
       <div className="max-w-md mx-auto text-center py-12 p-6 rounded-[4px] border border-concrete-rule bg-white space-y-4 font-sans text-asphalt">
         <h2 className="text-lg font-bold text-asphalt">
-          {t("common.error", "Scan Record Not Found")}
+          {t("common.error", "Error")}
         </h2>
-        <p className="text-xs text-asphalt-muted">{error || "Could not retrieve the requested scan."}</p>
-        <button
-          onClick={() => onNavigate("scan")}
-          className="px-5 py-2.5 rounded-[4px] bg-highway hover:bg-highway-dark text-white text-xs font-semibold focus-visible:outline-highway"
-        >
-          {t("result.back_to_scan", "Film another bridge")}
-        </button>
+        <p className="text-xs text-asphalt-muted">
+          {error || scan?.error || t("result.pipeline_error", "An error occurred while processing the scan.")}
+        </p>
+        <div className="flex items-center justify-center gap-3 pt-2">
+          <button
+            type="button"
+            onClick={loadScan}
+            className="inline-flex items-center space-x-1.5 px-5 py-2.5 rounded-[4px] bg-highway hover:bg-highway-dark text-white text-xs font-semibold focus-visible:outline-highway transition"
+          >
+            <RotateCw className="h-3.5 w-3.5" />
+            <span>{t("common.retry", "Retry")}</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => onNavigate("scan")}
+            className="px-5 py-2.5 rounded-[4px] bg-white hover:bg-concrete text-asphalt border border-concrete-rule text-xs font-semibold focus-visible:outline-highway transition"
+          >
+            {t("result.back_to_scan", "Film another bridge")}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Queued or Running state
+  if (scan.status === "queued" || scan.status === "running") {
+    return (
+      <div className="max-w-md mx-auto text-center py-16 p-6 rounded-[4px] border border-concrete-rule bg-white space-y-4 font-sans text-asphalt">
+        <div className="inline-block h-6 w-6 border-2 border-highway border-t-transparent rounded-full animate-spin" />
+        <h2 className="text-lg font-bold text-asphalt">
+          {scan.status === "queued"
+            ? t("scan.status_queued", "Status: waiting in line")
+            : t("scan.status_running", "Status: measuring bridge motion")}
+        </h2>
+        <p className="text-xs text-asphalt-muted">
+          {t("scan.polling_interval", "Checking every 2 seconds")}
+        </p>
+        <div className="pt-2">
+          <button
+            type="button"
+            onClick={loadScan}
+            className="inline-flex items-center space-x-1.5 px-4 py-2 rounded-[4px] bg-concrete hover:bg-concrete-dark text-asphalt text-xs font-semibold border border-concrete-rule focus-visible:outline-highway transition"
+          >
+            <RotateCw className="h-3.5 w-3.5" />
+            <span>{t("common.retry", "Retry")}</span>
+          </button>
+        </div>
       </div>
     );
   }
@@ -250,16 +304,18 @@ export default function ResultPage({ scanId, onNavigate }: ResultPageProps) {
           </div>
         </div>
 
-        {/* Verdict Reasons */}
+        {/* Verdict Reasons (Filtered for weak scans to avoid anomaly wording) */}
         {scan.verdict?.reasons && scan.verdict.reasons.length > 0 && (
           <div className="text-xs space-y-1">
             <span className="font-semibold text-asphalt block">
               {t("result.verdict_reasons", "Reasons:")}
             </span>
             <ul className="list-disc list-inside space-y-0.5 text-asphalt-muted">
-              {scan.verdict.reasons.map((r, i) => (
-                <li key={i}>{r}</li>
-              ))}
+              {scan.verdict.reasons
+                .filter((r) => !isWeak || (!/anomal/i.test(r) && !/severity/i.test(r)))
+                .map((r, i) => (
+                  <li key={i}>{r}</li>
+                ))}
             </ul>
           </div>
         )}
@@ -364,7 +420,7 @@ export default function ResultPage({ scanId, onNavigate }: ResultPageProps) {
               <div className="p-2 border border-concrete-rule rounded-[4px] bg-white flex justify-center">
                 <img
                   src={spectrumPlotUrl}
-                  alt="Vibration spectrum plot"
+                  alt={t("result.spectrum_image_alt", "Vibration spectrum plot")}
                   className="max-h-80 object-contain"
                 />
               </div>
@@ -528,36 +584,52 @@ export default function ResultPage({ scanId, onNavigate }: ResultPageProps) {
               )}
             </div>
 
-            {/* Engineer Section 4: Structural Assessment & Triage */}
-            <div className="space-y-3 pt-2 border-t border-concrete-rule">
-              <div className="flex justify-between items-center border-b border-concrete-rule pb-2">
-                <h3 className="font-bold text-sm text-asphalt">
-                  {t("result.structural_triage", "Engineering review")}
-                </h3>
-                <span className="text-xs font-bold uppercase text-asphalt">
-                  {severity} urgency
-                </span>
-              </div>
+            {/* Engineer Section 4: Structural Assessment & Triage (Hidden for weak scans to avoid anomaly/severity wording) */}
+            {!isWeak ? (
+              <div className="space-y-3 pt-2 border-t border-concrete-rule">
+                <div className="flex justify-between items-center border-b border-concrete-rule pb-2">
+                  <h3 className="font-bold text-sm text-asphalt">
+                    {t("result.structural_triage", "Engineering review")}
+                  </h3>
+                  <span className="text-xs font-bold uppercase text-asphalt">
+                    {severity} urgency
+                  </span>
+                </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs font-sans">
-                <div>
-                  <div className="text-asphalt-muted">{t("result.assessor_module", "Assessor:")} <strong className="text-asphalt">{assessment?.assessor || "local_rules"}</strong></div>
-                  <div className="text-asphalt-muted mt-1">{t("result.assessor_confidence", "Confidence:")} <strong className="text-asphalt uppercase">{assessment?.confidence || "low"}</strong></div>
-                  {assessment?.expected_range_hz && (
-                    <div className="text-asphalt-muted mt-1 font-mono">
-                      {t("result.expected_baseline", "Expected baseline:")} {formatLocaleNumber(assessment.expected_range_hz[0], { minimumFractionDigits: 2 })} - {formatLocaleNumber(assessment.expected_range_hz[1], { minimumFractionDigits: 2 })} Hz
-                    </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs font-sans">
+                  <div>
+                    <div className="text-asphalt-muted">{t("result.assessor_module", "Assessor:")} <strong className="text-asphalt">{assessment?.assessor || "local_rules"}</strong></div>
+                    <div className="text-asphalt-muted mt-1">{t("result.assessor_confidence", "Confidence:")} <strong className="text-asphalt uppercase">{assessment?.confidence || "low"}</strong></div>
+                    {assessment?.expected_range_hz && (
+                      <div className="text-asphalt-muted mt-1 font-mono">
+                        {t("result.expected_baseline", "Expected baseline:")} {formatLocaleNumber(assessment.expected_range_hz[0], { minimumFractionDigits: 2 })} - {formatLocaleNumber(assessment.expected_range_hz[1], { minimumFractionDigits: 2 })} Hz
+                      </div>
+                    )}
+                  </div>
+
+                  <div>
+                    <span className="font-bold text-asphalt block mb-1">{t("result.recommended_action", "Recommended action:")}</span>
+                    <p className="text-asphalt-muted leading-relaxed">
+                      {assessment?.recommended_action || "Routine periodic physical inspection per maintenance cycle."}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-2 pt-2 border-t border-concrete-rule text-xs font-sans">
+                <div className="border-b border-concrete-rule pb-2">
+                  <h3 className="font-bold text-sm text-asphalt">
+                    {t("result.weak_review_title", "Signal review")}
+                  </h3>
+                </div>
+                <p className="text-asphalt-muted leading-relaxed">
+                  {t(
+                    "result.weak_engineer_note",
+                    "Low vibration amplitude or marginal signal quality. This reading does not meet criteria for reliable frequency extraction."
                   )}
-                </div>
-
-                <div>
-                  <span className="font-bold text-asphalt block mb-1">{t("result.recommended_action", "Recommended action:")}</span>
-                  <p className="text-asphalt-muted leading-relaxed">
-                    {assessment?.recommended_action || "Routine periodic physical inspection per maintenance cycle."}
-                  </p>
-                </div>
+                </p>
               </div>
-            </div>
+            )}
 
             {/* Engineer Section 5: Processing Costs (No developer text) */}
             <div className="space-y-2 pt-2 border-t border-concrete-rule text-xs font-sans">

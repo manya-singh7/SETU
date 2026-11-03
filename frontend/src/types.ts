@@ -1,6 +1,6 @@
 /**
  * TypeScript Type Definitions for SETU Telemetry Platform
- * Matching Shared Result Format (schema_version 1.0)
+ * Matching Shared Result Format (schema_version 1.1)
  */
 
 export type ScanStatus = "queued" | "running" | "complete" | "error";
@@ -10,6 +10,37 @@ export type VerdictLevel = "usable" | "weak" | "failed";
 export type SegmentationSource = "sam" | "fallback" | "none" | string;
 
 export type TriageSeverity = "none" | "low" | "medium" | "high";
+
+export type FieldNoteTagType =
+  | "crack"
+  | "noise_under_load"
+  | "visible_sag"
+  | "rust"
+  | "spalling"
+  | "water_or_scour"
+  | "other";
+
+export interface FieldNoteTag {
+  tag: FieldNoteTagType;
+  evidence: string;
+}
+
+export interface FieldNote {
+  note_id: string;
+  created_at: string;
+  language: string;
+  transcript: string;
+  english: string | null;
+  tags: FieldNoteTag[];
+}
+
+export interface MeasurementInstance {
+  label: string;
+  bbox: [number, number, number, number];
+  frequency_hz: number | null;
+  amplitude_px: number | null;
+  verdict: VerdictLevel;
+}
 
 export interface Verdict {
   level: VerdictLevel;
@@ -59,6 +90,7 @@ export interface MeasurementDetails {
   peaks: SpectralPeak[];
   background_residual_px: number;
   psd?: PowerSpectralDensity | null;
+  instances?: MeasurementInstance[];
 }
 
 export interface QualityGateDetails {
@@ -100,6 +132,7 @@ export interface ScanOutputs {
   magnified_video?: string | null;
   spectrum_plot?: string | null;
   displacement_plot?: string | null;
+  vibration_map?: string | null;
   [key: string]: string | null | undefined;
 }
 
@@ -125,6 +158,7 @@ export interface ScanResult {
   outputs: ScanOutputs;
   costs_usd: CostBreakdown;
   disclaimer: string;
+  field_notes?: FieldNote[];
   error?: string | null;
 }
 
