@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 80" fill="none">
+  <!-- Milestone body -->
+  <path d="M4 32 C4 14 16 4 32 4 C48 4 60 14 60 32 L60 76 L4 76 Z" fill="#FFFFFF" stroke="#22262A" stroke-width="4"/>
+  <!-- Milestone yellow cap -->
+  <path d="M4 32 C4 14 16 4 32 4 C48 4 60 14 60 32 Z" fill="#F2C230" stroke="#22262A" stroke-width="4"/>
+  <line x1="4" y1="32" x2="60" y2="32" stroke="#22262A" stroke-width="3"/>
+  <text x="32" y="24" text-anchor="middle" font-family="sans-serif" font-weight="900" font-size="11" fill="#22262A">NH</text>
+  <text x="32" y="60" text-anchor="middle" font-family="sans-serif" font-weight="900" font-size="15" fill="#22262A">सेतु</text>
+</svg>

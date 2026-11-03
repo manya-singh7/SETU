@@ -7,5 +7,26 @@ export default defineConfig({
   server: {
     port: 5173,
     host: true,
+    proxy: {
+      "/api": {
+        target: "http://localhost:8000",
+        changeOrigin: true,
+      },
+      "/health": {
+        target: "http://localhost:8000",
+        changeOrigin: true,
+      },
+    },
+  },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          leaflet: ["leaflet"],
+          charts: ["recharts"],
+          i18n: ["i18next", "react-i18next"],
+        },
+      },
+    },
   },
 });
