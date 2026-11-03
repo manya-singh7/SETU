@@ -567,6 +567,10 @@ export default function EngineerMapPage({ onSelectScan, initialScanId }: Enginee
                           <span>•</span>
                           <span>Checked: {formatLocaleDate(b.timestamp, { dateStyle: "short" })}</span>
                         </div>
+                        {b.bridge_key && <div className="mt-2 flex flex-wrap gap-3 text-[10px] font-semibold">
+                          <a href={`/api/bridges/${encodeURIComponent(b.bridge_key)}/report.csv`} download className="underline text-[#0B6E4F]" onClick={(event) => event.stopPropagation()}>{t("map.download_csv", "Download report (CSV)")}</a>
+                          <a href={`/report/${encodeURIComponent(b.bridge_key)}`} className="underline text-[#0B6E4F]" onClick={(event) => event.stopPropagation()}>{t("map.printable_report", "Printable report")}</a>
+                        </div>}
                       </div>
 
                       <ChevronRight className={`h-4 w-4 ${isSelected ? "text-[#22262A]" : "text-[#22262A]/40"}`} />

@@ -206,3 +206,45 @@ def test_weak_result_allows_frequency_and_psd():
     assert d["measurement"]["dominant_frequency_hz"] == 3.70
     assert d["measurement"]["frequency_ci_hz"] == [3.65, 3.75]
     assert d["measurement"]["psd"]["freq_hz"] == [3.70]
+
+
+def test_schema_11_additions_and_schema_10_compatibility():
+    current = ScanResult()
+    data = current.to_dict()
+    assert data["schema_version"] == "1.2"
+    assert data["field_notes"] == []
+    assert data["measurement"]["instances"] == []
+    assert data["outputs"]["vibration_map"] is None
+    assert data["cable"] == {
+        "is_cable": False,
+        "tension_change_pct": None,
+        "tension_change_range_pct": None,
+        "compared_to_scan_id": None,
+        "compared_to_date": None,
+    }
+    legacy = ScanResult.from_dict({"schema_version": "1.0", "measurement": {}, "outputs": {}})
+    legacy_data = legacy.to_dict()
+    assert legacy.schema_version == "1.0"
+    assert "field_notes" not in legacy_data
+    assert "instances" not in legacy_data["measurement"]
+    assert "cable" not in legacy_data
+    legacy_11 = ScanResult.from_dict({"schema_version": "1.1", "measurement": {}, "outputs": {}})
+    assert legacy_11.to_dict()["schema_version"] == "1.1"
+    assert "cable" not in legacy_11.to_dict()
+
+
+def test_schema_12_cable_round_trip():
+    current = ScanResult.from_dict({
+        "schema_version": "1.2",
+        "cable": {
+            "is_cable": True,
+            "tension_change_pct": -9.75,
+            "tension_change_range_pct": [-11.1, -8.4],
+            "compared_to_scan_id": "scan_old",
+            "compared_to_date": "2026-11-03T10:00:00+00:00",
+        },
+    })
+    restored = ScanResult.from_json(current.to_json())
+    assert restored.to_dict() == current.to_dict()
+    assert restored.cable.is_cable is True
+    assert restored.cable.tension_change_pct == -9.75

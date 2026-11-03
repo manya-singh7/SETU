@@ -22,7 +22,8 @@
     "home": "Home",
     "scan": "Film a bridge",
     "result": "Scan result",
-    "map": "Engineer map"
+    "map": "Engineer map",
+    "proof": "Proof"
   },
   "home": {
     "hero_headline": "Film a bridge for 30 seconds. SETU measures how it vibrates.",
@@ -38,7 +39,8 @@
     "step3_desc": "Eulerian video magnification amplifies microscopic movement and reveals the dominant vibration frequency.",
     "real_scan_title": "Actual scan result",
     "real_scan_desc": "Magnified video and power spectral density plot from Napier Bridge benchmark.",
-    "real_scan_missing": "No completed scan is currently loaded. Film a bridge or choose an entry from the map to view real video and spectrum plots."
+    "real_scan_missing": "No completed scan is currently loaded. Film a bridge or choose an entry from the map to view real video and spectrum plots.",
+    "proof_link": "See validation results"
   },
   "scan": {
     "title": "Film a bridge",
@@ -83,7 +85,8 @@
     "status_queued": "Status: waiting in line",
     "status_running": "Status: measuring bridge motion",
     "status_complete": "Status: complete",
-    "status_error": "Status: could not process video"
+    "status_error": "Status: could not process video",
+    "cable_checkbox": "I'm filming a cable or hanger"
   },
   "result": {
     "demo_banner": "Demo result: sample data, not a real measurement",
@@ -157,7 +160,43 @@
     "pipeline_error": "An error occurred while processing the scan.",
     "weak_review_title": "Signal review",
     "weak_engineer_note": "Low vibration amplitude or marginal signal quality. This reading does not meet criteria for reliable frequency extraction.",
-    "spectrum_image_alt": "Vibration spectrum plot"
+    "spectrum_image_alt": "Vibration spectrum plot",
+    "voice_title": "Tell us what you see: cracks, sounds, sagging",
+    "record_voice": "Record a voice note",
+    "stop_recording": "Stop recording",
+    "uploading_note": "Uploading and transcribing…",
+    "voice_privacy": "Your voice is turned into text; the recording is deleted.",
+    "mic_denied": "Microphone access denied. Allow access and try again.",
+    "voice_upload_error": "Could not upload this voice note. Please try again.",
+    "share_whatsapp": "Share on WhatsApp",
+    "share_usable": "reading available",
+    "share_unclear": "reading not clear enough",
+    "share_bridge": "Bridge",
+    "share_reading": "Reading",
+    "share_frequency": "Frequency",
+    "share_link": "Page",
+    "bridge_area_unknown": "Bridge area",
+    "vibration_map_caption": "Each part is coloured by how it vibrates",
+    "instance_details": "For engineers: measured parts",
+    "instance": "Part",
+    "amplitude": "Amplitude",
+    "verdict": "Verdict",
+    "vibration_map_alt": "Vibration map",
+    "for_engineers": "For engineers",
+    "tag_crack": "Crack",
+    "tag_noise_under_load": "Noise under load",
+    "tag_visible_sag": "Visible sag",
+    "tag_rust": "Rust",
+    "tag_spalling": "Spalling",
+    "tag_water_or_scour": "Water or scour",
+    "tag_other": "Other",
+    "cable_comparison_brief": "Compared with an earlier scan of this cable",
+    "cable_comparison_details": "View details",
+    "cable_change_title": "Cable tension estimate",
+    "cable_change_estimate": "Estimated change in cable tension since {{date}}: {{change}}%",
+    "cable_change_range": "range {{low}}% to {{high}}%",
+    "cable_change_note": "Based on the change in vibration frequency; for engineer review, not a safety verdict.",
+    "earlier_scan": "an earlier scan"
   },
   "map": {
     "title": "Engineer bridge map",
@@ -186,6 +225,44 @@
     "triage_queue_title": "Bridges",
     "sorted_notice": "Sorted by urgency, then date",
     "no_bridges_match": "No bridges match current filters.",
-    "not_enough_data": "Not enough data"
+    "not_enough_data": "Not enough data",
+    "download_csv": "Download report (CSV)",
+    "printable_report": "Printable report"
+  },
+  "report": {
+    "page_title": "Bridge report",
+    "print": "Print or save as PDF",
+    "loading": "Loading report...",
+    "load_error": "Could not load this report.",
+    "bridge_key": "Bridge key",
+    "city": "Area",
+    "bridge_type": "Bridge type",
+    "material": "Material",
+    "scan_history": "Scan history",
+    "date": "Date",
+    "verdict": "Reading",
+    "frequency": "Frequency",
+    "cable_change": "Cable change",
+    "field_notes": "Field-note tags and evidence",
+    "no_scans": "No scans are available.",
+    "frequency_chart": "Frequency over time",
+    "location": "Location"
+  },
+  "proof": {
+    "title": "Validation proof",
+    "loading": "Loading validation results...",
+    "load_error": "Validation results are not available yet.",
+    "coming_soon": "Validation results coming soon",
+    "comparison": "Sensor comparison",
+    "camera": "Camera frequency",
+    "accelerometer": "Accelerometer frequency",
+    "difference": "Difference",
+    "agreement": "The sensors agree within the comparison criteria",
+    "disagreement": "The readings differ beyond the comparison criteria",
+    "spectra": "Normalized spectra",
+    "frequency_axis": "Frequency",
+    "normalized_power": "Normalized power",
+    "spectrum_unavailable": "A spectrum was not included for one of these sensors.",
+    "spectra_unavailable": "Spectra were not included in this comparison."
   }
 }

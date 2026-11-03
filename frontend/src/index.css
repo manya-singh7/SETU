@@ -50,3 +50,33 @@ html, body, #root {
   font-feature-settings: "tnum" 1;
   font-variant-numeric: tabular-nums;
 }
+
+
+@page {
+  size: A4;
+  margin: 16mm;
+}
+
+@media print {
+  html, body, #root {
+    min-height: 0;
+    background: #fff !important;
+    color: #000 !important;
+  }
+
+  body, body * {
+    color: #000 !important;
+    box-shadow: none !important;
+  }
+
+  .print-hidden, .app-navigation {
+    display: none !important;
+  }
+
+  .print-report {
+    max-width: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    background: #fff !important;
+  }
+}

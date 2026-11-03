@@ -27,6 +27,7 @@ export default function ScanPage({ onScanComplete }: ScanPageProps) {
   const [bridgeName, setBridgeName] = useState("Napier Bridge Pier #2");
   const [targetPrompt, setTargetPrompt] = useState("concrete pillar");
   const [backgroundPrompt, setBackgroundPrompt] = useState("building"); // Default "building"
+  const [isCable, setIsCable] = useState(false);
   const [gpsStatus, setGpsStatus] = useState<"idle" | "fetching" | "success" | "error">("idle");
 
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -85,6 +86,7 @@ export default function ScanPage({ onScanComplete }: ScanPageProps) {
         target_prompt: targetPrompt,
         background_prompt: backgroundPrompt,
         bridge_name: bridgeName,
+        is_cable: isCable,
       });
 
       const scanId = created.scan_id || (created as any).id;
@@ -383,6 +385,13 @@ export default function ScanPage({ onScanComplete }: ScanPageProps) {
                 <span className="text-[11px] text-asphalt-muted block mt-1">
                   {t("scan.target_prompt_desc", "For example: concrete pillar, road deck, or stay cable.")}
                 </span>
+              </div>
+
+              <div className="pt-2 md:col-span-2">
+                <label className="inline-flex items-center gap-2 text-sm font-semibold text-asphalt">
+                  <input type="checkbox" checked={isCable} onChange={(event) => setIsCable(event.target.checked)} className="h-5 w-5 accent-highway" />
+                  {t("scan.is_cable_label", "I'm filming a cable or hanger")}
+                </label>
               </div>
 
               {/* Background Prompt in Driver Words */}

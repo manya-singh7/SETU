@@ -20,10 +20,25 @@ The processing pipeline executes in seven sequential stages:
 
 ## Meta Models Used
 
-SETU integrates two Meta foundation models:
+SETU integrates three Meta model lines:
 
 - **sam-3.1** (`setu/segment.py`): Used for Promptable Concept Segmentation (PCS) on Frame 0. It takes user prompts (such as "concrete pillar" and "building") to generate binary target and background masks. An offline geometric heuristic segmenter acts as a fallback when the Meta API is unavailable.
 - **muse-spark-1.3** (`setu/assess.py`, `setu/quality_gate.py`, `setu/interpret.py`): Used for LLM-assisted anomaly screening and visual quality gate verification. It operates under a strict evidence lock, meaning every number in the output must match values in the input telemetry or OpenStreetMap metadata. It never certifies safety and always recommends human inspection when anomalies or uncertainties occur.
+- **muse-voice-transcribe-1.0** (`setu/voice.py`): Transcribes short driver voice notes; Muse Spark turns transcripts into engineer tags with exact transcript evidence.
+
+## Public Demo Deployment
+
+The root `Dockerfile` builds the frontend and serves it with the FastAPI backend
+on one port. It includes ffmpeg and PyAV support. Set
+`SETU_PUBLIC_DEMO=true` for public hosting: Meta runs in cached mode with live
+requests blocked, uploads are limited to 3 per IP per hour and 60 seconds, and
+original uploaded videos are deleted after 24 hours. See
+[`deploy/README.md`](deploy/README.md) for beginner steps to deploy on Modal or
+Render.
+
+Real showcase scans can be bundled under `demo_scans/<scan-name>/` with a
+`result.json` and referenced output files. They are listed at `GET /api/showcase`
+and served read-only.
 
 ## Setup on Windows
 
@@ -130,7 +145,8 @@ python -m validation.compare --phyphox tests/fixtures/phyphox_sample.csv --resul
 - Camera resonant peak frequency with confidence interval
 - Absolute frequency difference in Hz and relative difference in percent
 - Combined uncertainty calculation
-- Verdict: PASS or FAIL evaluated against engineering tolerances (5.0% relative discrepancy or 0.30 Hz absolute discrepancy for modes below 6 Hz)
+- Agreement is judged by combined uncertainty from the camera confidence interval and accelerometer confidence interval.
+- Verdict: PASS or FAIL based on whether the measured frequency intervals agree within their combined uncertainty.
 - Composite dual-spectrum plot normalizing both optical and contact sensor PSDs
 
 ## Limitations

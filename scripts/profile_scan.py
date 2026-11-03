@@ -23,10 +23,12 @@ import sys
 import tempfile
 import time
 import tracemalloc
+import threading
 from typing import Any, Dict, Optional, Tuple
 
 import cv2
 import numpy as np
+import psutil
 
 import sys
 from pathlib import Path
@@ -153,6 +155,16 @@ def run_profile_pass(
     meta_client = MetaClient(mode="mock")
     osm_client = OverpassBridgeClient(mode="mock")
 
+    process = psutil.Process()
+    peak_rss = [process.memory_info().rss]
+    stop_sampler = threading.Event()
+
+    def sample_memory() -> None:
+        while not stop_sampler.wait(0.05):
+            peak_rss[0] = max(peak_rss[0], process.memory_info().rss)
+
+    sampler = threading.Thread(target=sample_memory, daemon=True)
+    sampler.start()
     tracemalloc.start()
     t_start = time.perf_counter()
 
@@ -173,7 +185,11 @@ def run_profile_pass(
     total_time = time.perf_counter() - t_start
     _, peak_bytes = tracemalloc.get_traced_memory()
     tracemalloc.stop()
-    peak_mb = peak_bytes / (1024 * 1024)
+    stop_sampler.set()
+    sampler.join()
+    peak_rss[0] = max(peak_rss[0], process.memory_info().rss)
+    # RSS includes NumPy/OpenCV native allocations missed by tracemalloc.
+    peak_mb = peak_rss[0] / (1024 * 1024)
 
     if not timings and hasattr(result, "_stage_timings"):
         timings = getattr(result, "_stage_timings")

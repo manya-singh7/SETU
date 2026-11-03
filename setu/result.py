@@ -85,6 +85,32 @@ class MeasurementInfo:
     peaks: List[MeasurementPeak] = field(default_factory=list)
     psd: Optional[PSDData] = None
     background_residual_px: float = 0.0
+    instances: List["MeasurementInstance"] = field(default_factory=list)
+
+
+@dataclass
+class MeasurementInstance:
+    label: str = ""
+    bbox: List[float] = field(default_factory=list)
+    frequency_hz: Optional[float] = None
+    amplitude_px: Optional[float] = None
+    verdict: Literal["usable", "weak", "failed"] = "usable"
+
+
+@dataclass
+class FieldNoteTag:
+    tag: Literal["crack", "noise_under_load", "visible_sag", "rust", "spalling", "water_or_scour", "other"]
+    evidence: str
+
+
+@dataclass
+class FieldNote:
+    note_id: str
+    created_at: str
+    language: str
+    transcript: str
+    english: Optional[str] = None
+    tags: List[FieldNoteTag] = field(default_factory=list)
 
 
 @dataclass
@@ -126,6 +152,7 @@ class OutputsInfo:
     magnified_video: Optional[str] = None
     spectrum_plot: Optional[str] = None
     displacement_plot: Optional[str] = None
+    vibration_map: Optional[str] = None
 
 
 @dataclass
@@ -138,10 +165,21 @@ class CostsUSD:
 
 
 @dataclass
+class CableInfo:
+    """Estimated cable tension change for engineer review."""
+
+    is_cable: bool = False
+    tension_change_pct: Optional[float] = None
+    tension_change_range_pct: Optional[List[float]] = None
+    compared_to_scan_id: Optional[str] = None
+    compared_to_date: Optional[str] = None
+
+
+@dataclass
 class ScanResult:
     """Canonical scan result representation for Project SETU."""
 
-    schema_version: str = "1.0"
+    schema_version: str = "1.2"
     scan_id: str = ""
     is_demo: bool = False
     created_at: str = ""
@@ -155,6 +193,8 @@ class ScanResult:
     outputs: OutputsInfo = field(default_factory=OutputsInfo)
     costs_usd: CostsUSD = field(default_factory=CostsUSD)
     disclaimer: str = DEFAULT_DISCLAIMER
+    field_notes: List[FieldNote] = field(default_factory=list)
+    cable: CableInfo = field(default_factory=CableInfo)
 
     def __post_init__(self) -> None:
         self.validate()
@@ -191,7 +231,14 @@ class ScanResult:
     def to_dict(self) -> Dict[str, Any]:
         """Convert result object to dictionary matching shared result format schema."""
         self.validate()
-        return asdict(self)
+        result = asdict(self)
+        if self.schema_version == "1.0":
+            result.pop("field_notes", None)
+            result["measurement"].pop("instances", None)
+            result["outputs"].pop("vibration_map", None)
+        if self.schema_version in ("1.0", "1.1"):
+            result.pop("cable", None)
+        return result
 
     def to_json(self, indent: Optional[int] = 2) -> str:
         """Serialize result object to JSON string matching shared result format schema."""
@@ -301,6 +348,7 @@ class ScanResult:
                 peaks=peaks_list,
                 psd=psd_obj,
                 background_residual_px=float(meas_val.get("background_residual_px", 0.0)),
+                instances=[MeasurementInstance(**i) for i in meas_val.get("instances", [])],
             )
         elif isinstance(meas_val, MeasurementInfo):
             measurement = meas_val
@@ -357,6 +405,7 @@ class ScanResult:
                 magnified_video=out_val.get("magnified_video"),
                 spectrum_plot=out_val.get("spectrum_plot"),
                 displacement_plot=out_val.get("displacement_plot"),
+                vibration_map=out_val.get("vibration_map"),
             )
         elif isinstance(out_val, OutputsInfo):
             outputs = out_val
@@ -376,6 +425,22 @@ class ScanResult:
         else:
             costs_usd = CostsUSD()
 
+        cable_val = d.get("cable", {})
+        if isinstance(cable_val, dict):
+            cable = CableInfo(
+                is_cable=bool(cable_val.get("is_cable", False)),
+                tension_change_pct=(float(cable_val["tension_change_pct"])
+                                    if cable_val.get("tension_change_pct") is not None else None),
+                tension_change_range_pct=([float(x) for x in cable_val["tension_change_range_pct"]]
+                                          if cable_val.get("tension_change_range_pct") is not None else None),
+                compared_to_scan_id=cable_val.get("compared_to_scan_id"),
+                compared_to_date=cable_val.get("compared_to_date"),
+            )
+        elif isinstance(cable_val, CableInfo):
+            cable = cable_val
+        else:
+            cable = CableInfo()
+
         return cls(
             schema_version=str(d.get("schema_version", "1.0")),
             scan_id=str(d.get("scan_id", "")),
@@ -391,6 +456,12 @@ class ScanResult:
             outputs=outputs,
             costs_usd=costs_usd,
             disclaimer=str(d.get("disclaimer", DEFAULT_DISCLAIMER)),
+            field_notes=[FieldNote(
+                note_id=str(n.get("note_id", "")), created_at=str(n.get("created_at", "")),
+                language=str(n.get("language", "")), transcript=str(n.get("transcript", "")),
+                english=n.get("english"), tags=[FieldNoteTag(**t) for t in n.get("tags", [])]
+            ) for n in d.get("field_notes", [])],
+            cable=cable,
         )
 
     @classmethod

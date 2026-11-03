@@ -9,6 +9,7 @@
 import mockScansData from "./mock/scans.json";
 import {
   BridgeSummary,
+  BridgeReport,
   CreateScanPayload,
   FieldNote,
   ScanResult,
@@ -40,7 +41,7 @@ export const getScanFileUrl = getFileUrl;
  * Canonical sample scan conforming to Shared Result Format (schema 1.0)
  */
 export const SAMPLE_BENCHMARK_SCAN: ScanResult = {
-  schema_version: "1.1",
+  schema_version: "1.2",
   scan_id: "scan_20261103_a1b2c3",
   is_demo: false,
   created_at: "2026-11-03T19:30:00+05:30",
@@ -135,6 +136,7 @@ export const SAMPLE_BENCHMARK_SCAN: ScanResult = {
   },
   disclaimer: "SETU does not assess safety. Flagged readings are for engineer review.",
   field_notes: [],
+  cable: null,
 };
 
 function convertLegacyMockToScanResult(mock: Record<string, any>): ScanResult {
@@ -253,6 +255,7 @@ export async function createScan(payload: CreateScanPayload): Promise<ScanResult
   formData.append("lat", String(payload.lat));
   formData.append("lon", String(payload.lon));
   formData.append("target_prompt", payload.target_prompt || "concrete pillar");
+  formData.append("is_cable", String(Boolean(payload.is_cable)));
   formData.append("background_prompt", payload.background_prompt || "building");
   if (payload.bridge_name) {
     formData.append("bridge_name", payload.bridge_name);
@@ -323,6 +326,15 @@ export async function getScan(
   }
 }
 
+/** Fetch a bridge report from GET /api/bridges/{bridge_key}/report.json. */
+export async function getBridgeReport(bridgeKey: string): Promise<BridgeReport> {
+  const response = await fetch(`/api/bridges/${encodeURIComponent(bridgeKey)}/report.json`);
+  if (!response.ok) {
+    throw new Error(`Could not load bridge report (${response.status}).`);
+  }
+  return (await response.json()) as BridgeReport;
+}
+
 /**
  * Fetch bridges from GET /api/bridges.
  * If empty or the backend is down, falls back to mock data with is_sample_data: true.
@@ -334,7 +346,8 @@ export async function getBridges(): Promise<BridgeSummary[]> {
       const data = await response.json();
       if (Array.isArray(data) && data.length > 0) {
         return data.map((b: any, index: number) => ({
-          id: String(b.id ?? b.osm_id ?? `bridge-${index}`),
+          id: String(b.id ?? b.osm_id ?? b.bridge_key ?? `bridge-${index}`),
+          bridge_key: b.bridge_key == null ? undefined : String(b.bridge_key),
           bridge_name: b.name ?? b.bridge_name ?? `Bridge ${index + 1}`,
           city: b.city ?? (b.latitude && b.latitude > 16 ? "Mumbai Region" : "Chennai Region"),
           lat: Number(b.latitude ?? b.lat ?? 13.0827),
@@ -391,35 +404,6 @@ export function getMockBridges(): BridgeSummary[] {
 }
 
 /**
- * Creates a mock field note for offline fallback or testing
- */
-export function createMockFieldNote(language: string): FieldNote {
-  const isHindi = language === "hi";
-  const isTamil = language === "ta";
-  return {
-    note_id: `note_${Date.now()}`,
-    created_at: new Date().toISOString(),
-    language: language,
-    transcript: isHindi
-      ? "पुल के तीसरे खंभे पर बड़ी दरार दिख रही है और भारी ट्रक निकलने पर गड़गड़ाहट की तेज आवाज आ रही है।"
-      : isTamil
-      ? "மூன்றாவது தூணில் விரிசல் தெரிகிறது, கனரக லாரிகள் செல்லும்போது பலத்த சத்தம் கேட்கிறது."
-      : "Visible diagonal crack on pier #3 and noticeable rumbling noise under loaded truck transit.",
-    english: language === "en" ? null : "Visible diagonal crack on pier #3 and noticeable rumbling noise under loaded truck transit.",
-    tags: [
-      {
-        tag: "crack",
-        evidence: isHindi ? "तीसरे खंभे पर बड़ी दरार" : isTamil ? "மூன்றாவது தூணில் விரிசல்" : "Visible diagonal crack on pier #3",
-      },
-      {
-        tag: "noise_under_load",
-        evidence: isHindi ? "गड़गड़ाहट की तेज आवाज" : isTamil ? "பலத்த சத்தம் கேட்கிறது" : "noticeable rumbling noise under loaded truck transit",
-      },
-    ],
-  };
-}
-
-/**
  * Upload a voice field note to POST /api/scans/{id}/field-notes as multipart.
  * Sends the audio file and current language code.
  */
@@ -430,7 +414,6 @@ export async function uploadFieldNote(
 ): Promise<FieldNote> {
   const formData = new FormData();
   formData.append("audio", audioBlob, "field-note.webm");
-  formData.append("file", audioBlob, "field-note.webm");
   formData.append("language", language);
 
   let response: Response;
@@ -439,14 +422,12 @@ export async function uploadFieldNote(
       method: "POST",
       body: formData,
     });
-  } catch (err) {
-    console.warn("Backend POST /field-notes unreachable, creating mock note:", err);
-    return createMockFieldNote(language);
+  } catch {
+    throw new Error("Could not connect to field note service.");
   }
 
   if (!response.ok) {
-    console.warn(`Backend returned status ${response.status} for field note, falling back to mock note`);
-    return createMockFieldNote(language);
+    throw new Error(`Field note upload failed (${response.status}).`);
   }
 
   const result = await response.json();

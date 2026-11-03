@@ -23,6 +23,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 import pytest
+import numpy as np
 
 from setu.motion import track_motion
 from setu.spectrum import (
@@ -34,6 +35,24 @@ from setu.types import MotionResult, SegmentResult
 from tests.synth import generate_synthetic_video
 
 CACHE_DIR = Path("tests/.cache")
+
+
+def test_roi_affine_warp_matches_full_frame_crop():
+    """The ROI affine transform must match cropping a full-frame affine warp."""
+    import cv2
+
+    rng = np.random.default_rng(81)
+    frame = rng.integers(0, 256, (173, 219), dtype=np.uint8)
+    x, y, w, h = 37, 29, 61, 72
+    matrix = np.array([[0.9998, -0.017, 2.31], [0.017, 0.9998, -1.72]], dtype=np.float64)
+    shifted = matrix.copy()
+    shifted[:, 2] -= np.array([x, y])
+    grid_x, grid_y = np.meshgrid(np.arange(x, x + w), np.arange(y, y + h))
+    points = np.stack((grid_x, grid_y), axis=-1).reshape(1, -1, 2).astype(np.float64)
+    full_coordinates = cv2.transform(points, matrix)
+    roi_coordinates = cv2.transform(points, shifted)
+    roi_coordinates += np.array([[[x, y]]], dtype=np.float64)
+    np.testing.assert_allclose(roi_coordinates, full_coordinates, atol=1e-6, rtol=0)
 
 
 def _generate_cache_key(prefix: str, params: Dict[str, Any]) -> str:
@@ -209,8 +228,8 @@ def test_motion_recovery_matrix(benchmark_suite):
                 top_peak = peaks[0]
                 detected_freq = top_peak.freq_hz
                 freq_error = abs(detected_freq - target_freq)
-                passed = freq_error <= tolerance
                 verdict_str = top_peak.verdict  # "usable" or "weak"
+                passed = freq_error <= tolerance and verdict_str == "usable"
                 bg_ratio = getattr(top_peak, "bg_ratio", float("inf"))
                 bg_ratio_db = getattr(top_peak, "bg_ratio_db", float("inf"))
                 bg_ratio_str = (

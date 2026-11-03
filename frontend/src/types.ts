@@ -1,6 +1,6 @@
 /**
  * TypeScript Type Definitions for SETU Telemetry Platform
- * Matching Shared Result Format (schema_version 1.1)
+ * Matching Shared Result Format (schema_version 1.2)
  */
 
 export type ScanStatus = "queued" | "running" | "complete" | "error";
@@ -40,6 +40,14 @@ export interface MeasurementInstance {
   frequency_hz: number | null;
   amplitude_px: number | null;
   verdict: VerdictLevel;
+}
+
+export interface CableDetails {
+  is_cable: boolean;
+  tension_change_pct: number | null;
+  tension_change_range_pct: [number, number] | null;
+  compared_to_scan_id: string | null;
+  compared_to_date: string | null;
 }
 
 export interface Verdict {
@@ -159,6 +167,7 @@ export interface ScanResult {
   costs_usd: CostBreakdown;
   disclaimer: string;
   field_notes?: FieldNote[];
+  cable?: CableDetails | null;
   error?: string | null;
 }
 
@@ -172,6 +181,7 @@ export interface HistoryPoint {
 
 export interface BridgeSummary {
   id: string;
+  bridge_key?: string;
   bridge_name: string;
   city?: string;
   lat: number;
@@ -188,6 +198,43 @@ export interface BridgeSummary {
   is_demo?: boolean;
 }
 
+export interface BridgeReportFieldNoteTag {
+  tag: string;
+  evidence: string;
+}
+
+export interface BridgeReportScan {
+  scan_id?: string;
+  date?: string | null;
+  created_at?: string;
+  verdict: Verdict | VerdictLevel | string;
+  frequency_hz?: number | null;
+  frequency_range_hz?: [number, number] | null;
+  ci_low_hz?: number | null;
+  ci_high_hz?: number | null;
+  measurement?: Partial<MeasurementDetails>;
+  cable?: CableDetails | null;
+  cable_tension_change_pct?: number | null;
+  cable_tension_change_low_pct?: number | null;
+  cable_tension_change_high_pct?: number | null;
+  field_notes?: FieldNote[];
+  field_note_tags?: BridgeReportFieldNoteTag[];
+}
+
+export interface BridgeReport {
+  bridge_key?: string;
+  name?: string;
+  bridge_name?: string;
+  city?: string | null;
+  bridge_type?: string | null;
+  material?: string | null;
+  latitude?: number | null;
+  longitude?: number | null;
+  bridge?: { bridge_key?: string; name?: string; bridge_name?: string; city?: string | null; bridge_type?: string | null; material?: string | null; latitude?: number | null; longitude?: number | null; location?: { lat?: number; lon?: number } | null };
+  scans: BridgeReportScan[];
+  disclaimer?: string;
+}
+
 export interface CreateScanPayload {
   file?: File | null;
   preview_url?: string;
@@ -197,4 +244,5 @@ export interface CreateScanPayload {
   target_prompt?: string;
   background_prompt?: string;
   city?: string;
+  is_cable?: boolean;
 }

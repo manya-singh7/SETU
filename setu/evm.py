@@ -138,15 +138,6 @@ def magnify_phase_riesz(
         for t in range(num_frames)
     ]
 
-    # 2. Compute spatial Riesz transform components (Rx, Ry) for all bandpass levels
-    riesz_x = [[None] * levels for _ in range(num_frames)]
-    riesz_y = [[None] * levels for _ in range(num_frames)]
-    for t in range(num_frames):
-        for lvl in range(levels):
-            rx, ry = _compute_riesz_transform(frame_pyramids[t][lvl])
-            riesz_x[t][lvl] = rx
-            riesz_y[t][lvl] = ry
-
     magnified_pyramids: List[List[Any]] = [
         [None] * (levels + 1) for _ in range(num_frames)
     ]
@@ -157,84 +148,94 @@ def magnify_phase_riesz(
     # 3. Process each spatial bandpass level
     for lvl in range(levels):
         lvl_h, lvl_w = frame_pyramids[0][lvl].shape
-
-        phase_cos = np.zeros((num_frames, lvl_h, lvl_w), dtype=np.float32)
-        phase_sin = np.zeros((num_frames, lvl_h, lvl_w), dtype=np.float32)
-        amplitudes = np.zeros((num_frames, lvl_h, lvl_w), dtype=np.float32)
-
-        for t in range(1, num_frames):
-            curr_real = frame_pyramids[t][lvl]
-            curr_x = riesz_x[t][lvl]
-            curr_y = riesz_y[t][lvl]
-
-            prev_real = frame_pyramids[t - 1][lvl]
-            prev_x = riesz_x[t - 1][lvl]
-            prev_y = riesz_y[t - 1][lvl]
-
-            # Quaternion conjugate product
-            q_real = curr_real * prev_real + curr_x * prev_x + curr_y * prev_y
-            q_x = -curr_real * prev_x + prev_real * curr_x
-            q_y = -curr_real * prev_y + prev_real * curr_y
-
-            q_amp = np.sqrt(q_real**2 + q_x**2 + q_y**2)
-            safe_q_amp = np.maximum(q_amp, 1e-12, dtype=np.float32)
-
-            cos_arg = np.clip(q_real / safe_q_amp, -1.0, 1.0)
-            p_diff = np.arccos(cos_arg)
-
-            xy_mag = np.sqrt(q_x**2 + q_y**2)
-            safe_xy = np.maximum(xy_mag, 1e-12, dtype=np.float32)
-            cos_theta = q_x / safe_xy
-            sin_theta = q_y / safe_xy
-
-            phase_cos[t] = phase_cos[t - 1] + p_diff * cos_theta
-            phase_sin[t] = phase_sin[t - 1] + p_diff * sin_theta
-            amplitudes[t] = np.sqrt(q_amp)
-
-        amplitudes[0] = amplitudes[1]
-
-        # Temporal bandpass filter
-        filt_cos = _temporal_bandpass(phase_cos, fps, target_freq_hz, bandwidth_hz)
-        filt_sin = _temporal_bandpass(phase_sin, fps, target_freq_hz, bandwidth_hz)
-        del phase_cos, phase_sin
-
-        # Amplitude-weighted spatial Gaussian denoising + alpha magnification
-        ksize = 9
-        sigma = 2.0
-        smooth_cos = np.empty_like(filt_cos)
-        smooth_sin = np.empty_like(filt_sin)
+        # Temporal filtering is pixel-wise. Tile spatially so phase, amplitude,
+        # and Riesz buffers do not scale with the full 30-second image sequence.
         for t in range(num_frames):
-            amp = amplitudes[t]
-            den = cv2.GaussianBlur(amp, (ksize, ksize), sigma) + 1e-6
-            num_c = cv2.GaussianBlur(filt_cos[t] * amp, (ksize, ksize), sigma)
-            num_s = cv2.GaussianBlur(filt_sin[t] * amp, (ksize, ksize), sigma)
-            smooth_cos[t] = (num_c / den) * float(alpha)
-            smooth_sin[t] = (num_s / den) * float(alpha)
+            magnified_pyramids[t][lvl] = np.empty_like(frame_pyramids[t][lvl])
 
-        del filt_cos, filt_sin, amplitudes
+        tile_size = 64
+        for y0 in range(0, lvl_h, tile_size):
+            y1 = min(y0 + tile_size, lvl_h)
+            for x0 in range(0, lvl_w, tile_size):
+                x1 = min(x0 + tile_size, lvl_w)
+                # Include a four-pixel halo for the amplitude-weighted 9x9
+                # Gaussian, plus one more pixel for the 3x3 Riesz kernels.
+                py0, py1 = max(0, y0 - 4), min(lvl_h, y1 + 4)
+                px0, px1 = max(0, x0 - 4), min(lvl_w, x1 + 4)
+                hy0, hy1 = max(0, py0 - 1), min(lvl_h, py1 + 1)
+                hx0, hx1 = max(0, px0 - 1), min(lvl_w, px1 + 1)
+                ry0, ry1 = py0 - hy0, py1 - hy0
+                rx0, rx1 = px0 - hx0, px1 - hx0
 
-        # Reconstruct phase-shifted coefficient real part
+                real_tiles = [frame_pyramids[t][lvl][py0:py1, px0:px1] for t in range(num_frames)]
+                riesz_x, riesz_y = [], []
+                for t in range(num_frames):
+                    patch = frame_pyramids[t][lvl][hy0:hy1, hx0:hx1]
+                    rx, ry = _compute_riesz_transform(patch)
+                    riesz_x.append(rx[ry0:ry1, rx0:rx1])
+                    riesz_y.append(ry[ry0:ry1, rx0:rx1])
+
+                tile_h, tile_w = py1 - py0, px1 - px0
+                phase_cos = np.zeros((num_frames, tile_h, tile_w), dtype=np.float32)
+                phase_sin = np.zeros_like(phase_cos)
+                amplitudes = np.zeros_like(phase_cos)
+                for t in range(1, num_frames):
+                    curr_real, prev_real = real_tiles[t], real_tiles[t - 1]
+                    curr_x, prev_x = riesz_x[t], riesz_x[t - 1]
+                    curr_y, prev_y = riesz_y[t], riesz_y[t - 1]
+                    q_real = curr_real * prev_real + curr_x * prev_x + curr_y * prev_y
+                    q_x = -curr_real * prev_x + prev_real * curr_x
+                    q_y = -curr_real * prev_y + prev_real * curr_y
+                    q_amp = np.sqrt(q_real**2 + q_x**2 + q_y**2)
+                    safe_q_amp = np.maximum(q_amp, 1e-12, dtype=np.float32)
+                    p_diff = np.arccos(np.clip(q_real / safe_q_amp, -1.0, 1.0))
+                    xy_mag = np.sqrt(q_x**2 + q_y**2)
+                    safe_xy = np.maximum(xy_mag, 1e-12, dtype=np.float32)
+                    phase_cos[t] = phase_cos[t - 1] + p_diff * (q_x / safe_xy)
+                    phase_sin[t] = phase_sin[t - 1] + p_diff * (q_y / safe_xy)
+                    amplitudes[t] = np.sqrt(q_amp)
+                amplitudes[0] = amplitudes[1]
+
+                filt_cos = _temporal_bandpass(phase_cos, fps, target_freq_hz, bandwidth_hz)
+                filt_sin = _temporal_bandpass(phase_sin, fps, target_freq_hz, bandwidth_hz)
+                del phase_cos, phase_sin
+                smooth_cos = np.empty_like(filt_cos)
+                smooth_sin = np.empty_like(filt_sin)
+                for t in range(num_frames):
+                    amp = amplitudes[t]
+                    den = cv2.GaussianBlur(amp, (9, 9), 2.0) + 1e-6
+                    num_c = cv2.GaussianBlur(filt_cos[t] * amp, (9, 9), 2.0)
+                    num_s = cv2.GaussianBlur(filt_sin[t] * amp, (9, 9), 2.0)
+                    smooth_cos[t] = (num_c / den) * float(alpha)
+                    smooth_sin[t] = (num_s / den) * float(alpha)
+                del filt_cos, filt_sin, amplitudes
+
+                core_y0, core_y1 = y0 - py0, y1 - py0
+                core_x0, core_x1 = x0 - px0, x1 - px0
+                for t in range(num_frames):
+                    p_mag = np.sqrt(smooth_cos[t] ** 2 + smooth_sin[t] ** 2)
+                    exp_real = np.cos(p_mag)
+                    safe_pmag = np.maximum(p_mag, 1e-12, dtype=np.float32)
+                    exp_x = (smooth_cos[t] / safe_pmag) * np.sin(p_mag)
+                    exp_y = (smooth_sin[t] / safe_pmag) * np.sin(p_mag)
+                    mag_tile = (
+                        exp_real * real_tiles[t]
+                        - exp_x * riesz_x[t]
+                        - exp_y * riesz_y[t]
+                    )
+                    magnified_pyramids[t][lvl][y0:y1, x0:x1] = mag_tile[
+                        core_y0:core_y1, core_x0:core_x1
+                    ]
+                del smooth_cos, smooth_sin, riesz_x, riesz_y, real_tiles
+
         for t in range(num_frames):
-            p_mag = np.sqrt(smooth_cos[t] ** 2 + smooth_sin[t] ** 2)
-            exp_real = np.cos(p_mag)
-            safe_pmag = np.maximum(p_mag, 1e-12, dtype=np.float32)
-            exp_x = (smooth_cos[t] / safe_pmag) * np.sin(p_mag)
-            exp_y = (smooth_sin[t] / safe_pmag) * np.sin(p_mag)
-
-            mag_res = (
-                exp_real * frame_pyramids[t][lvl]
-                - exp_x * riesz_x[t][lvl]
-                - exp_y * riesz_y[t][lvl]
-            )
-            magnified_pyramids[t][lvl] = mag_res
-
-        del smooth_cos, smooth_sin
+            frame_pyramids[t][lvl] = None
 
     # 4. Collapse pyramids to synthesize magnified frames
-    magnified_sequence = np.array(
-        [_collapse_laplacian_pyramid(magnified_pyramids[t]) for t in range(num_frames)],
-        dtype=np.float32,
-    )
+    magnified_sequence = np.empty((num_frames, height, width), dtype=np.float32)
+    for t in range(num_frames):
+        magnified_sequence[t] = _collapse_laplacian_pyramid(magnified_pyramids[t])
+        magnified_pyramids[t] = []
     return magnified_sequence
 
 
@@ -467,58 +468,47 @@ class EulerianDisplayMagnifier:
         cx1 = cx0 + crop_w
         cy1 = cy0 + crop_h
 
-        # Decode frames once, capped at 720p
-        decoded_frames: List[np.ndarray] = []
-        raw_crops: List[np.ndarray] = []
-        n_frames = 0
+        # Retain only the grayscale sequence needed for temporal filtering. Full BGR
+        # frames are decoded again while writing the output.
+        max_dim = max(crop_w, crop_h)
+        downscaled = max_dim > self.config.max_crop_dimension > 0
+        if downscaled:
+            scale_fac = self.config.max_crop_dimension / max_dim
+            proc_w = max(modulo, int(round(crop_w * scale_fac)) // modulo * modulo)
+            proc_h = max(modulo, int(round(crop_h * scale_fac)) // modulo * modulo)
+        else:
+            proc_w, proc_h = crop_w, crop_h
 
+        proc_lum = np.empty((max_frames, proc_h, proc_w), dtype=np.float32)
+        n_frames = 0
         if frames is not None:
-            n_frames = min(len(frames), max_frames)
-            for t in range(n_frames):
-                f = frames[t]
-                if scale_720 != 1.0:
-                    f = cv2.resize(f, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
-                decoded_frames.append(f)
-                raw_crops.append(f[cy0:cy1, cx0:cx1])
+            frame_iter = iter(frames[:max_frames])
+            cap = None
         else:
             cap = cv2.VideoCapture(input_video_path)
-            while n_frames < max_frames:
+            frame_iter = None
+        while n_frames < max_frames:
+            if cap is not None:
                 ret, frame = cap.read()
                 if not ret or frame is None:
                     break
-                if scale_720 != 1.0:
-                    frame = cv2.resize(frame, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
-                decoded_frames.append(frame)
-                raw_crops.append(frame[cy0:cy1, cx0:cx1])
-                n_frames += 1
+            else:
+                try:
+                    frame = next(frame_iter)
+                except StopIteration:
+                    break
+            if scale_720 != 1.0:
+                frame = cv2.resize(frame, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+            gray = cv2.cvtColor(frame[cy0:cy1, cx0:cx1], cv2.COLOR_BGR2GRAY)
+            if downscaled:
+                gray = cv2.resize(gray, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
+            proc_lum[n_frames] = gray
+            n_frames += 1
+        if cap is not None:
             cap.release()
-
+        proc_lum = proc_lum[:n_frames]
         if n_frames == 0:
             raise ValueError(f"No frames could be decoded from {input_video_path}")
-
-        # Extract luminance directly into 1-channel arrays (no 3-channel float64 array!)
-        max_dim = max(crop_w, crop_h)
-        downscaled = False
-        if max_dim > self.config.max_crop_dimension and self.config.max_crop_dimension > 0:
-            scale_fac = self.config.max_crop_dimension / max_dim
-            proc_w = int(round(crop_w * scale_fac))
-            proc_h = int(round(crop_h * scale_fac))
-            proc_w -= proc_w % modulo
-            proc_h -= proc_h % modulo
-            downscaled = True
-        else:
-            proc_w = crop_w
-            proc_h = crop_h
-
-        proc_lum = np.empty((n_frames, proc_h, proc_w), dtype=np.float32)
-        lum_seq = np.empty((n_frames, crop_h, crop_w), dtype=np.float32)
-        for t in range(n_frames):
-            gray_crop = cv2.cvtColor(raw_crops[t], cv2.COLOR_BGR2GRAY).astype(np.float32)
-            lum_seq[t] = gray_crop
-            if downscaled:
-                proc_lum[t] = cv2.resize(gray_crop, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
-            else:
-                proc_lum[t] = gray_crop
 
         # Phase-based Riesz pyramid magnification
         mag_lum_proc = magnify_phase_riesz(
@@ -529,16 +519,6 @@ class EulerianDisplayMagnifier:
             bandwidth_hz=self.config.freq_bandwidth,
             levels=levels,
         )
-
-        if downscaled:
-            mag_lum = np.array(
-                [
-                    cv2.resize(mag_lum_proc[t], (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
-                    for t in range(n_frames)
-                ]
-            )
-        else:
-            mag_lum = mag_lum_proc
 
         # Blending matte
         if target_mask is not None:
@@ -559,36 +539,46 @@ class EulerianDisplayMagnifier:
             matte_blur = cv2.GaussianBlur(target_matte, (17, 17), 5.0)
             matte_weight = np.clip(matte_blur, 0.0, 1.0)
 
-        blended_lum = matte_weight * mag_lum + (1.0 - matte_weight) * lum_seq
-
-        # Synthesize magnified BGR crops in uint8
-        bgr_crops: List[np.ndarray] = []
-        for t in range(n_frames):
-            yuv = cv2.cvtColor(raw_crops[t], cv2.COLOR_BGR2YUV)
-            yuv[:, :, 0] = np.clip(blended_lum[t], 0, 255).astype(np.uint8)
-            bgr_crops.append(cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR))
-
-        del raw_crops, lum_seq, proc_lum, mag_lum, blended_lum
-
-        # Stream side-by-side composite directly into MP4 writer from pre-decoded frames
-        out_w = orig_w * 2
-        out_h = orig_h
+        # Stream input frames again to blend luminance and encode output.
+        out_w, out_h = orig_w * 2, orig_h
         font = cv2.FONT_HERSHEY_SIMPLEX
         label_text = f"{freq_center:.1f} Hz | {int(round(alpha))}x magnified"
 
         def composite_generator():
-            for t in range(n_frames):
-                orig_f = decoded_frames[t]
-                mag_f = orig_f.copy()
-                mag_f[cy0:cy1, cx0:cx1] = bgr_crops[t]
-                sbs = np.hstack([orig_f, mag_f])
-                sbs[:, orig_w - 1 : orig_w + 1] = (50, 50, 50)
-                cv2.rectangle(sbs, (16, 14), (160, 48), (15, 23, 42), -1)
-                cv2.putText(sbs, "Original", (24, 38), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-                cv2.rectangle(sbs, (orig_w + 16, 14), (orig_w + 350, 48), (15, 23, 42), -1)
-                cv2.putText(sbs, label_text, (orig_w + 24, 38), font, 0.7, (0, 230, 255), 2, cv2.LINE_AA)
-                yield sbs
+            source_cap = None if frames is not None else cv2.VideoCapture(input_video_path)
+            frame_iter = iter(frames[:n_frames]) if frames is not None else None
+            try:
+                for t in range(n_frames):
+                    if source_cap is not None:
+                        ok, orig_f = source_cap.read()
+                        if not ok or orig_f is None:
+                            break
+                    else:
+                        orig_f = next(frame_iter)
+                    if scale_720 != 1.0:
+                        orig_f = cv2.resize(orig_f, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+                    crop = orig_f[cy0:cy1, cx0:cx1]
+                    original_y = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
+                    mag_y = mag_lum_proc[t]
+                    if downscaled:
+                        mag_y = cv2.resize(mag_y, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
+                    blended = matte_weight * mag_y + (1.0 - matte_weight) * original_y
+                    yuv = cv2.cvtColor(crop, cv2.COLOR_BGR2YUV)
+                    yuv[:, :, 0] = np.clip(blended, 0, 255).astype(np.uint8)
+                    mag_f = orig_f.copy()
+                    mag_f[cy0:cy1, cx0:cx1] = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
+                    sbs = np.hstack([orig_f, mag_f])
+                    sbs[:, orig_w - 1 : orig_w + 1] = (50, 50, 50)
+                    cv2.rectangle(sbs, (16, 14), (160, 48), (15, 23, 42), -1)
+                    cv2.putText(sbs, "Original", (24, 38), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+                    cv2.rectangle(sbs, (orig_w + 16, 14), (orig_w + 350, 48), (15, 23, 42), -1)
+                    cv2.putText(sbs, label_text, (orig_w + 24, 38), font, 0.7, (0, 230, 255), 2, cv2.LINE_AA)
+                    yield sbs
+            finally:
+                if source_cap is not None:
+                    source_cap.release()
 
+        del proc_lum
         _write_mp4_video(output_video_path, composite_generator(), fps, width=out_w, height=out_h)
 
         elapsed = time.time() - start_time

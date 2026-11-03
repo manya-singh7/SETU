@@ -1,7 +1,10 @@
-import React, { useEffect, useState, useMemo, Suspense, lazy } from "react";
+import React, { useEffect, useState, useMemo, Suspense, lazy, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Activity,
+  Mic,
+  Square,
+  Share2,
   ArrowLeft,
   ChevronDown,
   Clock,
@@ -10,7 +13,9 @@ import {
   RotateCw,
   Sliders,
 } from "lucide-react";
-import { getScan, getFileUrl } from "../api";
+import { getScan, getFileUrl, uploadFieldNote } from "../api";
+import { FieldNote } from "../types";
+import i18n from "../i18n";
 import { ScanResult, VerdictLevel, TriageSeverity } from "../types";
 import { formatLocaleNumber, formatLocaleDate } from "../i18n";
 import RealWaveform from "../components/RealWaveform";
@@ -31,6 +36,14 @@ export default function ResultPage({ scanId, onNavigate, initialScan }: ResultPa
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"image" | "chart">("image");
   const [showEngineerDetails, setShowEngineerDetails] = useState<boolean>(false);
+  const [recording, setRecording] = useState(false);
+  const [seconds, setSeconds] = useState(0);
+  const [uploadingNote, setUploadingNote] = useState(false);
+  const [noteError, setNoteError] = useState<string | null>(null);
+  const [fieldNotes, setFieldNotes] = useState<FieldNote[]>(initialScan?.field_notes || []);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const timerRef = useRef<number | null>(null);
 
   const loadScan = () => {
     let isMounted = true;
@@ -41,6 +54,7 @@ export default function ResultPage({ scanId, onNavigate, initialScan }: ResultPa
       .then((data) => {
         if (isMounted) {
           setScan(data);
+          setFieldNotes(data.field_notes || []);
           setLoading(false);
         }
       })
@@ -59,6 +73,7 @@ export default function ResultPage({ scanId, onNavigate, initialScan }: ResultPa
   useEffect(() => {
     if (initialScan) {
       setScan(initialScan);
+      setFieldNotes(initialScan.field_notes || []);
       setLoading(false);
       setError(null);
       return;
@@ -66,6 +81,45 @@ export default function ResultPage({ scanId, onNavigate, initialScan }: ResultPa
 
     return loadScan();
   }, [scanId, initialScan]);
+
+  useEffect(() => {
+    if (!recording) return;
+    timerRef.current = window.setInterval(() => setSeconds((n) => {
+      if (n + 1 >= 120) { recorderRef.current?.stop(); return 120; }
+      return n + 1;
+    }), 1000);
+    return () => { if (timerRef.current != null) window.clearInterval(timerRef.current); };
+  }, [recording]);
+
+  const startRecording = async () => {
+    setNoteError(null);
+    try {
+      if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") throw new Error("unsupported");
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      recorderRef.current = recorder;
+      chunksRef.current = [];
+      recorder.ondataavailable = (event) => { if (event.data.size) chunksRef.current.push(event.data); };
+      recorder.onstop = async () => {
+        stream.getTracks().forEach((track) => track.stop());
+        setRecording(false);
+        if (!chunksRef.current.length) return;
+        setUploadingNote(true);
+        try {
+          const note = await uploadFieldNote(scanId, new Blob(chunksRef.current, { type: recorder.mimeType || "audio/webm" }), i18n.language);
+          setFieldNotes((notes) => [...notes, note]);
+        } catch { setNoteError(t("result.voice_upload_error", "Could not upload this voice note. Please try again.")); }
+        finally { setUploadingNote(false); }
+      };
+      recorder.start();
+      setSeconds(0);
+      setRecording(true);
+    } catch {
+      setNoteError(t("result.mic_denied", "Microphone access was denied or is unavailable. Allow microphone access and try again."));
+    }
+  };
+
+
 
   // Real measurement.psd only (no synthetic curves from peaks!)
   const realPsdData = useMemo(() => {
@@ -162,6 +216,17 @@ export default function ResultPage({ scanId, onNavigate, initialScan }: ResultPa
   const bridgeWarning = scan.interpretation?.bridge_warning;
   const bridgeData = scan.interpretation?.bridge;
   const isDemo = Boolean(scan.is_demo);
+
+  const cable = scan.cable;
+  const hasCableChange = cable?.tension_change_pct != null;
+
+  const shareText = makeWhatsAppText({
+    bridge: bridgeData?.name || t("result.bridge_area_unknown", "Bridge area"),
+    verdict: isUsable ? t("result.share_usable", "reading available") : t("result.share_unclear", "reading not clear enough"),
+    frequency: isUsable && domFreq != null && freqCi ? `${formatLocaleNumber(domFreq, { maximumFractionDigits: 2 })} Hz (${formatLocaleNumber(freqCi[0], { maximumFractionDigits: 2 })}\u2013${formatLocaleNumber(freqCi[1], { maximumFractionDigits: 2 })} Hz)` : null,
+    link: `${window.location.origin}${window.location.pathname}?scan=${encodeURIComponent(scan.scan_id)}`,
+    labels: { bridge: t("result.share_bridge", "Bridge"), reading: t("result.share_reading", "Reading"), frequency: t("result.share_frequency", "Frequency"), link: t("result.share_link", "Page") },
+  });
 
   // Driver register verdict badge:
   // Usable = green (#0B6E4F), Weak = yellow (#F2C230), Failed = grey (#737982, never red)
@@ -321,6 +386,26 @@ export default function ResultPage({ scanId, onNavigate, initialScan }: ResultPa
         )}
       </div>
 
+      {hasCableChange && (
+        <div className="rounded-[4px] border border-concrete-rule bg-white px-4 py-3 text-sm">
+          <span>{t("result.cable_comparison_brief", "Compared with an earlier scan of this cable")}</span>{" "}
+          <button type="button" onClick={() => { setShowEngineerDetails(true); window.setTimeout(() => document.getElementById("cable-engineer-details")?.scrollIntoView({ behavior: "smooth" }), 0); }} className="underline text-highway font-semibold">{t("result.cable_comparison_details", "View details")}</button>
+        </div>
+      )}
+      <div className="rounded-[4px] border border-concrete-rule bg-white p-5 space-y-3">
+        <h2 className="font-bold text-base">{t("result.voice_title", "Tell us what you see: cracks, sounds, sagging")}</h2>
+        <button type="button" onClick={recording ? () => recorderRef.current?.stop() : startRecording} disabled={uploadingNote} aria-label={recording ? t("result.stop_recording", "Stop recording") : t("result.voice_title", "Tell us what you see: cracks, sounds, sagging")} className="inline-flex items-center gap-2 rounded-full bg-highway px-6 py-4 text-white font-bold disabled:opacity-60">
+          {recording ? <Square className="h-5 w-5" /> : <Mic className="h-6 w-6" />}{recording ? t("result.stop_recording", "Stop recording") : t("result.record_voice", "Record a voice note")}
+        </button>
+        {recording && <span role="timer" className="ml-3 font-mono">{String(Math.floor(seconds / 60)).padStart(2,"0")}:{String(seconds % 60).padStart(2,"0")} / 02:00</span>}
+        {uploadingNote && <p role="status">{t("result.uploading_note", "Uploading and transcribing?")}</p>}
+        {noteError && <p role="alert" className="text-red-700">{noteError}</p>}
+        <p className="text-xs text-asphalt-muted">{t("result.voice_privacy", "Your voice is turned into text; the recording is deleted.")}</p>
+        {fieldNotes.map((note) => <article key={note.note_id} className="border-t pt-3 space-y-2"><p>{note.transcript}</p>{note.english && <div><strong>{t("result.for_engineers_title", "For engineers (technical details)")}</strong><p>{note.english}</p></div>}<div className="flex flex-wrap gap-2">{note.tags.map((tag, i) => <span key={`${tag.tag}-${i}`} className="rounded bg-concrete px-2 py-1 text-xs">{t(`result.tag_${tag.tag}`, tag.tag)}: {"\u201c"}{tag.evidence}{"\u201d"}</span>)}</div></article>)}
+      </div>
+      <a href={`https://wa.me/?text=${encodeURIComponent(shareText)}`} target="_blank" rel="noreferrer" className="inline-flex items-center gap-2 rounded bg-highway px-4 py-3 text-white font-semibold"><Share2 className="h-4 w-4" />{t("result.share_whatsapp", "Share on WhatsApp")}</a>
+      {scan.measurement?.instances?.length && scan.outputs?.vibration_map ? <div className="rounded-[4px] border border-concrete-rule bg-white p-5"><img src={getFileUrl(scan.scan_id, scan.outputs.vibration_map)} alt={t("result.vibration_map_alt", "Vibration map")} className="max-h-96 mx-auto"/><p className="text-xs text-center">{t("result.vibration_map_caption", "Each part is coloured by how it vibrates")}</p></div> : null}
+
       {/* DRIVER REGISTER: Video Inspection & Motion Wave */}
       <div className="rounded-[4px] border border-concrete-rule bg-white p-5 space-y-4">
         <div className="flex items-center justify-between border-b border-concrete-rule pb-2">
@@ -452,6 +537,16 @@ export default function ResultPage({ scanId, onNavigate, initialScan }: ResultPa
 
         {showEngineerDetails && (
           <div className="p-5 space-y-6 border-t border-concrete-rule font-sans text-xs">
+            {hasCableChange && <section id="cable-engineer-details" className="space-y-1 border-b border-concrete-rule pb-4">
+              <h3 className="font-bold text-sm">{t("result.cable_change_title", "Cable tension estimate")}</h3>
+              <p>{t("result.cable_change_estimate", "Estimated change in cable tension since {{date}}: {{change}}%", {
+                date: cable.compared_to_date ? formatLocaleDate(cable.compared_to_date, { dateStyle: "medium" }) : t("result.earlier_scan", "an earlier scan"),
+                change: formatLocaleNumber(cable.tension_change_pct),
+              })}{cable.tension_change_range_pct && <> ({t("result.cable_change_range", "range {{low}}% to {{high}}%", { low: formatLocaleNumber(cable.tension_change_range_pct[0]), high: formatLocaleNumber(cable.tension_change_range_pct[1]) })})</>}</p>
+              <p className="text-asphalt-muted">{t("result.cable_change_note", "Based on the change in vibration frequency; for engineer review, not a safety verdict.")}</p>
+            </section>}
+            {scan.measurement?.instances?.length ? <section><h3 className="font-bold text-sm">{t("result.instance_details", "For engineers: measured parts")}</h3><div className="overflow-x-auto"><table className="w-full text-left"><thead><tr><th>{t("result.instance", "Part")}</th><th>{t("result.frequency", "Frequency")}</th><th>{t("result.amplitude", "Amplitude")}</th><th>{t("result.verdict", "Verdict")}</th></tr></thead><tbody>{scan.measurement.instances.map((instance, idx) => <tr key={`${instance.label}-${idx}`}><td>{instance.label}</td><td>{instance.frequency_hz == null ? "?" : `${formatLocaleNumber(instance.frequency_hz)} Hz`}</td><td>{instance.amplitude_px == null ? "?" : `${formatLocaleNumber(instance.amplitude_px)} px`}</td><td>{instance.verdict}</td></tr>)}</tbody></table></div></section> : null}
+
             {/* Engineer Section 1: PSD Peak Modes & SNR Table */}
             <div className="space-y-3">
               <div className="flex justify-between items-center border-b border-concrete-rule pb-2">
@@ -655,4 +750,7 @@ export default function ResultPage({ scanId, onNavigate, initialScan }: ResultPa
       </div>
     </div>
   );
+}
+export function makeWhatsAppText(args: { bridge: string; verdict: string; frequency: string | null; link: string; labels: { bridge: string; reading: string; frequency: string; link: string } }): string {
+  return [`${args.labels.bridge}: ${args.bridge}`, `${args.labels.reading}: ${args.verdict}`, ...(args.frequency ? [`${args.labels.frequency}: ${args.frequency}`] : []), `${args.labels.link}: ${args.link}`].join("\n");
 }

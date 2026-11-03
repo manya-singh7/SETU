@@ -6,7 +6,7 @@ import KmStone from "../components/KmStone";
 import RealWaveform from "../components/RealWaveform";
 
 interface HomePageProps {
-  onNavigate: (page: "home" | "scan" | "result" | "map", scanId?: string) => void;
+  onNavigate: (page: "home" | "scan" | "result" | "map" | "proof", scanId?: string) => void;
 }
 
 export default function HomePage({ onNavigate }: HomePageProps) {
@@ -84,6 +84,14 @@ export default function HomePage({ onNavigate }: HomePageProps) {
               {t("home.cta_real_scan", "See a real scan")}
             </button>
           </div>
+
+            <button
+              type="button"
+              onClick={() => onNavigate("proof")}
+              className="inline-flex items-center justify-center px-6 py-3.5 bg-white hover:bg-concrete-light text-asphalt border border-concrete-rule font-medium text-sm rounded-[4px] transition focus-visible:outline-highway"
+            >
+              {t("home.proof_link", "See validation results")}
+            </button>
 
           {/* Real displacement waveform playback (only animated element) */}
           <div className="pt-4 max-w-lg">

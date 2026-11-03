@@ -834,6 +834,100 @@ def plot_comparison(
     return out_path
 
 
+def _camera_psd_from_source(camera_source: Union[float, int, str, Path, Dict[str, Any]]) -> Optional[Dict[str, npt.NDArray[np.float64]]]:
+    """Read real camera PSD arrays when the source JSON provides them."""
+    data: Any = None
+    if isinstance(camera_source, dict):
+        data = camera_source
+    elif isinstance(camera_source, (str, Path)):
+        try:
+            float(str(camera_source).strip())
+            return None
+        except ValueError:
+            path = Path(camera_source)
+            if not path.is_file():
+                return None
+            try:
+                with path.open("r", encoding="utf-8") as stream:
+                    data = json.load(stream)
+            except (OSError, json.JSONDecodeError):
+                return None
+    if not isinstance(data, dict):
+        return None
+
+    measurement = data.get("measurement") or {}
+    psd = measurement.get("psd") if isinstance(measurement, dict) else None
+    if not isinstance(psd, dict):
+        psd = data.get("camera_spectrum") or data.get("psd")
+    if not isinstance(psd, dict):
+        return None
+
+    frequencies = psd.get("freq_hz", psd.get("frequencies_hz"))
+    power = psd.get("power", psd.get("psd"))
+    if not isinstance(frequencies, (list, tuple)) or not isinstance(power, (list, tuple)):
+        return None
+    if len(frequencies) != len(power):
+        return None
+    try:
+        freq_arr = np.asarray(frequencies, dtype=np.float64).ravel()
+        power_arr = np.asarray(power, dtype=np.float64).ravel()
+    except (TypeError, ValueError):
+        return None
+    valid = np.isfinite(freq_arr) & np.isfinite(power_arr) & (freq_arr >= 0.0) & (freq_arr <= DEFAULT_MAX_FREQ_HZ)
+    if not np.any(valid):
+        return None
+    return {"frequencies_hz": freq_arr[valid], "psd": power_arr[valid]}
+
+
+def _normalized_spectrum_points(frequencies: Sequence[float], power: Sequence[float], max_points: int = 300) -> List[Dict[str, float]]:
+    """Return at most max_points finite normalized PSD points between 0 and 30 Hz."""
+    freq_arr = np.asarray(frequencies, dtype=np.float64).ravel()
+    power_arr = np.asarray(power, dtype=np.float64).ravel()
+    if len(freq_arr) != len(power_arr):
+        return []
+    valid = np.isfinite(freq_arr) & np.isfinite(power_arr) & (freq_arr >= 0.0) & (freq_arr <= DEFAULT_MAX_FREQ_HZ)
+    freq_arr, power_arr = freq_arr[valid], power_arr[valid]
+    if len(freq_arr) == 0:
+        return []
+    peak = float(np.max(power_arr))
+    if not np.isfinite(peak) or peak <= 0.0:
+        return []
+    power_arr = power_arr / peak
+    if len(freq_arr) > max_points:
+        indices = np.linspace(0, len(freq_arr) - 1, max_points, dtype=int)
+        peak_index = int(np.argmax(power_arr))
+        if peak_index not in indices:
+            indices[int(np.argmin(np.abs(indices - peak_index)))] = peak_index
+            indices.sort()
+        freq_arr, power_arr = freq_arr[indices], power_arr[indices]
+    order = np.argsort(freq_arr)
+    return [
+        {"frequency_hz": round(float(freq_arr[i]), 6), "normalized_power": round(float(power_arr[i]), 8)}
+        for i in order
+    ]
+
+
+def comparison_validation_dict(result: ComparisonResult) -> Dict[str, Any]:
+    """Build the public JSON payload consumed by the frontend Proof page."""
+    accel = result.accelerometer_spectrum
+    accel_points = _normalized_spectrum_points(accel.frequencies_hz, accel.psd) if accel else []
+    camera = result.camera_spectrum or {}
+    camera_points = _normalized_spectrum_points(camera.get("frequencies_hz", []), camera.get("psd", []))
+    return {
+        "camera_frequency_hz": round(result.camera_peak_hz, 6),
+        "camera_frequency_ci_hz": list(result.camera_ci) if result.camera_ci is not None else None,
+        "accelerometer_frequency_hz": round(result.accelerometer_peak_hz, 6),
+        "accelerometer_frequency_ci_hz": list(result.accel_ci) if result.accel_ci is not None else None,
+        "camera_spectrum": {"available": bool(camera_points), "points": camera_points},
+        "accelerometer_spectrum": {"available": bool(accel_points), "points": accel_points},
+        "difference_hz": round(result.absolute_diff_hz, 6),
+        "difference_pct": round(result.relative_diff_pct, 6),
+        "agreement": result.is_agreement,
+        "agreement_verdict": result.verdict,
+        "verdict": result.verdict,
+    }
+
+
 # ---------------------------------------------------------------------------
 # High-Level End-to-End Comparison API
 # ---------------------------------------------------------------------------
@@ -891,6 +985,7 @@ def compare_phyphox_to_camera(
         tolerance_abs_hz=tolerance_abs_hz,
     )
 
+    camera_psd = _camera_psd_from_source(camera_source)
     result = ComparisonResult(
         accelerometer_peak_hz=dom_spectrum.peak_frequency_hz,
         camera_peak_hz=cam_freq,
@@ -909,6 +1004,7 @@ def compare_phyphox_to_camera(
         accel_ci=accel_ci,
         uncertainty_note=uncertainty_note,
         accelerometer_spectrum=dom_spectrum,
+        camera_spectrum=camera_psd,
     )
 
     # 6. Generate plot if output path requested
@@ -918,7 +1014,7 @@ def compare_phyphox_to_camera(
             camera_freq_hz=cam_freq,
             comparison_res=result,
             output_png_path=output_png,
-            camera_spectrum=None,
+            camera_spectrum=camera_psd,
             max_display_freq_hz=max_freq_hz,
         )
         result.plot_path = str(plot_path)
@@ -962,6 +1058,13 @@ def main() -> int:
         help="Destination path for the comparison PNG spectrum plot.",
     )
     parser.add_argument(
+        "--json",
+        dest="json_out",
+        metavar="OUT.json",
+        type=str,
+        help="Optional destination path for machine-readable comparison JSON.",
+    )
+    parser.add_argument(
         "--tolerance-rel",
         type=float,
         default=DEFAULT_TOLERANCE_REL_PCT,
@@ -986,6 +1089,11 @@ def main() -> int:
             tolerance_rel_pct=args.tolerance_rel,
             tolerance_abs_hz=args.tolerance_abs,
         )
+        if args.json_out:
+            json_path = Path(args.json_out)
+            with json_path.open("w", encoding="utf-8") as stream:
+                json.dump(comparison_validation_dict(res), stream, ensure_ascii=False, indent=2, allow_nan=False)
+                stream.write("\n")
     except Exception as exc:
         print(f"Error during validation comparison: {exc}", file=sys.stderr)
         return 1

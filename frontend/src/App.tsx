@@ -5,6 +5,7 @@ import {
   MapPin,
   ShieldAlert,
   BarChart3,
+  BadgeCheck,
   Home as HomeIcon,
 } from "lucide-react";
 import HomePage from "./pages/HomePage";
@@ -12,15 +13,19 @@ import ScanPage from "./pages/ScanPage";
 import Logo from "./components/Logo";
 import LanguagePickerModal from "./components/LanguagePickerModal";
 import LanguageSwitcher from "./components/LanguageSwitcher";
+import ReportPage from "./pages/ReportPage";
+import ProofPage from "./pages/ProofPage";
 import { hasUserChosenLanguage, SUPPORTED_LANGUAGES } from "./i18n";
 
 // Code-split heavy map (Leaflet) and chart (Recharts) libraries so initial page load is fast
 const EngineerMapPage = lazy(() => import("./pages/EngineerMapPage"));
 const ResultPage = lazy(() => import("./pages/ResultPage"));
 
-export default function App() {
+type AppPage = "home" | "scan" | "result" | "map" | "proof";
+
+function AppShell({ initialPage = "home" }: { initialPage?: AppPage }) {
   const { t, i18n } = useTranslation();
-  const [currentPage, setCurrentPage] = useState<"home" | "scan" | "result" | "map">("home");
+  const [currentPage, setCurrentPage] = useState<AppPage>(initialPage);
   const [selectedScanId, setSelectedScanId] = useState<string>("scan_20261103_a1b2c3");
   const [backendHealth, setBackendHealth] = useState<string>("Connecting...");
   const [showLanguageModal, setShowLanguageModal] = useState<boolean>(false);
@@ -46,11 +51,13 @@ export default function App() {
       });
   }, [t]);
 
-  const handleNavigate = (page: "home" | "scan" | "result" | "map", scanId?: string) => {
+  const handleNavigate = (page: AppPage, scanId?: string) => {
     if (scanId) {
       setSelectedScanId(scanId);
     }
     setCurrentPage(page);
+    if (page === "proof") window.history.pushState({}, "", "/proof");
+    else if (window.location.pathname === "/proof") window.history.pushState({}, "", "/");
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
@@ -87,7 +94,7 @@ export default function App() {
       </div>
 
       {/* Top Header & Navigation Bar */}
-      <header className="border-b border-[#22262A]/20 bg-white px-4 sm:px-6 py-3 flex items-center justify-between sticky top-0 z-40">
+      <header className="app-navigation border-b border-[#22262A]/20 bg-white px-4 sm:px-6 py-3 flex items-center justify-between sticky top-0 z-40">
         {/* Logo: "SETU" with "सेतु" beneath it */}
         <Logo size="md" onClick={() => handleNavigate("home")} />
 
@@ -150,6 +157,14 @@ export default function App() {
               <span className="hidden sm:inline">{t("nav.map", "Engineer Map")}</span>
               <span className="sm:hidden">Map</span>
             </button>
+            <button
+              type="button"
+              onClick={() => handleNavigate("proof")}
+              className={`flex items-center space-x-1.5 px-3 py-2 rounded-[4px] transition ${currentPage === "proof" ? "bg-[#0B6E4F] text-white" : "text-[#22262A] hover:bg-[#E9E7E2]"}`}
+            >
+              <BadgeCheck className="h-3.5 w-3.5" />
+              <span>{t("nav.proof", "Proof")}</span>
+            </button>
           </nav>
 
           {/* Language Switcher Dropdown */}
@@ -187,6 +202,8 @@ export default function App() {
               onSelectScan={(id) => handleNavigate("result", id)}
             />
           )}
+
+          {currentPage === "proof" && <ProofPage />}
         </Suspense>
       </main>
 
@@ -201,4 +218,11 @@ export default function App() {
       </footer>
     </div>
   );
+}
+
+export default function App() {
+  const match = window.location.pathname.match(/^\/report\/([^/]+)\/?$/);
+  if (match) return <ReportPage bridgeKey={decodeURIComponent(match[1])} />;
+  if (window.location.pathname === "/proof") return <AppShell initialPage="proof" />;
+  return <AppShell />;
 }

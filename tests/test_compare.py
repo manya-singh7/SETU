@@ -32,6 +32,7 @@ from validation.compare import (
     AccelerometerSpectrum,
     ComparisonResult,
     compare_frequency,
+    comparison_validation_dict,
     compare_phyphox_to_camera,
     compute_axis_psd,
     estimate_accelerometer_uncertainty,
@@ -382,6 +383,48 @@ def test_cli_execution_mismatching(tmp_path: Path, capsys: pytest.CaptureFixture
     assert "FAIL (Exceeds tolerance margin)" in captured.out
     assert "25.00%" in captured.out
     assert out_png.exists()
+
+
+def test_cli_writes_proof_json_with_normalized_bounded_spectra(tmp_path: Path):
+    """Proof JSON contains real peaks, confidence intervals, and normalized spectra."""
+    out_png = tmp_path / "proof_plot.png"
+    out_json = tmp_path / "proof.json"
+    camera_freqs = np.linspace(0.0, 35.0, 701)
+    camera_power = np.exp(-((camera_freqs - 12.0) / 0.4) ** 2)
+    result_json = tmp_path / "camera_result.json"
+    result_json.write_text(json.dumps({
+        "frequency_hz": 12.0,
+        "frequency_ci": [11.9, 12.1],
+        "measurement": {"psd": {"freq_hz": camera_freqs.tolist(), "power": camera_power.tolist()}},
+    }), encoding="utf-8")
+
+    test_args = ["validation.compare", "--phyphox", str(FIXTURE_PATH), "--result", str(result_json), "--out", str(out_png), "--json", str(out_json)]
+    with patch.object(sys, "argv", test_args):
+        assert main() == 0
+
+    payload = json.loads(out_json.read_text(encoding="utf-8"))
+    assert payload["camera_frequency_hz"] == 12.0
+    assert payload["camera_frequency_ci_hz"] == [11.9, 12.1]
+    assert payload["accelerometer_frequency_ci_hz"] is not None
+    assert payload["difference_hz"] >= 0
+    assert payload["difference_pct"] >= 0
+    assert payload["agreement"] is True
+    assert payload["agreement_verdict"] == "PASS"
+    for key in ("camera_spectrum", "accelerometer_spectrum"):
+        spectrum = payload[key]
+        assert spectrum["available"] is True
+        assert 1 <= len(spectrum["points"]) <= 300
+        assert max(point["frequency_hz"] for point in spectrum["points"]) <= 30.0
+        assert max(point["normalized_power"] for point in spectrum["points"]) == pytest.approx(1.0)
+        assert all(0 <= point["normalized_power"] <= 1 for point in spectrum["points"])
+
+
+def test_validation_json_does_not_invent_camera_spectrum_for_frequency_only_input():
+    res = compare_phyphox_to_camera(phyphox_csv=FIXTURE_PATH, camera_source=12.0)
+    payload = comparison_validation_dict(res)
+    assert payload["camera_frequency_ci_hz"] is None
+    assert payload["camera_spectrum"] == {"available": False, "points": []}
+    assert payload["accelerometer_spectrum"]["available"] is True
 
 
 def test_cli_execution_with_result_json(tmp_path: Path, capsys: pytest.CaptureFixture):

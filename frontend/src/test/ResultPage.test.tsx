@@ -1,7 +1,7 @@
 import React from "react";
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
-import ResultPage from "../pages/ResultPage";
+import ResultPage, { makeWhatsAppText } from "../pages/ResultPage";
 import {
   mockUsableScan,
   mockWeakScan,
@@ -33,6 +33,43 @@ vi.mock("../api", async () => {
 
 describe("ResultPage Smoke Tests", () => {
   const mockNavigate = vi.fn();
+
+  it("renders field note transcript, English translation, and evidence tags", () => {
+    const scan = { ...mockUsableScan, field_notes: [{ note_id: "n1", created_at: "2026-01-01T00:00:00Z", language: "hi", transcript: "Visible crack on the bridge", english: "A crack is visible on the bridge", tags: [{ tag: "crack" as const, evidence: "Visible crack" }] }] };
+    const { container } = render(<ResultPage scanId="scan_usable_001" onNavigate={mockNavigate} initialScan={scan} />);
+    expect(screen.getByText("Tell us what you see: cracks, sounds, sagging")).toBeInTheDocument();
+    expect(screen.getByText("Visible crack on the bridge")).toBeInTheDocument();
+    expect(screen.getByText("A crack is visible on the bridge")).toBeInTheDocument();
+    expect(Array.from(container.querySelectorAll("article span")).some((el) => el.textContent?.includes("Visible crack"))).toBe(true);
+  });
+
+  it("shows a clear message when microphone permission is refused", async () => {
+    Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: { getUserMedia: vi.fn().mockRejectedValue(new Error("denied")) } });
+    render(<ResultPage scanId="scan_usable_001" onNavigate={mockNavigate} initialScan={mockUsableScan} />);
+    fireEvent.click(screen.getByRole("button", { name: /Tell us what you see/i }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Microphone access denied");
+  });
+
+  it("shows cable tension details only when cable change data exists", () => {
+    const withCable = { ...mockUsableScan, cable: { is_cable: true, tension_change_pct: 4.2, tension_change_range_pct: [3.1, 5.3] as [number, number], compared_to_scan_id: "old-1", compared_to_date: "2026-10-01T00:00:00Z" } };
+    const { rerender } = render(<ResultPage scanId="scan_usable_001" onNavigate={mockNavigate} initialScan={withCable} />);
+    expect(screen.getByText("Compared with an earlier scan of this cable")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("For engineers (technical details)"));
+    expect(screen.getByText(/Estimated change in cable tension since/)).toBeInTheDocument();
+    expect(screen.getByText(/Based on the change in vibration frequency/)).toBeInTheDocument();
+    rerender(<ResultPage scanId="scan_usable_001" onNavigate={mockNavigate} initialScan={mockUsableScan} />);
+    expect(screen.queryByText("Compared with an earlier scan of this cable")).not.toBeInTheDocument();
+  });
+
+  it("creates WhatsApp summaries with frequency only for usable readings", () => {
+    const labels = { bridge: "Bridge", reading: "Reading", frequency: "Frequency", link: "Page" };
+    const usable = makeWhatsAppText({ bridge: "River Bridge", verdict: "reading available", frequency: "3.7 Hz (3.6-3.8 Hz)", link: "https://setu.test/?scan=x", labels });
+    expect(usable).toContain("Frequency: 3.7 Hz (3.6-3.8 Hz)");
+    const weak = makeWhatsAppText({ bridge: "River Bridge", verdict: "reading not clear enough", frequency: null, link: "https://setu.test/?scan=x", labels });
+    expect(weak).toContain("reading not clear enough");
+    expect(weak).not.toContain("Frequency:");
+    expect(weak).not.toContain("Hz");
+  });
 
   it("renders usable scan with dominant frequency and usable verdict badge", async () => {
     render(

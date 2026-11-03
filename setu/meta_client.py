@@ -38,6 +38,7 @@ OUTPUT_COST_PER_1K_TOKENS = 0.0015
 
 # SAM 3.1 pricing: $2.50 per 1,000 images ($0.0025 per image)
 SAM_COST_PER_IMAGE = 0.0025
+MUSE_VOICE_COST_PER_HOUR = 0.18
 
 
 def get_running_total_cost(usage_path: str = "usage.jsonl") -> float:
@@ -309,6 +310,67 @@ class MetaClient:
             fixture_name=fixture_name,
             extra_inputs={"image_hash": image_hash, "prompt": prompt},
         )
+
+    def transcribe_audio(self, wav_path: str, language: str, duration_s: float) -> str:
+        """Transcribe a mono PCM WAV through Muse Voice Transcribe."""
+        model = "muse-voice-transcribe-1.0"
+        audio_hash = hashlib.sha256(Path(wav_path).read_bytes()).hexdigest()
+        cache_file = os.path.join(self.cache_dir, f"voice-{audio_hash}-{language}.json")
+        if self.mode == "mock":
+            return "The concrete has a crack and rust near the water."
+        if self.mode == "cached" and os.path.exists(cache_file):
+            with open(cache_file, "r", encoding="utf-8") as f:
+                return json.load(f)["transcript"]
+        cost = round(max(0.0, duration_s) / 3600 * MUSE_VOICE_COST_PER_HOUR, 6)
+        total = get_running_total_cost(self.usage_log_path)
+        if total + cost > self.budget_cap:
+            raise BudgetExceededError(f"SETU budget cap of ${self.budget_cap:.2f} reached; refusing live call.")
+        if not self.api_key:
+            raise MetaAPIError("META_API_KEY is not set. Cannot execute live call.")
+        language_names = {
+            "ar": "Arabic", "bn": "Bengali", "nl": "Dutch", "en": "English",
+            "fr": "French", "de": "German", "he": "Hebrew", "hi": "Hindi",
+            "id": "Indonesian", "it": "Italian", "ja": "Japanese", "kn": "Kannada",
+            "ko": "Korean", "ms": "Malay", "zh": "Mandarin Chinese", "mr": "Marathi",
+            "pl": "Polish", "pt": "Portuguese", "es": "Spanish", "tl": "Tagalog",
+            "ta": "Tamil", "te": "Telugu", "th": "Thai", "tr": "Turkish", "vi": "Vietnamese",
+        }
+        language_hint = language_names.get(language.lower(), language)
+        try:
+            with open(wav_path, "rb") as audio:
+                response = requests.post(
+                    f"{self.base_url.rstrip('/')}/asr/transcribe",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    files={
+                        "request": (None, json.dumps({"model": model, "audioEncoding": "WAV", "languageBias": [language_hint]}), "application/json"),
+                        "audio": ("audio.wav", audio, "audio/wav"),
+                    }, timeout=self.timeout,
+                )
+            if response.status_code != 200:
+                raise MetaAPIError(f"Meta Voice API responded with HTTP {response.status_code}: {response.text[:300]}")
+            data = response.json()
+        except requests.exceptions.RequestException as exc:
+            raise MetaAPIError(f"Meta Voice API network request failed: {exc}") from exc
+        transcript = str(data.get("transcript") or data.get("text") or "")
+        if not transcript:
+            raise MetaAPIError("Meta Voice API response did not contain a transcript.")
+        log_entry = {"timestamp": datetime.now(timezone.utc).isoformat(), "model": model,
+                     "audio_seconds": duration_s, "estimated_cost": cost}
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.usage_log_path)), exist_ok=True)
+            with open(self.usage_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_entry) + "\n")
+        except Exception as exc:
+            logger.warning("Could not write voice usage log: %s", exc)
+        print(
+            f"[Meta API Usage] Model: {model} | Audio: {duration_s:.2f}s | "
+            f"Call: ${cost:.6f} | Running Total: ${total + cost:.6f} / Cap: ${self.budget_cap:.2f}"
+        )
+        if self.mode == "cached":
+            os.makedirs(self.cache_dir, exist_ok=True)
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump({"transcript": transcript}, f)
+        return transcript
 
     def _record_live_sam_usage(self, model: str, images_count: int = 1) -> float:
         """Log live SAM API image usage to usage.jsonl and print running total."""

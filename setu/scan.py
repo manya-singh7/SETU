@@ -37,7 +37,7 @@ import numpy as np
 import scipy.signal as signal
 
 from setu.assess import AnomalyAssessmentResult, BaseAssessor
-from setu.evm import magnify_video
+from setu.evm import EVMDisplayConfig, magnify_video
 from setu.interpret import NO_BRIDGE_WARNING, interpret
 from setu.meta_client import MetaClient, get_meta_client
 from setu.motion import track_motion
@@ -454,7 +454,7 @@ def analyze_video(
 
     # Subpixel background residual is already computed during motion tracking (qual["background_residual_px"])
     # Omitting the redundant second full-video optical flow decode pass saves ~40s on 30s 1080p input.
-    bg_disp = None
+    bg_disp = getattr(motion_result, "background_displacement", None)
     t_motion = time.perf_counter() - t_stage3_start
 
     # -------------------------------------------------------------------------
@@ -704,6 +704,7 @@ def analyze_video(
                 target_frequency_hz=dom_freq,
                 target_bbox=target_box,
                 amplification_factor=50.0,
+                config=EVMDisplayConfig(max_crop_dimension=208),
             )
             magnified_file = "magnified.mp4"
         except Exception as evm_exc:

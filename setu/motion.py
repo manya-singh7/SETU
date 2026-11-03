@@ -241,6 +241,7 @@ def track_motion(
     bg_residuals: List[float] = [0.0]
     camera_shifts_x: List[float] = [0.0]
     camera_shifts_y: List[float] = [0.0]
+    background_displacement: List[float] = [0.0]
     M_prev = np.float32([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
 
     while True:
@@ -303,10 +304,14 @@ def track_motion(
             camera_shifts_y.append(float(M[1, 2]))
 
             # C. Warp current frame to frame 0 reference coordinate system
+            roi_M = M.copy()
+            # Output coordinates are ROI-local, while source coordinates remain
+            # full-frame coordinates: translate the destination by the ROI origin.
+            roi_M[:, 2] -= np.array([tx, ty], dtype=roi_M.dtype)
             warped_curr = cv2.warpAffine(
                 gray_curr,
-                M,
-                (width, height),
+                roi_M,
+                (tw, th),
                 flags=cv2.INTER_LANCZOS4,
                 borderMode=cv2.BORDER_REFLECT,
             )
@@ -319,18 +324,23 @@ def track_motion(
                 res_diff = warped_bg_pts - good_bg0.reshape(-1, 2)
                 res_rms = float(np.sqrt(np.mean(np.sum(res_diff**2, axis=1))))
                 bg_residuals.append(res_rms)
+                background_displacement.append(
+                    float(np.median(np.linalg.norm(res_diff, axis=1)))
+                )
             else:
                 bg_residuals.append(0.0)
+                background_displacement.append(0.0)
         else:
             # Skip camera stabilization: use unwarped frame and record zero camera shifts
-            warped_curr = gray_curr
+            warped_curr = gray_curr[ty : ty + th, tx : tx + tw]
             camera_shifts_x.append(0.0)
             camera_shifts_y.append(0.0)
             bg_residuals.append(0.0)
+            background_displacement.append(0.0)
 
         # E. Measure target motion using FIXED frame 0 mask
         if method == "phase_correlation":
-            target_roi_curr = warped_curr[ty : ty + th, tx : tx + tw].astype(np.float64)
+            target_roi_curr = warped_curr.astype(np.float64)
             (dx_step, dy_step), _ = cv2.phaseCorrelate(target_roi0, target_roi_curr, hanning_win)
             dx_raw_list.append(float(dx_step))
             dy_raw_list.append(float(dy_step))
@@ -338,7 +348,7 @@ def track_motion(
             # Lucas-Kanade on stabilized target features
             p_tgt_curr, st_tgt, _ = cv2.calcOpticalFlowPyrLK(
                 gray0,
-                warped_curr,
+                warped_curr if not has_background else gray_curr,
                 p_tgt0,
                 None,
                 winSize=(15, 15),
@@ -469,6 +479,7 @@ def track_motion(
         verdict=verdict,
         reasons=reasons,
     )
+    motion_result.background_displacement = np.asarray(background_displacement, dtype=np.float64)
 
     return motion_result
 

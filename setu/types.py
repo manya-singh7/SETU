@@ -104,3 +104,4 @@ class MotionResult:
     scale: Optional[float] = None
     verdict: Literal["usable", "weak", "failed"] = "usable"
     reasons: List[str] = field(default_factory=list)
+    background_displacement: Optional[npt.NDArray[np.float64]] = None

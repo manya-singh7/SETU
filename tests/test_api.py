@@ -2,6 +2,8 @@
 
 import io
 import os
+import wave
+import json
 import pytest
 from fastapi.testclient import TestClient
 
@@ -46,11 +48,12 @@ def test_scan_upload_demo_mode():
     result = response.json()
 
     # Verify shared result format
-    assert result["schema_version"] == "1.0"
+    assert result["schema_version"] == "1.2"
     assert result["scan_id"].startswith("scan_")
     assert result["status"] == "complete"
     assert result["is_demo"] is True
     assert result["verdict"]["level"] == "usable"
+    assert result["cable"]["is_cable"] is False
     assert result["location"]["lat"] == 13.0827
     assert result["location"]["lon"] == 80.2707
     assert result["measurement"]["dominant_frequency_hz"] == 3.70
@@ -61,6 +64,7 @@ def test_scan_upload_demo_mode():
     assert result["outputs"]["magnified_video"] is None
     assert result["outputs"]["spectrum_plot"] is None
     assert result["outputs"]["displacement_plot"] is None
+    assert result["outputs"]["vibration_map"] is None
 
 
 def test_demo_result_has_is_demo_true_and_null_outputs():
@@ -79,12 +83,53 @@ def test_demo_result_has_is_demo_true_and_null_outputs():
     assert outputs["magnified_video"] is None
     assert outputs["spectrum_plot"] is None
     assert outputs["displacement_plot"] is None
+    assert outputs["vibration_map"] is None
 
     # Assert no placeholder output files were created on disk
     scan_dir = storage.get_scan_dir(data["scan_id"])
     assert not (scan_dir / "magnified.mp4").exists()
     assert not (scan_dir / "spectrum.png").exists()
     assert not (scan_dir / "displacement.png").exists()
+
+
+def _wav_bytes(seconds=1):
+    stream = io.BytesIO()
+    with wave.open(stream, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(24000)
+        wav.writeframes(b"\x00\x00" * 24000 * seconds)
+    return stream.getvalue()
+
+
+def _demo_scan_id():
+    video = b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00isomiso2mp41demo_content"
+    response = client.post("/api/scans", files={"file": ("note_scan.mp4", io.BytesIO(video), "video/mp4")})
+    assert response.status_code == 200
+    return response.json()["scan_id"]
+
+
+def test_field_note_endpoint_transcribes_tags_and_deletes_audio():
+    scan_id = _demo_scan_id()
+    response = client.post(f"/api/scans/{scan_id}/field-notes", files={"audio": ("note.wav", _wav_bytes(), "audio/wav")}, data={"language": "en"})
+    assert response.status_code == 201, response.text
+    data = response.json()
+    assert data["transcript"] == "The concrete has a crack and rust near the water."
+    assert data["english"] is None
+    assert {tag["tag"] for tag in data["tags"]} == {"crack", "rust"}
+    assert all(tag["evidence"] in data["transcript"] for tag in data["tags"])
+    scan_dir = storage.get_scan_dir(scan_id)
+    assert not list(scan_dir.glob("field_note_*"))
+    saved = client.get(f"/api/scans/{scan_id}").json()
+    assert len(saved["field_notes"]) == 1
+
+
+def test_field_note_enforces_size_and_duration_limits():
+    scan_id = _demo_scan_id()
+    too_large = client.post(f"/api/scans/{scan_id}/field-notes", files={"audio": ("large.wav", io.BytesIO(b"x" * (10 * 1024 * 1024 + 1)), "audio/wav")}, data={"language": "en"})
+    assert too_large.status_code == 413
+    too_long = client.post(f"/api/scans/{scan_id}/field-notes", files={"audio": ("long.wav", _wav_bytes(121), "audio/wav")}, data={"language": "en"})
+    assert too_long.status_code == 413
 
 
 def test_get_scan_result():
@@ -267,7 +312,7 @@ def test_bridges_grouped_endpoint():
     assert len(bridges) >= 2
 
     # Verify bridge summary structure and that non-demo scans are present
-    pamban_found = False
+    pamban_scan_group = None
     for b in bridges:
         assert "bridge" in b
         assert "location" in b
@@ -278,9 +323,11 @@ def test_bridges_grouped_endpoint():
         assert len(b["frequency_history"]) >= 1
         assert "frequency_hz" in b["frequency_history"][0]
         if b["bridge"] == "Pamban Bridge":
-            pamban_found = True
-            assert "scan_prod_01" in b["scans"]
-    assert pamban_found
+            pamban_scan_group = b
+    if pamban_scan_group is None:
+        pamban_scan_group = next(b for b in bridges if "scan_prod_01" in b["scans"])
+    assert "scan_prod_01" in pamban_scan_group["scans"]
+    assert pamban_scan_group["bridge_key"] == "13.083,80.271"
 
 
 def test_triage_queue_endpoint():
@@ -288,6 +335,129 @@ def test_triage_queue_endpoint():
     response = client.get("/api/triage")
     assert response.status_code == 200
     assert isinstance(response.json(), list)
+
+
+def test_bridges_include_stable_key_and_reports_exclude_demo_rows():
+    from setu.api import _sync_scan_record_to_db
+
+    scan = {
+        "schema_version": "1.2", "is_demo": False,
+        "scan_id": "scan_report_api_prod", "created_at": "2026-11-03T20:00:00+05:30",
+        "status": "complete", "verdict": {"level": "usable", "reasons": []},
+        "location": {"lat": 27.12345, "lon": 78.54321},
+        "segmentation": {"target_prompt": "stay cable", "target_source": "sam", "background_source": "sam"},
+        "measurement": {"dominant_frequency_hz": 3.7, "frequency_ci_hz": [3.6, 3.8]},
+        "interpretation": {"bridge": {"name": "Report Cable Bridge", "osm_id": "way/765"}},
+        "cable": {"is_cable": True, "tension_change_pct": -9.75,
+                  "tension_change_range_pct": [-11.0, -8.5]},
+        "field_notes": [{"tags": [{"tag": "rust", "evidence": "rust by the joint"}]}],
+    }
+    demo = dict(scan, scan_id="scan_report_api_demo", is_demo=True)
+    for item in (scan, demo):
+        storage.save_scan_result(item["scan_id"], item)
+        _sync_scan_record_to_db(item["scan_id"], item)
+
+    bridges = client.get("/api/bridges").json()
+    group = next(item for item in bridges if item.get("bridge_key") == "way/765")
+    assert "bridge_key" in group
+
+    json_response = client.get("/api/bridges/way%2F765/report.json")
+    assert json_response.status_code == 200, json_response.text
+    report = json_response.json()
+    assert report["bridge"]["osm_id"] == "way/765"
+    assert [row["scan_id"] for row in report["scans"]] == ["scan_report_api_prod"]
+    assert report["scans"][0]["field_note_tags"][0]["evidence"] == "rust by the joint"
+
+    csv_response = client.get("/api/bridges/way%2F765/report.csv")
+    assert csv_response.status_code == 200
+    assert "scan_report_api_prod" in csv_response.text
+    assert "scan_report_api_demo" not in csv_response.text
+    assert "cable_tension_change_low_pct" in csv_response.text
+
+
+def test_upload_can_explicitly_mark_cable_scan():
+    video_bytes = b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00isomiso2mp41demo_content"
+    response = client.post(
+        "/api/scans",
+        files={"file": ("explicit_cable.mp4", io.BytesIO(video_bytes), "video/mp4")},
+        data={"target_prompt": "concrete structure", "is_cable": "true"},
+    )
+    assert response.status_code == 200
+    assert response.json()["schema_version"] == "1.2"
+    assert response.json()["cable"]["is_cable"] is True
+
+
+def test_showcase_loading_and_endpoint(tmp_path, monkeypatch):
+    from setu import api
+
+    showcase_dir = tmp_path / "showcase"
+    scan_dir = showcase_dir / "real-bridge"
+    scan_dir.mkdir(parents=True)
+    (scan_dir / "result.json").write_text(json.dumps({
+        "scan_id": "showcase_real_1", "schema_version": "1.2",
+        "is_demo": True, "verdict": {"level": "usable"},
+        "outputs": {"spectrum_plot": "spectrum.png"},
+    }), encoding="utf-8")
+    (scan_dir / "spectrum.png").write_bytes(b"png")
+    monkeypatch.setattr(api, "SHOWCASE_DIR", showcase_dir)
+    monkeypatch.setattr(api.app.state, "showcase_scans", None, raising=False)
+    loaded = api.load_showcase_scans()
+    assert loaded["showcase_real_1"]["is_showcase"] is True
+    assert loaded["showcase_real_1"]["is_demo"] is False
+    response = client.get("/api/showcase")
+    assert response.status_code == 200
+    assert response.json()[0]["scan_id"] == "showcase_real_1"
+    assert client.get("/api/scans/showcase_real_1").json()["is_showcase"] is True
+    image = client.get("/api/scans/showcase_real_1/files/spectrum.png")
+    assert image.status_code == 200 and image.content == b"png"
+
+
+def _public_video(monkeypatch, name="public.mp4"):
+    from setu import api
+    monkeypatch.setenv("SETU_PUBLIC_DEMO", "true")
+    monkeypatch.setenv("SETU_DEMO_MODE", "false")
+    monkeypatch.setattr(api, "_public_video_duration", lambda _path: 10.0)
+    monkeypatch.setattr(api, "_execute_analysis_task", lambda **_kwargs: None)
+    return {"file": (name, io.BytesIO(b"video"), "video/mp4")}
+
+
+def test_public_demo_rate_limit_and_real_pipeline(monkeypatch):
+    from setu import api
+    api._upload_times.clear()
+    responses = [client.post("/api/scans", files=_public_video(monkeypatch)) for _ in range(3)]
+    assert all(response.status_code == 200 for response in responses)
+    assert all(response.json()["is_demo"] is False for response in responses)
+    assert all(response.json()["status"] == "queued" for response in responses)
+    assert api.settings.SETU_META_MODE == "cached"
+    limited = client.post("/api/scans", files=_public_video(monkeypatch))
+    assert limited.status_code == 429
+
+
+def test_public_demo_rejects_over_60_seconds_and_deletes_video(monkeypatch):
+    from setu import api
+    monkeypatch.setenv("SETU_PUBLIC_DEMO", "true")
+    monkeypatch.setenv("SETU_DEMO_MODE", "false")
+    monkeypatch.setattr(api, "_public_video_duration", lambda _path: 60.01)
+    api._upload_times.clear()
+    response = client.post("/api/scans", files={"file": ("long.mp4", io.BytesIO(b"video"), "video/mp4")})
+    assert response.status_code == 413
+    assert "60 seconds" in response.json()["detail"]
+    assert not list(storage.SCANS_DIR.glob("scan_*/long.mp4"))
+
+
+def test_public_upload_cleanup_removes_only_old_original(tmp_path, monkeypatch):
+    from setu import api
+    import time
+    scan_dir = tmp_path / "scan"; scan_dir.mkdir()
+    (scan_dir / "result.json").write_text(json.dumps({"video": {"filename": "source.mp4"}}), encoding="utf-8")
+    upload = scan_dir / "source.mp4"; upload.write_bytes(b"video")
+    output = scan_dir / "magnified.mp4"; output.write_bytes(b"output")
+    old = time.time() - 90000
+    os.utime(upload, (old, old))
+    monkeypatch.setattr(api, "SCANS_DIR", tmp_path)
+    assert api.cleanup_expired_uploads() == 1
+    assert not upload.exists()
+    assert output.exists()
 
 
 def test_scan_pipeline_non_demo_mode(monkeypatch):
@@ -300,7 +470,7 @@ def test_scan_pipeline_non_demo_mode(monkeypatch):
     response = client.post("/api/scans", files=files, data=data)
     assert response.status_code == 200
     res = response.json()
-    assert res["schema_version"] == "1.0"
+    assert res["schema_version"] == "1.2"
     scan_id = res["scan_id"]
 
     # In TestClient, background tasks execute before returning
