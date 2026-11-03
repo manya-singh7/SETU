@@ -1,0 +1,12 @@
+{
+  "severity": "high",
+  "reasons": [
+    "Detected severe abnormal resonant shift to 9.87 Hz exceeding critical threshold of 14.50 Hz",
+    "Model confidence is 99.9% with 55 structural defects identified"
+  ],
+  "expected_range_hz": [12.0, 15.0],
+  "confidence": "high",
+  "data_quality_issues": [],
+  "recommended_action": "Immediate bridge closure recommended.",
+  "assessor": "muse_spark"
+}

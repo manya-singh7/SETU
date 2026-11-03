@@ -1,0 +1,40 @@
+{
+  "version": 0.6,
+  "generator": "Overpass API",
+  "elements": [
+    {
+      "type": "way",
+      "id": 24891152,
+      "tags": {
+        "bridge": "yes",
+        "bridge:structure": "arch",
+        "highway": "primary",
+        "layer": "1",
+        "material": "concrete",
+        "name": "Napier Bridge"
+      },
+      "geometry": [
+        {"lat": 13.067120, "lon": 80.284550},
+        {"lat": 13.067420, "lon": 80.284850},
+        {"lat": 13.067720, "lon": 80.285150},
+        {"lat": 13.068020, "lon": 80.285450}
+      ]
+    },
+    {
+      "type": "way",
+      "id": 99999999,
+      "tags": {
+        "bridge": "yes",
+        "bridge:structure": "beam",
+        "highway": "secondary",
+        "material": "steel",
+        "name": "Farther Bypass Span",
+        "length": "85.5 m"
+      },
+      "geometry": [
+        {"lat": 13.069500, "lon": 80.287000},
+        {"lat": 13.069900, "lon": 80.287500}
+      ]
+    }
+  ]
+}

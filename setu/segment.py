@@ -36,7 +36,13 @@ import numpy.typing as npt
 import requests
 
 from setu.config import settings
-from setu.meta_client import BudgetExceededError, MetaAPIError, MetaClient, get_meta_client
+from setu.meta_client import (
+    SAM_COST_PER_IMAGE,
+    BudgetExceededError,
+    MetaAPIError,
+    MetaClient,
+    get_meta_client,
+)
 from setu.types import SegmentResult
 
 logger = logging.getLogger(__name__)
@@ -235,6 +241,19 @@ def validate_segment_result(result: SegmentResult) -> Dict[str, Any]:
         if max_iou > 0.15:
             warnings.append(f"High overlap between target and stationary background (max IoU: {max_iou:.2f}).")
 
+    # Check target persistence failure
+    target_pers = getattr(result, "metadata", {}).get("target_persistence")
+    if target_pers is not None and not target_pers.get("passed", True):
+        failure_msg = getattr(
+            result,
+            "metadata",
+            {},
+        ).get(
+            "failure_reason",
+            f"Target persistence failure: fraction of valid frames ({target_pers.get('fraction_valid', 0.0):.1%}) below threshold.",
+        )
+        errors.append(failure_msg)
+
     return {
         "is_valid": len(errors) == 0,
         "errors": errors,
@@ -361,6 +380,149 @@ def track_roi_displacement(
     dx = int(best_x - x1)
     dy = int(best_y - y1)
     return dx, dy
+
+
+def compute_patch_ncc(patch_ref: np.ndarray, patch_curr: np.ndarray) -> float:
+    """Compute normalized cross-correlation between two grayscale image patches.
+
+    Returns a Pearson correlation coefficient in [-1.0, 1.0].
+    Guards against division by zero on uniform/solid-color patches.
+    """
+    if patch_ref.shape != patch_curr.shape or patch_ref.size == 0:
+        return 0.0
+
+    ref_f = patch_ref.astype(np.float32)
+    curr_f = patch_curr.astype(np.float32)
+
+    std_ref = float(np.std(ref_f))
+    std_curr = float(np.std(curr_f))
+
+    # Guard against division by zero on flat/uniform patches
+    if std_ref < 1e-3 or std_curr < 1e-3:
+        mean_diff = abs(float(np.mean(ref_f)) - float(np.mean(curr_f)))
+        if std_ref < 1e-3 and std_curr < 1e-3:
+            # Both flat: match if mean intensity matches within 10 levels
+            return 1.0 if mean_diff <= 10.0 else 0.0
+        # One is flat and other has texture (e.g. solid block occluding texture)
+        return 0.0
+
+    res = cv2.matchTemplate(curr_f, ref_f, cv2.TM_CCOEFF_NORMED)
+    val = float(res[0, 0])
+    return max(-1.0, min(1.0, val))
+
+
+def compute_persistence(
+    frames: Sequence[npt.NDArray[np.uint8]],
+    bbox: Optional[Tuple[int, int, int, int]],
+    fps: float = 30.0,
+    correlation_threshold: float = 0.70,
+    min_persistence_ratio: float = 0.85,
+    sample_stride: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Verify that a frame-0 mask/bounding box remains valid across a video sequence.
+
+    Computes normalized cross-correlation (NCC) of each frame's patch against Frame 0.
+
+    Threshold justification:
+      - Normal civil structural vibration involves subpixel to micro-pixel motion (< 1-2 px),
+        under which NCC for real textured structures remains high (>= 0.85 to 0.98).
+      - Target occlusion (e.g. a vehicle or block) or camera pan changes patch structure,
+        causing correlation to drop sharply (< 0.50).
+      - A correlation threshold of 0.70 reliably discriminates valid structural motion
+        from severe occlusions and camera drift.
+      - A min_persistence_ratio of 0.85 requires 85% of checked frames to stay above 0.70,
+        ensuring that videos with substantial occlusion (e.g. 30% of frames blocked) fail,
+        while allowing minor momentary micro-transients on static recordings.
+
+    Args:
+        frames: Sequence of video frame arrays.
+        bbox: Bounding box tuple (x, y, w, h) in pixel coordinates, or None.
+        fps: Sampling frame rate in Hz.
+        correlation_threshold: Minimum correlation score to consider a frame valid (default: 0.70).
+        min_persistence_ratio: Minimum fraction of checked frames that must meet threshold (default: 0.85).
+        sample_stride: Frame check interval for speed. Defaults to 1 for <= 60 frames, or max(1, len(frames) // 60).
+
+    Returns:
+        Dictionary reporting:
+            - fraction_valid: float (fraction of checked frames above correlation_threshold)
+            - lowest_correlation: float | None (minimum correlation observed)
+            - lowest_frame_idx: int | None (frame index where lowest correlation occurred)
+            - lowest_timestamp_sec: float | None (time in seconds where lowest correlation occurred)
+            - threshold: float (correlation threshold used)
+            - min_persistence_ratio: float (fraction threshold required)
+            - passed: bool (whether fraction_valid >= min_persistence_ratio)
+            - total_checked: int
+            - valid_frames: int
+    """
+    if bbox is None or len(frames) == 0:
+        return {
+            "fraction_valid": 0.0,
+            "lowest_correlation": None,
+            "lowest_frame_idx": None,
+            "lowest_timestamp_sec": None,
+            "threshold": correlation_threshold,
+            "min_persistence_ratio": min_persistence_ratio,
+            "passed": False,
+            "total_checked": 0,
+            "valid_frames": 0,
+            "reason": "No bounding box specified",
+        }
+
+    x, y, w, h = bbox
+    H, W = frames[0].shape[:2]
+    x1 = max(0, min(x, W - 1))
+    y1 = max(0, min(y, H - 1))
+    x2 = max(x1 + 1, min(x + w, W))
+    y2 = max(y1 + 1, min(y + h, H))
+
+    ref_gray = _to_gray(frames[0])[y1:y2, x1:x2]
+    if ref_gray.size == 0:
+        return {
+            "fraction_valid": 0.0,
+            "lowest_correlation": None,
+            "lowest_frame_idx": None,
+            "lowest_timestamp_sec": None,
+            "threshold": correlation_threshold,
+            "min_persistence_ratio": min_persistence_ratio,
+            "passed": False,
+            "total_checked": 0,
+            "valid_frames": 0,
+            "reason": "Empty patch bounding box",
+        }
+
+    n_frames = len(frames)
+    stride = sample_stride if sample_stride is not None else (1 if n_frames <= 60 else max(1, n_frames // 60))
+
+    valid_frames = 0
+    total_checked = 0
+    lowest_corr: Optional[float] = None
+    lowest_idx: Optional[int] = None
+
+    for i in range(0, n_frames, stride):
+        curr_gray = _to_gray(frames[i])[y1:y2, x1:x2]
+        score = compute_patch_ncc(ref_gray, curr_gray)
+        total_checked += 1
+        if score >= correlation_threshold:
+            valid_frames += 1
+        if lowest_corr is None or score < lowest_corr:
+            lowest_corr = score
+            lowest_idx = i
+
+    fraction_valid = valid_frames / max(1, total_checked)
+    passed = fraction_valid >= min_persistence_ratio
+    lowest_time = (lowest_idx / fps) if (lowest_idx is not None and fps > 0) else None
+
+    return {
+        "fraction_valid": round(fraction_valid, 4),
+        "lowest_correlation": round(lowest_corr, 4) if lowest_corr is not None else None,
+        "lowest_frame_idx": lowest_idx,
+        "lowest_timestamp_sec": round(lowest_time, 3) if lowest_time is not None else None,
+        "threshold": correlation_threshold,
+        "min_persistence_ratio": min_persistence_ratio,
+        "passed": passed,
+        "total_checked": total_checked,
+        "valid_frames": valid_frames,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -615,6 +777,7 @@ class BaseSegmenter(ABC):
         frame: npt.NDArray[np.uint8],
         target_prompt: str = "corner of concrete pillar",
         background_prompt: str = "stationary ground reference",
+        **kwargs: Any,
     ) -> SegmentationOutput:
         """Segment target and stationary reference from a single video frame.
 
@@ -622,6 +785,7 @@ class BaseSegmenter(ABC):
             frame: Video frame array (H, W, 3) or (H, W) in uint8 format.
             target_prompt: Open-vocabulary text description of structural target.
             background_prompt: Text description of static background reference anchor.
+            **kwargs: Additional implementation-specific options.
 
         Returns:
             SegmentationOutput containing binary masks, bounding boxes, and optional confidence.
@@ -636,12 +800,21 @@ class BaseSegmenter(ABC):
         fps: float = 30.0,
         qa_keyframes: bool = False,
         qa_keyframe_interval: int = 30,
+        correlation_threshold: float = 0.70,
+        min_persistence_ratio: float = 0.85,
+        sample_stride: Optional[int] = None,
+        fallback_background_prompts: Optional[Sequence[str]] = None,
+        **kwargs: Any,
     ) -> SegmentResult:
         """Segment target and background across an entire video sequence.
 
         Segments ONLY the first frame (frame 0) and returns the same fixed masks
         for every frame. Motion stabilization and displacement tracking happen
         downstream (in setu/motion.py), so masks must remain fixed per frame.
+
+        Evaluates track persistence over time using normalized cross-correlation
+        against Frame 0. If target persistence falls below threshold, flags
+        segmentation as failed with a diagnostic failure reason.
         """
         frames, detected_fps = load_video_frames(video_source, default_fps=fps)
         if not frames:
@@ -649,7 +822,13 @@ class BaseSegmenter(ABC):
 
         # Segment ONLY Frame 0
         first_frame = frames[0]
-        initial_out = self.segment(first_frame, target_prompt, background_prompt)
+        initial_out = self.segment(
+            first_frame,
+            target_prompt=target_prompt,
+            background_prompt=background_prompt,
+            fallback_background_prompts=fallback_background_prompts,
+            **kwargs,
+        )
 
         # Return the same fixed masks for every frame
         n_frames = len(frames)
@@ -663,6 +842,51 @@ class BaseSegmenter(ABC):
         else:
             background_masks = []
 
+        # Track persistence across video frames
+        target_pers = compute_persistence(
+            frames=frames,
+            bbox=initial_out.target_bbox,
+            fps=detected_fps,
+            correlation_threshold=correlation_threshold,
+            min_persistence_ratio=min_persistence_ratio,
+            sample_stride=sample_stride,
+        )
+
+        bg_pers = None
+        if initial_out.background_bbox is not None:
+            bg_pers = compute_persistence(
+                frames=frames,
+                bbox=initial_out.background_bbox,
+                fps=detected_fps,
+                correlation_threshold=correlation_threshold,
+                min_persistence_ratio=min_persistence_ratio,
+                sample_stride=sample_stride,
+            )
+
+        metadata = dict(initial_out.metadata)
+        metadata["target_persistence"] = target_pers
+        metadata["background_persistence"] = bg_pers
+
+        if not target_pers["passed"]:
+            failure_msg = (
+                f"Target persistence failure: fraction of valid frames ({target_pers['fraction_valid']:.1%}) "
+                f"below threshold {target_pers['min_persistence_ratio']:.1%} "
+                f"(lowest correlation {target_pers['lowest_correlation']} at frame {target_pers['lowest_frame_idx']}, "
+                f"t={target_pers['lowest_timestamp_sec']}s). Target likely occluded or camera panned away."
+            )
+            metadata["status"] = "failed"
+            metadata["failed"] = True
+            metadata["is_valid"] = False
+            metadata["failure_reason"] = failure_msg
+            logger.warning(failure_msg)
+
+            if getattr(self, "raise_on_failure", False):
+                raise RuntimeError(failure_msg)
+        else:
+            metadata["status"] = "completed"
+            metadata["failed"] = False
+            metadata["is_valid"] = True
+
         # Optional QA drift check on keyframes
         if qa_keyframes and n_frames > 1:
             ref_gray = _to_gray(first_frame)
@@ -673,12 +897,14 @@ class BaseSegmenter(ABC):
                 drift_reports.append({"frame": kf_idx, "target_drift_px": (tdx, tdy)})
             logger.info("QA keyframe drift check (%d keyframes): %s", len(drift_reports), drift_reports)
 
-        return SegmentResult(
+        result = SegmentResult(
             target_masks=target_masks,
             background_masks=background_masks,
             fps=detected_fps,
             method=initial_out.method,
+            metadata=metadata,
         )
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -700,6 +926,7 @@ class MetaSAM31Segmenter(BaseSegmenter):
         timeout: int = 25,
         raise_on_failure: bool = False,
         meta_client: Optional[MetaClient] = None,
+        fallback_background_prompts: Optional[Sequence[str]] = ("building", "ground", "trees"),
     ) -> None:
         self.api_key = api_key or settings.META_API_KEY
         self.model_name = model_name or getattr(settings, "SAM_MODEL", "sam-3.1")
@@ -707,12 +934,16 @@ class MetaSAM31Segmenter(BaseSegmenter):
         self.timeout = timeout
         self.raise_on_failure = raise_on_failure
         self.meta_client = meta_client
+        self.fallback_background_prompts = (
+            list(fallback_background_prompts) if fallback_background_prompts is not None else ["building", "ground", "trees"]
+        )
 
     def _call_api_endpoint(
         self,
         frame: npt.NDArray[np.uint8],
         target_prompt: str,
         background_prompt: str,
+        fallback_background_prompts: Optional[Sequence[str]] = None,
     ) -> Optional[SegmentationOutput]:
         """Call Meta SAM 3.1 Model API endpoint via MetaClient."""
         client = self.meta_client or get_meta_client()
@@ -745,13 +976,60 @@ class MetaSAM31Segmenter(BaseSegmenter):
             target_conf = target_inst.get("confidence")
             target_source: Literal["sam", "manual", "fallback", "none"] = "sam"
 
-            # Stationary background reference
+            # Stationary background reference with candidate prompt fallback
+            candidate_prompts = [b_prompt]
+            fb_candidates = (
+                fallback_background_prompts
+                if fallback_background_prompts is not None
+                else self.fallback_background_prompts
+            )
+            for fb in fb_candidates:
+                fb_clean = " ".join(fb.strip().split()[:32])
+                if (
+                    fb_clean.lower() != candidate_prompts[0].lower()
+                    and fb_clean not in candidate_prompts
+                ):
+                    candidate_prompts.append(fb_clean)
+                    if len(candidate_prompts) >= 3:  # Initial prompt + up to 2 fallbacks
+                        break
+
             bg_instances: List[Dict[str, Any]] = []
-            try:
-                bg_resp = client.segment_image(image_b64, prompt=b_prompt, model=self.model_name)
-                bg_instances = parse_sam_grammar(bg_resp, frame.shape[:2])
-            except Exception as bg_err:
-                logger.debug("Background SAM call failed (%s).", bg_err)
+            matched_bg_prompt: Optional[str] = None
+            background_prompts_attempted: List[Dict[str, Any]] = []
+
+            for p_idx, p_cand in enumerate(candidate_prompts):
+                try:
+                    bg_resp = client.segment_image(image_b64, prompt=p_cand, model=self.model_name)
+                    cand_instances = parse_sam_grammar(bg_resp, frame.shape[:2])
+                    matched = len(cand_instances) > 0
+                    background_prompts_attempted.append({
+                        "prompt": p_cand,
+                        "attempt": p_idx + 1,
+                        "matched": matched,
+                        "instance_count": len(cand_instances),
+                        "cost": SAM_COST_PER_IMAGE,
+                    })
+                    logger.info(
+                        "Background SAM call #%d for prompt '%s': matched=%s (%d instances), cost=$%.4f",
+                        p_idx + 1,
+                        p_cand,
+                        matched,
+                        len(cand_instances),
+                        SAM_COST_PER_IMAGE,
+                    )
+                    if matched:
+                        bg_instances = cand_instances
+                        matched_bg_prompt = p_cand
+                        break
+                except Exception as bg_err:
+                    logger.debug("Background SAM call for '%s' failed (%s).", p_cand, bg_err)
+                    background_prompts_attempted.append({
+                        "prompt": p_cand,
+                        "attempt": p_idx + 1,
+                        "matched": False,
+                        "error": str(bg_err),
+                        "cost": 0.0,
+                    })
 
             if bg_instances:
                 bg_inst = select_best_instance(bg_instances, frame.shape[:2])
@@ -777,13 +1055,14 @@ class MetaSAM31Segmenter(BaseSegmenter):
             else:
                 method = "fallback"
 
+            bg_prompt_used = matched_bg_prompt if matched_bg_prompt is not None else background_prompt
             return SegmentationOutput(
                 target_mask=target_mask,
                 background_mask=bg_mask,
                 target_bbox=target_box,
                 background_bbox=bg_box,
                 target_prompt=target_prompt,
-                background_prompt=background_prompt,
+                background_prompt=bg_prompt_used,
                 confidence=target_conf,
                 method=method,
                 target_source=target_source,
@@ -800,6 +1079,10 @@ class MetaSAM31Segmenter(BaseSegmenter):
                     "all_background_instances": bg_instances,
                     "target_instance_count": len(target_instances),
                     "background_instance_count": len(bg_instances),
+                    "background_prompts_attempted": background_prompts_attempted,
+                    "matched_background_prompt": matched_bg_prompt,
+                    "background_sam_calls": len(background_prompts_attempted),
+                    "background_sam_cost": sum(a.get("cost", 0.0) for a in background_prompts_attempted),
                     "parser": "meta_sam_parser" if HAS_META_SAM_PARSER else "builtin_grammar_decoder",
                 },
             )
@@ -885,11 +1168,17 @@ class MetaSAM31Segmenter(BaseSegmenter):
         frame: npt.NDArray[np.uint8],
         target_prompt: str = "corner of concrete pillar",
         background_prompt: str = "stationary ground reference",
+        fallback_background_prompts: Optional[Sequence[str]] = None,
     ) -> SegmentationOutput:
         """Segment target and background using Meta SAM 3.1 API or offline concept heuristic."""
         client = self.meta_client or get_meta_client()
         if client.mode == "mock" or client.api_key:
-            api_res = self._call_api_endpoint(frame, target_prompt, background_prompt)
+            api_res = self._call_api_endpoint(
+                frame,
+                target_prompt,
+                background_prompt,
+                fallback_background_prompts=fallback_background_prompts,
+            )
             if api_res is not None:
                 return api_res
 
@@ -924,6 +1213,7 @@ class ManualSegmenter(BaseSegmenter):
         frame: npt.NDArray[np.uint8],
         target_prompt: str = "manual target ROI",
         background_prompt: str = "manual background ROI",
+        **kwargs: Any,
     ) -> SegmentationOutput:
         """Generate masks directly from specified manual bounding boxes."""
         h, w = frame.shape[:2]
@@ -965,6 +1255,7 @@ class FallbackSegmenter(BaseSegmenter):
         frame: npt.NDArray[np.uint8],
         target_prompt: str = "corner of concrete pillar",
         background_prompt: str = "stationary ground reference",
+        **kwargs: Any,
     ) -> SegmentationOutput:
         """Generate deterministic target and background regions from frame dimensions."""
         h, w = frame.shape[:2]
@@ -1005,6 +1296,7 @@ def get_segmenter(
     model_name: Optional[str] = None,
     raise_on_failure: bool = False,
     meta_client: Optional[MetaClient] = None,
+    fallback_background_prompts: Optional[Sequence[str]] = None,
 ) -> BaseSegmenter:
     """Factory providing the configured segmenter implementation."""
     if method == "manual":
@@ -1018,6 +1310,7 @@ def get_segmenter(
         model_name=model_name,
         raise_on_failure=raise_on_failure,
         meta_client=meta_client,
+        fallback_background_prompts=fallback_background_prompts,
     )
 
 
@@ -1031,6 +1324,10 @@ def segment_video(
     background_bbox: Optional[Tuple[int, int, int, int]] = None,
     raise_on_failure: bool = False,
     meta_client: Optional[MetaClient] = None,
+    fallback_background_prompts: Optional[Sequence[str]] = None,
+    correlation_threshold: float = 0.70,
+    min_persistence_ratio: float = 0.85,
+    sample_stride: Optional[int] = None,
 ) -> SegmentResult:
     """Convenience function to segment video with fixed masks per frame."""
     segmenter = get_segmenter(
@@ -1039,12 +1336,17 @@ def segment_video(
         background_bbox=background_bbox,
         raise_on_failure=raise_on_failure,
         meta_client=meta_client,
+        fallback_background_prompts=fallback_background_prompts,
     )
     return segmenter.segment_video(
         video_source=video_source,
         target_prompt=target_prompt,
         background_prompt=background_prompt,
         fps=fps,
+        fallback_background_prompts=fallback_background_prompts,
+        correlation_threshold=correlation_threshold,
+        min_persistence_ratio=min_persistence_ratio,
+        sample_stride=sample_stride,
     )
 
 

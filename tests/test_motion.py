@@ -210,21 +210,19 @@ def test_motion_recovery_matrix(benchmark_suite):
                 detected_freq = top_peak.freq_hz
                 freq_error = abs(detected_freq - target_freq)
                 passed = freq_error <= tolerance
-                is_reliable = getattr(top_peak, "is_reliable", is_peak_reliable(top_peak))
+                verdict_str = top_peak.verdict  # "usable" or "weak"
                 bg_ratio = getattr(top_peak, "bg_ratio", float("inf"))
                 bg_ratio_db = getattr(top_peak, "bg_ratio_db", float("inf"))
-                verdict_str = "Reliable" if is_reliable else "Low Confidence"
                 bg_ratio_str = (
                     f"{bg_ratio:8.1f} ({bg_ratio_db:4.1f} dB)"
-                    if bg_ratio < 1e7
-                    else f">1e7 ({bg_ratio_db:4.1f} dB)"
+                    if bg_ratio is not None and bg_ratio < 1e7
+                    else f">1e7 ({bg_ratio_db:4.1f} dB)" if bg_ratio is not None else "N/A"
                 )
             else:
                 detected_freq = 0.0
                 freq_error = 999.0
                 passed = False
-                is_reliable = False
-                verdict_str = "Low Confidence"
+                verdict_str = "failed"
                 bg_ratio_str = "N/A"
 
             if passed:
@@ -279,17 +277,17 @@ def test_motion_recovery_matrix(benchmark_suite):
     print("=" * 165 + "\n")
 
     # Assertions:
-    # 1. The two 0.05 px failing cases must be flagged as "Low Confidence"
-    # 2. All 12 passing cases must be flagged as "Reliable" and strictly PASS without loosening tolerance
+    # 1. The two 0.05 px failing cases must be flagged as "weak"
+    # 2. All 12 passing cases must be flagged as "usable" and strictly PASS without loosening tolerance
     for r in table_rows:
         if "Hard: Low Amp" in r["Condition"]:
-            assert r["Verdict"] == "Low Confidence", (
-                f"Failing case {r['Method']} under {r['Condition']} must be flagged Low Confidence, got {r['Verdict']}"
+            assert r["Verdict"] == "weak", (
+                f"Failing case {r['Method']} under {r['Condition']} must be flagged 'weak', got {r['Verdict']}"
             )
             assert "FAIL" in r["Status"], "Tolerance must not be loosened on low amplitude 0.05 px stress case"
         else:
-            assert r["Verdict"] == "Reliable", (
-                f"Passing case {r['Method']} under {r['Condition']} must be Reliable, got {r['Verdict']}"
+            assert r["Verdict"] == "usable", (
+                f"Passing case {r['Method']} under {r['Condition']} must be 'usable', got {r['Verdict']}"
             )
             assert "PASS" in r["Status"], (
                 f"Standard/passing case {r['Method']} under {r['Condition']} failed: {r['Error']}"
@@ -301,8 +299,8 @@ def test_no_stationary_background_handling(benchmark_suite):
     - setu/motion.py runs without crashing.
     - Camera stabilisation is skipped with a clear warning.
     - Background-ratio check is skipped.
-    - Result is marked 'Unverified: no stationary background in frame'.
-    - Result is NEVER labelled 'Reliable'.
+    - Result is marked 'weak' with unverified reason.
+    - Result is NEVER labelled 'usable'.
     """
     import cv2
     import numpy as np
@@ -340,10 +338,11 @@ def test_no_stationary_background_handling(benchmark_suite):
     assert any("no stationary background" in w.lower() for w in warnings), (
         f"Expected clear warning about missing background in {warnings}"
     )
-    assert motion_res.quality.get("confidence") == "Unverified: no stationary background in frame"
-    assert motion_res.quality.get("verdict") == "Unverified: no stationary background in frame"
+    assert motion_res.quality.get("verdict") == "weak"
+    assert motion_res.verdict == "weak"
+    assert any("no stationary background" in r.lower() for r in motion_res.quality.get("reasons", []))
 
-    # 3. Verify spectral analysis skips background-ratio check and marks peaks unverified
+    # 3. Verify spectral analysis skips background-ratio check and marks peaks weak
     peaks = compute_welch_peaks(
         motion_res.displacement,
         fps=motion_res.fps,
@@ -352,7 +351,68 @@ def test_no_stationary_background_handling(benchmark_suite):
 
     assert len(peaks) >= 1
     for p in peaks:
-        assert p.is_reliable is False, "Must NEVER be labelled Reliable without a background"
+        assert p.is_reliable is False, "Must NEVER be labelled Reliable/usable without a background"
         assert is_peak_reliable(p) is False
-        assert p.verdict == "Unverified: no stationary background in frame"
+        assert p.verdict == "weak"
         assert p.bg_ratio is None, "Background ratio check must be skipped"
+
+
+def test_clipping_check_flags_weak_verdict(tmp_path):
+    """Verify that sensor saturation/clipping in target mask:
+    - Detects clipped frames when >15% of pixels are at 0 or 255.
+    - If >10% of frames have clipping, flags clipping_detected=True.
+    - Adds 'weak' verdict with reason explaining saturation reduces sub-pixel accuracy.
+    """
+    import cv2
+    import numpy as np
+
+    fps = 30.0
+    n_frames = 30
+    width, height = 320, 240
+    target_bbox = (100, 50, 60, 60)
+    bg_bbox = (20, 150, 60, 40)
+
+    temp_video = str(tmp_path / "clipping_test.mp4")
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(temp_video, fourcc, fps, (width, height))
+
+    tx, ty, tw, th = target_bbox
+    bx, by, bw, bh = bg_bbox
+
+    for _ in range(n_frames):
+        frame = np.ones((height, width, 3), dtype=np.uint8) * 128
+        # Add textured background
+        frame[by : by + bh, bx : bx + bw] = np.random.randint(50, 200, (bh, bw, 3), dtype=np.uint8)
+        # Saturate 50% of the target area to 255 (blown out / overexposed)
+        frame[ty : ty + th, tx : tx + tw] = 120
+        frame[ty : ty + th // 2, tx : tx + tw] = 255  # 50% of target saturated to 255
+        writer.write(frame)
+    writer.release()
+
+    res = track_motion(
+        video_path=temp_video,
+        target_bbox=target_bbox,
+        background_bbox=bg_bbox,
+        method="phase_correlation",
+    )
+
+    assert res.quality.get("clipping_detected") is True, "Expected clipping_detected=True"
+    assert res.quality.get("verdict") == "weak", f"Expected verdict 'weak', got {res.quality.get('verdict')}"
+    reasons = res.quality.get("reasons", [])
+    assert any("saturation" in r.lower() or "clipping" in r.lower() for r in reasons)
+    assert any("reduces sub-pixel accuracy" in r.lower() for r in reasons)
+
+
+def test_motion_result_units_and_scale(benchmark_suite):
+    """Verify that MotionResult contains explicit units='px' and scale=None."""
+    v_path, t_box, b_box = benchmark_suite["no_jitter_crf18"]
+    res = track_motion(v_path, target_bbox=t_box, background_bbox=b_box)
+
+    assert hasattr(res, "units")
+    assert res.units == "px"
+    assert hasattr(res, "scale")
+    assert res.scale is None
+    assert res.quality.get("units") == "px"
+    assert res.quality.get("scale") is None
+    assert res.verdict in ("usable", "weak", "failed")
+    assert isinstance(res.reasons, list)

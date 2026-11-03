@@ -12,7 +12,30 @@ Step 3 in SETU Pipeline:
 4. Secondary method: Subpixel Lucas-Kanade optical flow on good features inside
    the target mask.
 5. Computes quality diagnostics: background residual RMS, estimated displacement
-   SNR, and warnings for excessive camera tremor.
+   SNR, pixel saturation/clipping check, and warnings for excessive camera tremor.
+6. Three-level verdict: "usable", "weak", or "failed", with diagnostic reasons.
+
+Note on Physical Units:
+   Displacement is reported strictly in pixel units (units="px", scale=None).
+   Converting pixel displacement to physical millimetres (mm) requires a known
+   physical reference length in the camera plane at the bridge structure (e.g.
+   pillar diameter, bolt spacing, or surveyor scale bar) to calibrate pixels per
+   millimetre.
+
+Saturation / Clipping Threshold Justification:
+   Subpixel motion estimation via phase correlation and Lucas-Kanade differential optical
+   flow relies on continuous spatial intensity gradients (grad I * dx ~ dI). When sensor
+   saturation occurs (pixel values at 0 or 255), grad I -> 0, causing flat-top clipping
+   that suppresses high spatial frequency features and introduces nonlinear harmonic distortion.
+   - SATURATION_PIXEL_FRACTION = 0.15: If more than 15% of pixels in the target ROI are saturated
+     in a frame, the gradient field is critically impaired.
+   - CLIPPING_FRAME_FRACTION = 0.10: If more than 10% of frames in the recording suffer from target
+     clipping, subpixel tracking accuracy degrades throughout the displacement time series,
+     warranting a 'weak' verdict reason.
+
+Classification Safety Principle:
+   Weak input must NEVER be described as an anomaly. A "weak" verdict reflects sensor dynamic range,
+   measurement SNR, or environmental reference limitations requiring engineer triage.
 """
 
 from __future__ import annotations
@@ -23,6 +46,16 @@ import numpy as np
 import numpy.typing as npt
 
 from setu.types import MotionResult, SegmentResult
+
+SATURATION_PIXEL_FRACTION: float = 0.15
+"""Fraction of pixels inside the target mask that must be saturated (intensity <= 5 or >= 250)
+for a frame to be marked as clipped.
+"""
+
+CLIPPING_FRAME_FRACTION: float = 0.10
+"""Fraction of total video frames that must exhibit target pixel clipping to trigger a 'weak'
+verdict reason for sensor saturation.
+"""
 
 
 def _extract_bounding_box(mask: npt.NDArray[np.uint8]) -> Tuple[int, int, int, int]:
@@ -47,6 +80,10 @@ def track_motion(
     max_corners_target: int = 100,
 ) -> MotionResult:
     """Track subpixel target motion cancelled against background micro-jitter.
+
+    Physical Units Note:
+        Displacement is in pixels (units='px', scale=None). Converting to millimetres (mm)
+        requires a known physical reference length in the camera plane.
 
     Args:
         video_path: Path to input MP4 video file.
@@ -118,6 +155,14 @@ def track_motion(
             has_background = False
 
     tx, ty, tw, th = t_box
+
+    # Target mask clipping check setup on Frame 0
+    target_roi_mask = (target_mask0[ty : ty + th, tx : tx + tw] > 0)
+    roi0 = gray0[ty : ty + th, tx : tx + tw]
+    pix0 = roi0[target_roi_mask] if np.any(target_roi_mask) else roi0.ravel()
+    sat_count0 = int(np.sum((pix0 <= 5) | (pix0 >= 250)))
+    clipped_frames_count = 1 if (sat_count0 / max(len(pix0), 1) >= SATURATION_PIXEL_FRACTION) else 0
+    total_frames_count = 1
 
     # 2. Setup background feature tracking (or skip if no background available)
     if not has_background or bg_mask0 is None or not np.any(bg_mask0):
@@ -191,7 +236,15 @@ def track_motion(
         if not ret or frame_curr is None:
             break
 
+        total_frames_count += 1
         gray_curr = cv2.cvtColor(frame_curr, cv2.COLOR_BGR2GRAY)
+
+        # Target mask saturation/clipping check on current frame
+        roi_curr = gray_curr[ty : ty + th, tx : tx + tw]
+        pix_curr = roi_curr[target_roi_mask] if np.any(target_roi_mask) else roi_curr.ravel()
+        sat_count = int(np.sum((pix_curr <= 5) | (pix_curr >= 250)))
+        if (sat_count / max(len(pix_curr), 1)) >= SATURATION_PIXEL_FRACTION:
+            clipped_frames_count += 1
 
         if has_background and p_bg0 is not None:
             # A. Track background features from frame 0 to current frame
@@ -333,24 +386,65 @@ def track_motion(
             "High-amplitude ground or mount vibration detected."
         )
 
+    # Clipping detection evaluation
+    clipped_frame_ratio = float(clipped_frames_count / max(total_frames_count, 1))
+    clipping_detected = bool(clipped_frame_ratio >= CLIPPING_FRAME_FRACTION)
+    if clipping_detected:
+        warnings.append(
+            f"Target mask pixel saturation/clipping detected in {clipped_frame_ratio * 100:.1f}% of frames "
+            f"(threshold: {CLIPPING_FRAME_FRACTION * 100:.0f}%). Saturated pixel dynamic range (0 or 255) "
+            "reduces sub-pixel gradient accuracy."
+        )
+
+    # Three-level verdict determination
+    reasons: List[str] = []
+    if not has_background:
+        reasons.append("unverified: no stationary background in frame")
+    if clipping_detected:
+        reasons.append("target mask pixel saturation/clipping detected (saturation reduces sub-pixel accuracy)")
+    if cam_rms > 5.0 * max(disp_std, 0.05):
+        reasons.append(
+            f"camera micro-jitter motion ({cam_rms:.2f} px) significantly exceeds target motion ({disp_std:.3f} px)"
+        )
+    if bg_residual_px > 0.08:
+        reasons.append(f"elevated background stabilization residual ({bg_residual_px:.3f} px)")
+
+    if len(displacement) == 0 or not np.all(np.isfinite(displacement)):
+        verdict: Literal["usable", "weak", "failed"] = "failed"
+        reasons.insert(0, "non-finite or empty displacement tracking output")
+    elif len(reasons) > 0:
+        verdict = "weak"
+    else:
+        verdict = "usable"
+
     quality: Dict[str, Any] = {
+        "verdict": verdict,
+        "reasons": reasons,
+        "units": "px",
+        "scale": None,
         "has_background": has_background,
+        "clipping_detected": clipping_detected,
+        "clipped_frame_ratio": round(clipped_frame_ratio, 4),
         "background_residual_px": round(bg_residual_px, 4),
         "snr": round(snr_val, 2),
         "camera_motion_rms_px": round(cam_rms, 4),
         "dominant_axis": "x" if (axis == "x" or (axis == "auto" and var_x >= var_y)) else "y",
         "method": method,
         "warnings": warnings,
+        "confidence": verdict,
     }
-    if not has_background:
-        quality["confidence"] = "Unverified: no stationary background in frame"
-        quality["verdict"] = "Unverified: no stationary background in frame"
 
-    return MotionResult(
+    motion_result = MotionResult(
         displacement=displacement,
         fps=fps,
         quality=quality,
+        units="px",
+        scale=None,
+        verdict=verdict,
+        reasons=reasons,
     )
+
+    return motion_result
 
 
 class SubpixelMotionTracker:

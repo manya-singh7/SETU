@@ -179,6 +179,12 @@ def main() -> int:
         help="Text cue for stationary background anchor.",
     )
     parser.add_argument(
+        "--fallback-background-prompts",
+        type=str,
+        default="building,ground,trees",
+        help="Comma-separated fallback prompts for stationary background reference if primary prompt fails.",
+    )
+    parser.add_argument(
         "--method",
         type=str,
         choices=["sam", "manual", "fallback"],
@@ -208,34 +214,60 @@ def main() -> int:
 
     # Load image/video or fallback to synthetic frame
     media_path = args.image or args.video
+    is_video = bool(args.video and not args.image)
     if media_path and os.path.exists(media_path):
         print(f"Loading input media: {media_path}")
-        frames, fps = load_video_frames(media_path, max_frames=1)
-        frame0 = frames[0]
+        if is_video:
+            frames, fps = load_video_frames(media_path)
+            frame0 = frames[0]
+        else:
+            frames, fps = load_video_frames(media_path, max_frames=1)
+            frame0 = frames[0]
     else:
         if media_path:
             print(f"Warning: Media file '{media_path}' not found. Generating synthetic bridge test frame.")
         else:
             print("No video or image specified. Using synthetic civil infrastructure benchmark frame.")
         frame0 = generate_synthetic_bridge_frame()
+        frames = [frame0]
+        fps = 30.0
 
     # Parse manual bboxes if supplied
     t_box = parse_bbox(args.target_bbox)
     b_box = parse_bbox(args.background_bbox)
+
+    fallback_prompts = [p.strip() for p in args.fallback_background_prompts.split(",") if p.strip()]
 
     # Initialize segmenter
     segmenter = get_segmenter(
         method=args.method,
         target_bbox=t_box,
         background_bbox=b_box,
+        fallback_background_prompts=fallback_prompts,
     )
 
-    # Run single-frame segmentation on Frame 0
+    # Run segmentation
     output = segmenter.segment(
         frame=frame0,
         target_prompt=args.target_prompt,
         background_prompt=args.background_prompt,
+        fallback_background_prompts=fallback_prompts,
     )
+
+    # If multi-frame video, evaluate persistence across frames
+    if is_video and len(frames) > 1:
+        seg_res = segmenter.segment_video(
+            video_source=frames,
+            target_prompt=args.target_prompt,
+            background_prompt=args.background_prompt,
+            fps=fps,
+            fallback_background_prompts=fallback_prompts,
+        )
+        output.metadata["target_persistence"] = seg_res.metadata.get("target_persistence")
+        output.metadata["background_persistence"] = seg_res.metadata.get("background_persistence")
+        output.metadata["status"] = seg_res.metadata.get("status")
+        output.metadata["failed"] = seg_res.metadata.get("failed")
+        output.metadata["failure_reason"] = seg_res.metadata.get("failure_reason")
 
     # Print which method and provenance produced the result
     print(f"Produced using method: {output.method}")
@@ -248,6 +280,29 @@ def main() -> int:
         print(f"  Background BBox: {output.background_bbox} (Active pixels: {compute_mask_area(output.background_mask)})")
     else:
         print(f"  Background BBox: None (Active pixels: 0)")
+
+    if "background_prompts_attempted" in output.metadata:
+        attempts = output.metadata["background_prompts_attempted"]
+        print(f"  Background Prompts Attempted ({len(attempts)}):")
+        for att in attempts:
+            status_desc = "matched" if att.get("matched") else "no match"
+            print(f"    - Attempt #{att['attempt']}: '{att['prompt']}' -> {status_desc} (cost=${att.get('cost', 0.0):.4f})")
+    if output.metadata.get("matched_background_prompt"):
+        print(f"  Matched Background Prompt: '{output.metadata['matched_background_prompt']}'")
+    if "background_sam_cost" in output.metadata:
+        print(f"  Total Background SAM Cost: ${output.metadata['background_sam_cost']:.4f}")
+
+    if "target_persistence" in output.metadata and output.metadata["target_persistence"]:
+        tp = output.metadata["target_persistence"]
+        print(f"  Target Persistence: valid={tp['fraction_valid']:.1%}, lowest_corr={tp['lowest_correlation']:.4f} "
+              f"at frame {tp['lowest_frame_idx']} (t={tp['lowest_timestamp_sec']:.2f}s) | passed={tp['passed']}")
+    if "background_persistence" in output.metadata and output.metadata["background_persistence"]:
+        bp = output.metadata["background_persistence"]
+        print(f"  Background Persistence: valid={bp['fraction_valid']:.1%}, lowest_corr={bp['lowest_correlation']:.4f} "
+              f"at frame {bp['lowest_frame_idx']} (t={bp['lowest_timestamp_sec']:.2f}s) | passed={bp['passed']}")
+    if output.metadata.get("failed"):
+        print(f"  Segmentation FAILURE: {output.metadata.get('failure_reason')}")
+
     for w in output.warnings:
         print(f"  Warning: {w}")
     if "all_target_instances" in output.metadata and len(output.metadata["all_target_instances"]) > 1:
@@ -263,7 +318,7 @@ def main() -> int:
         target_bbox=output.target_bbox,
         background_bbox=output.background_bbox,
         target_prompt=args.target_prompt,
-        background_prompt=args.background_prompt,
+        background_prompt=output.background_prompt or args.background_prompt,
         method=output.method,
     )
 

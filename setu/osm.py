@@ -127,6 +127,24 @@ class OSMBridgeInfo:
             "tags": self.tags,
         }
 
+    def __getitem__(self, item: str) -> Any:
+        return getattr(self, item)
+
+    def get(self, item: str, default: Any = None) -> Any:
+        return getattr(self, item, default)
+
+    def keys(self) -> Any:
+        return self.to_dict().keys()
+
+    def __iter__(self) -> Any:
+        return iter(self.to_dict())
+
+    def items(self) -> Any:
+        return self.to_dict().items()
+
+    def values(self) -> Any:
+        return self.to_dict().values()
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "OSMBridgeInfo":
         """Reconstruct bridge info from dictionary."""
@@ -155,10 +173,16 @@ class OverpassBridgeClient:
         endpoint_url: Optional[str] = None,
         timeout: int = 20,
         cache_dir: str = "cache/osm",
+        mode: Optional[str] = None,
+        fixture_path: Optional[str] = None,
     ) -> None:
         self.endpoint_url = endpoint_url or settings.OVERPASS_API_URL
         self.timeout = timeout
         self.cache_dir = cache_dir
+        self.mode = mode.lower() if mode else None
+        self.fixture_path = fixture_path or os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "tests", "fixtures", "osm_napier_bridge.json"
+        )
 
     def _get_cache_path(self, latitude: float, longitude: float, precision: int = 3) -> str:
         """Compute disk cache file path keyed by rounded lat/lon."""
@@ -344,6 +368,17 @@ out body geom;"""
         Returns:
             OSMBridgeInfo for nearest bridge if found, otherwise None.
         """
+        # In mock mode, evaluate directly against local offline fixture
+        if self.mode == "mock":
+            if os.path.exists(self.fixture_path):
+                try:
+                    with open(self.fixture_path, "r", encoding="utf-8") as f:
+                        fixture_data = json.load(f)
+                    return self.parse_overpass_response(fixture_data, latitude, longitude, radius_meters)
+                except Exception as e:
+                    logger.warning(f"Error reading mock OSM fixture {self.fixture_path}: {e}")
+            return None
+
         cache_path = self._get_cache_path(latitude, longitude)
         cached_result = self._read_cache(cache_path)
         if cached_result is not None:
@@ -377,3 +412,15 @@ out body geom;"""
         except (json.JSONDecodeError, KeyError, ValueError) as exc:
             logger.warning(f"Failed to parse Overpass response: {exc}")
             return None
+
+
+def get_nearest_bridge(
+    latitude: float,
+    longitude: float,
+    radius_meters: float = 150.0,
+    client: Optional[OverpassBridgeClient] = None,
+) -> Optional[OSMBridgeInfo]:
+    """Convenience function querying nearest bridge within radius_meters."""
+    c = client or OverpassBridgeClient()
+    return c.find_nearest_bridge(latitude=latitude, longitude=longitude, radius_meters=radius_meters)
+

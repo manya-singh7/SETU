@@ -21,7 +21,11 @@ from setu.spectrum import (
     LOWER_BAND_EDGE_MARGIN_HZ,
     MIN_BG_RATIO,
     RELIABILITY_THRESHOLD_SNR_DB,
+    SpectrumOutput,
+    WelchSpectrumAnalyzer,
     compute_welch_peaks,
+    determine_spectrum_verdict,
+    estimate_frequency_uncertainty,
     is_peak_reliable,
 )
 from setu.types import Peak
@@ -289,7 +293,7 @@ def test_synthetic_video_generation_playable_and_frame_count():
 
 
 def test_no_background_marks_peaks_unverified_and_never_reliable():
-    """Verify that when has_background=False, peaks are marked unverified and never reliable,
+    """Verify that when has_background=False, peaks are marked weak (unverified) and never usable,
     and the background-ratio check is skipped.
     """
     fps = 60.0
@@ -304,12 +308,164 @@ def test_no_background_marks_peaks_unverified_and_never_reliable():
     assert len(peaks) >= 1
     top_peak = peaks[0]
 
-    # Must be marked unverified and never reliable
-    assert top_peak.is_reliable is False, "Result must never be labelled Reliable without a background"
+    # Must be marked weak / unverified and never usable
+    assert top_peak.is_reliable is False, "Result must never be labelled Reliable/usable without a background"
     assert is_peak_reliable(top_peak) is False
-    assert top_peak.verdict == "Unverified: no stationary background in frame"
-    assert any("no stationary background" in f.lower() for f in top_peak.flags)
+    assert top_peak.verdict == "weak", f"Expected verdict 'weak' without background, got {top_peak.verdict}"
+    assert any("no stationary background" in r.lower() for r in top_peak.reasons)
 
     # Background-ratio check must be skipped (bg_ratio is None)
     assert top_peak.bg_ratio is None, "Background ratio check should be skipped when has_background=False"
     assert top_peak.bg_ratio_db is None
+
+
+def test_input_guards_flat_non_finite_top_k():
+    """Verify input guards in compute_welch_peaks:
+    1. Returns no peaks for non-finite input (NaN or Inf).
+    2. Returns no peaks for top_k <= 0.
+    3. Returns no peaks for a flat signal after detrending (max abs <= 1e-10).
+    4. A still recording must never produce a peak.
+    """
+    fps = 60.0
+    n_samples = 600
+
+    # A. Non-finite inputs
+    nan_sig = np.zeros(n_samples, dtype=np.float64)
+    nan_sig[100] = np.nan
+    assert compute_welch_peaks(nan_sig, fps=fps) == []
+
+    inf_sig = np.zeros(n_samples, dtype=np.float64)
+    inf_sig[50] = np.inf
+    assert compute_welch_peaks(inf_sig, fps=fps) == []
+
+    # B. top_k <= 0
+    t = np.arange(n_samples) / fps
+    valid_sine = 0.2 * np.sin(2.0 * np.pi * 3.7 * t)
+    assert compute_welch_peaks(valid_sine, fps=fps, top_k=0) == []
+    assert compute_welch_peaks(valid_sine, fps=fps, top_k=-2) == []
+
+    # C. Flat signal / still recording (max abs <= 1e-10 after detrending)
+    flat_zero = np.zeros(n_samples, dtype=np.float64)
+    assert compute_welch_peaks(flat_zero, fps=fps) == [], "Still recording (zeros) must never produce a peak"
+
+    flat_const = np.ones(n_samples, dtype=np.float64) * 42.123
+    assert compute_welch_peaks(flat_const, fps=fps) == [], "Still recording (constant offset) must never produce a peak"
+
+    flat_linear_drift = 0.05 * t  # Linear detrending reduces this to ~0 <= 1e-10
+    assert compute_welch_peaks(flat_linear_drift, fps=fps) == [], "Pure linear drift with no vibration must produce no peaks"
+
+    # D. determine_spectrum_verdict returns 'failed' for flat or non-finite inputs
+    v_flat, r_flat = determine_spectrum_verdict([], is_flat=True)
+    assert v_flat == "failed"
+    assert any("flat signal" in r for r in r_flat)
+
+    v_nan, r_nan = determine_spectrum_verdict([], is_non_finite=True)
+    assert v_nan == "failed"
+    assert any("non-finite" in r for r in r_nan)
+
+
+def test_frequency_uncertainty_overlapping_segments():
+    """Verify frequency uncertainty estimation via overlapping segments:
+    On synthetic 3.7 Hz vibration, the confidence interval contains 3.7 and is narrower than 0.1 Hz.
+    """
+    fps = 60.0
+    duration_sec = 10.0
+    freq_nominal = 3.70
+    n_samples = int(fps * duration_sec)
+    t = np.arange(n_samples, dtype=np.float64) / fps
+
+    sig = 0.2 * np.sin(2.0 * np.pi * freq_nominal * t)
+
+    # 1. Direct uncertainty estimation call
+    uncert = estimate_frequency_uncertainty(
+        displacement=sig,
+        fps=fps,
+        center_freq_hz=freq_nominal,
+        n_segments=5,
+        overlap=0.5,
+        confidence_level=0.95,
+    )
+
+    assert uncert["n_segments"] == 5
+    assert uncert["ci_lower"] <= freq_nominal <= uncert["ci_upper"], (
+        f"Confidence interval [{uncert['ci_lower']}, {uncert['ci_upper']}] does not contain target {freq_nominal}"
+    )
+    assert uncert["ci_width"] < 0.10, (
+        f"Confidence interval width {uncert['ci_width']:.4f} Hz is not narrower than 0.1 Hz"
+    )
+    assert abs(uncert["mean_hz"] - freq_nominal) <= 0.01
+
+    # 2. Uncertainty attributes attached to Peak objects
+    peaks = compute_welch_peaks(sig, fps=fps, min_freq_hz=0.5, top_k=1)
+    assert len(peaks) >= 1
+    top_peak = peaks[0]
+
+    assert hasattr(top_peak, "freq_mean")
+    assert hasattr(top_peak, "freq_uncertainty")
+    assert hasattr(top_peak, "freq_ci")
+    assert top_peak.freq_ci_lower <= freq_nominal <= top_peak.freq_ci_upper
+    assert top_peak.freq_ci_width < 0.10
+
+
+def test_three_level_verdict_usable_weak_failed():
+    """Verify three-level verdict system ('usable', 'weak', 'failed') and reason tracking.
+    Weak input must never be described as an anomaly.
+    """
+    fps = 60.0
+    t = np.arange(600) / fps
+
+    # Case A: Usable (clean 3.7 Hz sine)
+    sig_usable = 0.2 * np.sin(2.0 * np.pi * 3.7 * t)
+    peaks_usable = compute_welch_peaks(sig_usable, fps=fps, min_freq_hz=0.5, top_k=1)
+    assert len(peaks_usable) >= 1
+    assert peaks_usable[0].verdict == "usable"
+    assert peaks_usable[0].is_reliable is True
+    assert peaks_usable[0].reasons == []
+
+    # Case B: Weak due to drift (0.65 Hz near 0.5 Hz lower band edge)
+    sig_drift = 0.2 * np.sin(2.0 * np.pi * 0.65 * t)
+    peaks_drift = compute_welch_peaks(sig_drift, fps=fps, min_freq_hz=0.5, top_k=1)
+    assert len(peaks_drift) >= 1
+    assert peaks_drift[0].verdict == "weak"
+    assert peaks_drift[0].is_reliable is False
+    assert any("drift" in r.lower() for r in peaks_drift[0].reasons)
+    # Weak input must never be described as an anomaly
+    for r in peaks_drift[0].reasons:
+        assert "anomaly" not in r.lower()
+
+    # Case C: Weak due to missing background
+    peaks_no_bg = compute_welch_peaks(sig_usable, fps=fps, min_freq_hz=0.5, top_k=1, has_background=False)
+    assert len(peaks_no_bg) >= 1
+    assert peaks_no_bg[0].verdict == "weak"
+    assert any("no stationary background" in r.lower() for r in peaks_no_bg[0].reasons)
+
+    # Case D: Failed on flat signal or non-finite
+    analyzer = WelchSpectrumAnalyzer(fps=fps)
+    out_flat = analyzer.compute_welch_psd(np.zeros(600))
+    assert out_flat.verdict == "failed"
+    assert out_flat.is_reliable is False
+    assert any("flat" in r.lower() for r in out_flat.reasons)
+
+    nan_arr = np.zeros(600)
+    nan_arr[5] = np.nan
+    out_nan = analyzer.compute_welch_psd(nan_arr)
+    assert out_nan.verdict == "failed"
+    assert out_nan.is_reliable is False
+    assert any("non-finite" in r.lower() for r in out_nan.reasons)
+
+
+def test_spectrum_units_and_scale():
+    """Verify displacement and spectral peaks maintain explicit units='px' and scale=None."""
+    fps = 60.0
+    t = np.arange(600) / fps
+    sig = 0.2 * np.sin(2.0 * np.pi * 3.7 * t)
+
+    peaks = compute_welch_peaks(sig, fps=fps, min_freq_hz=0.5, top_k=1)
+    assert len(peaks) >= 1
+    assert peaks[0].units == "px"
+    assert peaks[0].scale is None
+
+    analyzer = WelchSpectrumAnalyzer(fps=fps)
+    out = analyzer.compute_welch_psd(sig)
+    assert out.units == "px"
+    assert out.scale is None

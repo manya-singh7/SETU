@@ -40,6 +40,8 @@ from setu.segment import (
     compute_mask_area,
     compute_mask_centroid,
     compute_mask_iou,
+    compute_patch_ncc,
+    compute_persistence,
     extract_bboxes_from_result,
     get_segmenter,
     load_video_frames,
@@ -115,6 +117,8 @@ def test_segment_result_contract():
         assert res.background_masks[0].dtype == bool
         assert res.fps == 30.0
         assert res.method in ("sam", "manual", "fallback")
+        assert isinstance(res.metadata, dict)
+        assert res.metadata == {}
 
 
 # ---------------------------------------------------------------------------
@@ -639,3 +643,202 @@ def test_preview_masks_script(capsys: pytest.CaptureFixture):
         assert "Confidence: None" in captured.out
         assert os.path.exists(out_png)
         assert os.path.getsize(out_png) > 1000
+
+
+# ---------------------------------------------------------------------------
+# Track Persistence & Failure Flagging Tests
+# ---------------------------------------------------------------------------
+
+def _create_textured_video(num_frames: int = 20, occlude_count: int = 0) -> list[np.ndarray]:
+    """Helper creating synthetic video with textured pillar, optionally occluded for trailing frames."""
+    h, w = 120, 160
+    frames = []
+    for i in range(num_frames):
+        frame = np.full((h, w, 3), 190, dtype=np.uint8)
+        # Textured pillar
+        pillar_patch = np.zeros((60, 40, 3), dtype=np.uint8)
+        for py in range(60):
+            for px in range(40):
+                pillar_patch[py, px] = [80 + (px % 6) * 5, 85 + (py % 5) * 4, 90 + ((px + py) % 7) * 3]
+        frame[30:90, 60:100] = pillar_patch
+        # Dark ground
+        frame[95:120, :] = [45, 50, 40]
+
+        # Apply occlusion to target region for the last `occlude_count` frames
+        if i >= (num_frames - occlude_count):
+            # Cover target with a black occlusion block
+            cv2.rectangle(frame, (55, 25), (105, 95), (10, 10, 10), -1)
+
+        frames.append(frame)
+    return frames
+
+
+def test_persistence_static_video_passes():
+    """Verify that a static synthetic video passes track persistence with 100% valid frames."""
+    frames = _create_textured_video(num_frames=20, occlude_count=0)
+    segmenter = ManualSegmenter(target_bbox=(60, 30, 40, 60), background_bbox=(10, 95, 140, 25))
+    res = segmenter.segment_video(frames, fps=30.0)
+
+    assert res.metadata["status"] == "completed"
+    assert res.metadata["failed"] is False
+    assert res.metadata["is_valid"] is True
+    assert "failure_reason" not in res.metadata
+
+    tp = res.metadata["target_persistence"]
+    assert tp is not None
+    assert tp["passed"] is True
+    assert tp["fraction_valid"] == 1.0
+    assert tp["lowest_correlation"] >= 0.99
+    assert tp["lowest_frame_idx"] == 0
+
+    bp = res.metadata["background_persistence"]
+    assert bp is not None
+    assert bp["passed"] is True
+    assert bp["fraction_valid"] == 1.0
+
+    validation = validate_segment_result(res)
+    assert validation["is_valid"] is True
+    assert len(validation["errors"]) == 0
+
+
+def test_persistence_occluded_video_fails():
+    """Verify that target occlusion for 30% of frames fails persistence and marks segmentation failed."""
+    # 20 frames, last 6 frames occluded (6/20 = 30% occlusion, 70% valid)
+    frames = _create_textured_video(num_frames=20, occlude_count=6)
+    segmenter = ManualSegmenter(target_bbox=(60, 30, 40, 60), background_bbox=(10, 95, 140, 25))
+    res = segmenter.segment_video(frames, fps=30.0)
+
+    # Must be marked failed
+    assert res.metadata["status"] == "failed"
+    assert res.metadata["failed"] is True
+    assert res.metadata["is_valid"] is False
+    assert "Target persistence failure" in res.metadata["failure_reason"]
+
+    tp = res.metadata["target_persistence"]
+    assert tp is not None
+    assert tp["passed"] is False
+    assert tp["fraction_valid"] == 0.70  # Exactly 14 / 20 = 70%
+    assert tp["lowest_correlation"] < 0.50
+    assert tp["lowest_frame_idx"] == 14
+    assert tp["lowest_timestamp_sec"] == round(14 / 30.0, 3)
+
+    validation = validate_segment_result(res)
+    assert validation["is_valid"] is False
+    assert any("Target persistence failure" in err for err in validation["errors"])
+
+
+def test_persistence_raise_on_failure_raises_runtime_error():
+    """Verify that segment_video raises RuntimeError when raise_on_failure=True and persistence fails."""
+    frames = _create_textured_video(num_frames=20, occlude_count=6)
+    segmenter = ManualSegmenter(target_bbox=(60, 30, 40, 60))
+    segmenter.raise_on_failure = True
+
+    with pytest.raises(RuntimeError, match="Target persistence failure"):
+        segmenter.segment_video(frames, fps=30.0)
+
+
+# ---------------------------------------------------------------------------
+# Background Prompt Fallback Tests
+# ---------------------------------------------------------------------------
+
+def test_background_prompt_fallback_stops_at_first_match(synthetic_frame: np.ndarray):
+    """Verify background prompt fallback tries candidates in order and stops at first match."""
+    # Target prompt response
+    target_resp = {
+        "output": [{
+            "content": [{
+                "type": "output_text",
+                "text": "<0f>0<|box;x1=60;y1=30;x2=100;y2=90;w=160;h=120;score=0.95|><|mask;x=60;y=30;data=rle_tgt|>",
+            }]
+        }]
+    }
+    # Initial background prompt ("sky") -> no instances
+    empty_bg_resp = {
+        "output": [{"content": [{"type": "output_text", "text": ""}]}]
+    }
+    # Fallback 1 ("building") -> matches 1 instance
+    building_bg_resp = {
+        "output": [{
+            "content": [{
+                "type": "output_text",
+                "text": "<0f>0<|box;x1=10;y1=20;x2=50;y2=70;w=160;h=120;score=0.91|><|mask;x=10;y=20;data=rle_bld|>",
+            }]
+        }]
+    }
+
+    mock_client = MagicMock()
+    mock_client.mode = "mock"
+    # Target, primary bg (empty), fallback 1 (matched). Fallback 2 ("trees") should NOT be called.
+    mock_client.segment_image.side_effect = [target_resp, empty_bg_resp, building_bg_resp]
+
+    sam = MetaSAM31Segmenter(meta_client=mock_client)
+    out = sam.segment(
+        synthetic_frame,
+        target_prompt="concrete column",
+        background_prompt="sky reference",
+        fallback_background_prompts=["building", "trees"],
+    )
+
+    # Primary failed, fallback 1 matched -> stops, so only 2 background attempts
+    assert out.method == "sam"
+    assert out.target_source == "sam"
+    assert out.background_source == "sam"
+    assert out.background_mask is not None
+    assert out.background_bbox == (10, 20, 40, 50)
+    assert out.metadata["matched_background_prompt"] == "building"
+
+    attempts = out.metadata["background_prompts_attempted"]
+    assert len(attempts) == 2
+    assert attempts[0]["prompt"] == "sky reference"
+    assert attempts[0]["matched"] is False
+    assert attempts[0]["cost"] == 0.0025
+
+    assert attempts[1]["prompt"] == "building"
+    assert attempts[1]["matched"] is True
+    assert attempts[1]["cost"] == 0.0025
+
+    assert out.metadata["background_sam_cost"] == 0.0050
+    # Assert client was called exactly 3 times (1 target + 2 background)
+    assert mock_client.segment_image.call_count == 3
+
+
+def test_background_prompt_fallback_exhaustion_never_hardcoded_box(synthetic_frame: np.ndarray):
+    """Verify SAM returns no background mask and never substitutes a hardcoded box if all prompts fail."""
+    target_resp = {
+        "output": [{
+            "content": [{
+                "type": "output_text",
+                "text": "<0f>0<|box;x1=60;y1=30;x2=100;y2=90;w=160;h=120;score=0.95|><|mask;x=60;y=30;data=rle_tgt|>",
+            }]
+        }]
+    }
+    empty_resp = {
+        "output": [{"content": [{"type": "output_text", "text": ""}]}]
+    }
+
+    mock_client = MagicMock()
+    mock_client.mode = "mock"
+    # Target, primary bg (empty), fallback 1 (empty), fallback 2 (empty)
+    mock_client.segment_image.side_effect = [target_resp, empty_resp, empty_resp, empty_resp]
+
+    sam = MetaSAM31Segmenter(meta_client=mock_client)
+    out = sam.segment(
+        synthetic_frame,
+        target_prompt="concrete column",
+        background_prompt="bedrock anchor",
+        fallback_background_prompts=["building", "ground"],
+    )
+
+    # Never substitute a hardcoded box
+    assert out.background_mask is None
+    assert out.background_bbox is None
+    assert out.background_source == "none"
+    assert out.target_source == "sam"
+    assert out.metadata["matched_background_prompt"] is None
+
+    attempts = out.metadata["background_prompts_attempted"]
+    assert len(attempts) == 3
+    assert all(not a["matched"] for a in attempts)
+    assert out.metadata["background_sam_cost"] == 0.0075
+    assert any("No stationary background found" in w for w in out.warnings)
+

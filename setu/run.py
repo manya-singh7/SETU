@@ -262,7 +262,7 @@ def main() -> None:
     elif peaks:
         print("\nNo reliable frequency detected. Unverified candidates:")
         for i, p in enumerate(peaks, 1):
-            reasons = ", ".join(getattr(p, "flags", [])) or "unverified"
+            reasons = ", ".join(getattr(p, "reasons", getattr(p, "flags", []))) or "unverified"
             print(f"  Candidate #{i}: {p.freq_hz:.3f} Hz ({p.rel_power*100:.1f}% rel power, {p.snr:.1f} dB SNR) - [{reasons}]")
     else:
         print("\nNo reliable frequency detected. No spectral peaks identified above 0.5 Hz.")
