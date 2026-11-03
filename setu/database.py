@@ -1,13 +1,15 @@
 """
 Database session management and engine initialization using SQLModel.
 
-Stores all bridge entities, upload metadata, analysis results, and
-engineer triage items in a local SQLite database for zero-friction local setup.
+Stores all bridge entities, upload metadata, analysis results,
+engineer triage items, and vibration scans in a local SQLite database
+for zero-friction local setup.
 """
 
 from typing import Generator
 from sqlmodel import Session, SQLModel, create_engine
 from setu.config import settings
+import setu.models  # noqa: F401 - Ensures SQLModel registers all tables before create_all
 
 # SQLite connection args for multi-threaded FastAPI access
 connect_args = {"check_same_thread": False} if "sqlite" in settings.DATABASE_URL else {}

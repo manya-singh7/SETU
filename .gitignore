@@ -69,3 +69,5 @@ venv/
 tests/.cache/
 
 uploads/
+
+data/scans/

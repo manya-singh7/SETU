@@ -1,0 +1,82 @@
+{
+  "schema_version": "1.0",
+  "scan_id": "scan_20261103_a1b2c3",
+  "is_demo": false,
+  "created_at": "2026-11-03T19:30:00+05:30",
+  "status": "complete",
+  "verdict": {
+    "level": "usable",
+    "reasons": []
+  },
+  "location": {
+    "lat": 13.0827,
+    "lon": 80.2707
+  },
+  "video": {
+    "filename": "clip.mp4",
+    "fps": 60.0,
+    "duration_s": 30.0,
+    "width": 1920,
+    "height": 1080,
+    "frame_count": 1800
+  },
+  "segmentation": {
+    "target_prompt": "concrete pillar",
+    "background_prompt": "building",
+    "target_source": "sam",
+    "background_source": "sam",
+    "target_persistence": 0.98,
+    "background_persistence": 0.99,
+    "warnings": []
+  },
+  "measurement": {
+    "units": "px",
+    "scale": null,
+    "dominant_frequency_hz": 3.70,
+    "frequency_ci_hz": [
+      3.68,
+      3.72
+    ],
+    "peaks": [
+      {
+        "frequency_hz": 3.70,
+        "relative_power": 0.91,
+        "snr_db": 38.5
+      }
+    ],
+    "psd": {
+      "freq_hz": [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0, 10.5, 11.0, 11.5, 12.0, 12.5, 13.0, 13.5, 14.0, 14.5, 15.0, 15.5, 16.0, 16.5, 17.0, 17.5, 18.0, 18.5, 19.0, 19.5, 20.0, 20.5, 21.0, 21.5, 22.0, 22.5, 23.0, 23.5, 24.0, 24.5, 25.0, 25.5, 26.0, 26.5, 27.0, 27.5, 28.0, 28.5, 29.0, 29.5, 30.0],
+      "power": [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.371, 0.1228, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]
+    },
+    "background_residual_px": 0.016
+  },
+  "interpretation": {
+    "bridge": null,
+    "bridge_warning": "No mapped bridge within 150 m",
+    "quality_gate": {
+      "is_structural_element": true,
+      "has_static_background": true,
+      "appears_stable": true,
+      "issues": []
+    },
+    "assessment": {
+      "severity": "none",
+      "reasons": [],
+      "expected_range_hz": null,
+      "confidence": "low",
+      "recommended_action": "",
+      "assessor": "local_rules"
+    }
+  },
+  "outputs": {
+    "magnified_video": "magnified.mp4",
+    "spectrum_plot": "spectrum.png",
+    "displacement_plot": "displacement.png"
+  },
+  "costs_usd": {
+    "sam": 0.0025,
+    "muse_spark": 0.0013,
+    "total": 0.0038
+  },
+  "disclaimer": "SETU does not assess safety. Flagged readings are for engineer review."
+}
