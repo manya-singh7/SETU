@@ -191,6 +191,7 @@ def analyze_footage_folder(
     results_dir: Optional[Union[str, Path]] = None,
     magnify: bool = False,
     is_demo: bool = False,
+    skip_osm: bool = False,
 ) -> List[Dict[str, Any]]:
     """Scan and process all video recordings in the specified folder.
 
@@ -246,6 +247,7 @@ def analyze_footage_folder(
             background_prompt=bg_prompt,
             magnify=magnify,
             is_demo=is_demo,
+            skip_osm=skip_osm,
             out_dir=video_out_dir,
         )
         elapsed_sec = time.perf_counter() - t_start
@@ -350,6 +352,7 @@ def main() -> int:
         action="store_true",
         help="Run in demo mode.",
     )
+    parser.add_argument("--skip-osm", action="store_true", help="Skip live OpenStreetMap bridge lookup.")
 
     args = parser.parse_args()
 
@@ -358,6 +361,7 @@ def main() -> int:
         results_dir=args.results_dir,
         magnify=args.magnify,
         is_demo=args.demo,
+        skip_osm=args.skip_osm,
     )
     return 0
 

@@ -3,7 +3,7 @@ Video validation and integrity checks for Project SETU.
 
 Step 1 in SETU Pipeline:
 Verifies that the uploaded or recorded video meets technical requirements:
-- File is readable and opens cleanly with cv2.VideoCapture.
+- File is readable and has decodable frames through the shared PyAV reader.
 - Video stream contains decodable frames (frame 0 decoded successfully).
 - Duration is between 5.0 and 60.0 seconds.
 - Frame rate (fps) is between 15.0 and 240.0 Hz.
@@ -20,9 +20,10 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import cv2
 import numpy as np
 import numpy.typing as npt
+import av
+from setu.video_io import iter_video_frames
 
 from setu.result import VideoInfo
 
@@ -82,42 +83,22 @@ def check_video(video_path: Union[str, Path]) -> VideoCheckResult:
             frame0=None,
         )
 
-    cap = cv2.VideoCapture(path_str)
     try:
-        if not cap.isOpened():
+        container = av.open(path_str)
+        stream = container.streams.video[0]
+        fps = float(stream.average_rate or 0)
+        frame_count = int(stream.frames or 0)
+        if frame_count <= 0 and stream.duration is not None and stream.time_base is not None:
+            frame_count = int(round(float(stream.duration * stream.time_base) * fps))
+        frames = iter_video_frames(path_str)
+        frame0 = next(frames, None)
+        container.close()
+        if frame0 is None:
             return VideoCheckResult(
-                passed=False,
-                reasons=[f"Unable to open video stream at '{path_str}' (unreadable or unsupported codec)"],
-                video_info=VideoInfo(filename=filename),
-                frame0=None,
+                passed=False, reasons=["Failed to decode video frames (stream has no decodable frames)"],
+                video_info=VideoInfo(filename=filename), frame0=None,
             )
-
-        fps = float(cap.get(cv2.CAP_PROP_FPS))
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-        ret, frame0 = cap.read()
-        if not ret or frame0 is None:
-            return VideoCheckResult(
-                passed=False,
-                reasons=["Failed to decode video frames (stream has no decodable frames)"],
-                video_info=VideoInfo(
-                    filename=filename,
-                    fps=fps,
-                    duration_s=0.0,
-                    width=width,
-                    height=height,
-                    frame_count=frame_count,
-                ),
-                frame0=None,
-            )
-
-        # Update dimensions from actual decoded frame if needed
-        actual_h, actual_w = frame0.shape[:2]
-        if actual_w > 0 and actual_h > 0:
-            width = actual_w
-            height = actual_h
+        height, width = frame0.shape[:2]
 
         # Compute duration
         duration_s = float(frame_count / fps) if fps > 0.0 else 0.0
@@ -161,5 +142,5 @@ def check_video(video_path: Union[str, Path]) -> VideoCheckResult:
             video_info=video_info,
             frame0=frame0,
         )
-    finally:
-        cap.release()
+    except Exception as exc:
+        return VideoCheckResult(False, [f"Unable to open video stream at '{path_str}' ({exc})"], VideoInfo(filename=filename))

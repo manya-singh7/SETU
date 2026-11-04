@@ -24,9 +24,12 @@ import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import cv2
+import av
 import numpy as np
 import numpy.typing as npt
 from scipy.signal import butter, filtfilt
+from itertools import islice
+from setu.video_io import iter_video_frames, read_video_frame0
 
 logger = logging.getLogger(__name__)
 
@@ -393,16 +396,15 @@ class EulerianDisplayMagnifier:
             fps = self.config.fps
             total_frames = len(frames)
         else:
-            cap = cv2.VideoCapture(input_video_path)
-            if not cap.isOpened():
-                raise RuntimeError(f"Could not open input video: {input_video_path}")
-            fps = cap.get(cv2.CAP_PROP_FPS)
+            with av.open(input_video_path) as container:
+                stream = container.streams.video[0]
+                fps = float(stream.average_rate or self.config.fps)
+                total_frames = int(stream.frames or 0)
+            first_frame = read_video_frame0(input_video_path)
+            orig_h, orig_w = first_frame.shape[:2]
+            del first_frame
             if fps <= 0.0 or np.isnan(fps):
                 fps = self.config.fps
-            orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            cap.release()
 
         start_frame = max(0, int(round(fps * start_time_sec)))
         max_frames = min(total_frames - start_frame, int(round(fps * max_duration_sec))) if max_duration_sec else total_frames - start_frame
@@ -489,21 +491,13 @@ class EulerianDisplayMagnifier:
         n_frames = 0
         if frames is not None:
             frame_iter = iter(frames[start_frame:start_frame + max_frames])
-            cap = None
         else:
-            cap = cv2.VideoCapture(input_video_path)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-            frame_iter = None
+            frame_iter = islice(iter_video_frames(input_video_path), start_frame, start_frame + max_frames)
         while n_frames < max_frames:
-            if cap is not None:
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    break
-            else:
-                try:
-                    frame = next(frame_iter)
-                except StopIteration:
-                    break
+            try:
+                frame = next(frame_iter)
+            except StopIteration:
+                break
             if scale_720 != 1.0:
                 frame = cv2.resize(frame, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
             gray = cv2.cvtColor(frame[cy0:cy1, cx0:cx1], cv2.COLOR_BGR2GRAY)
@@ -511,8 +505,6 @@ class EulerianDisplayMagnifier:
                 gray = cv2.resize(gray, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
             proc_lum[n_frames] = gray
             n_frames += 1
-        if cap is not None:
-            cap.release()
         proc_lum = proc_lum[:n_frames]
         if n_frames == 0:
             raise ValueError(f"No frames could be decoded from {input_video_path}")
@@ -552,45 +544,32 @@ class EulerianDisplayMagnifier:
         label_text = f"{start_time_sec:.1f}-{start_time_sec + n_frames / fps:.1f}s | {freq_center:.1f} Hz | {int(round(requested_alpha))}x"
 
         def composite_generator():
-            source_cap = None if frames is not None else cv2.VideoCapture(input_video_path)
-            if source_cap is not None:
-                source_cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-            frame_iter = iter(frames[start_frame:start_frame + n_frames]) if frames is not None else None
-            try:
-                for t in range(n_frames):
-                    if source_cap is not None:
-                        ok, orig_f = source_cap.read()
-                        if not ok or orig_f is None:
-                            break
-                    else:
-                        orig_f = next(frame_iter)
-                    if scale_720 != 1.0:
-                        orig_f = cv2.resize(orig_f, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
-                    crop = orig_f[cy0:cy1, cx0:cx1]
-                    original_y = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
-                    mag_y = mag_lum_proc[t]
-                    if downscaled:
-                        mag_y = cv2.resize(mag_y, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
-                    # Compensate for phase attenuation during pyramid collapse;
-                    # apply this in luminance after resizing so the gain is stable
-                    # across processing resolutions and preserves the band frequency.
-                    mag_y = original_y + 1.2 * (mag_y - original_y)
-                    blended = matte_weight * mag_y + (1.0 - matte_weight) * original_y
-                    yuv = cv2.cvtColor(crop, cv2.COLOR_BGR2YUV)
-                    yuv[:, :, 0] = np.clip(blended, 0, 255).astype(np.uint8)
-                    mag_f = orig_f.copy()
-                    mag_f[cy0:cy1, cx0:cx1] = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
-                    sbs = np.hstack([orig_f, mag_f])
-                    sbs[:, orig_w - 1 : orig_w + 1] = (50, 50, 50)
-                    cv2.rectangle(sbs, (16, 14), (160, 48), (15, 23, 42), -1)
-                    cv2.putText(sbs, "Original", (24, 38), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-                    cv2.rectangle(sbs, (orig_w + 16, 14), (orig_w + 350, 48), (15, 23, 42), -1)
-                    cv2.putText(sbs, label_text, (orig_w + 24, 38), font, 0.7, (0, 230, 255), 2, cv2.LINE_AA)
-                    yield sbs
-            finally:
-                if source_cap is not None:
-                    source_cap.release()
-
+            frame_iter = (iter(frames[start_frame:start_frame + n_frames]) if frames is not None else
+                          islice(iter_video_frames(input_video_path), start_frame, start_frame + n_frames))
+            for t, orig_f in enumerate(frame_iter):
+                if scale_720 != 1.0:
+                    orig_f = cv2.resize(orig_f, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+                crop = orig_f[cy0:cy1, cx0:cx1]
+                original_y = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
+                mag_y = mag_lum_proc[t]
+                if downscaled:
+                    mag_y = cv2.resize(mag_y, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR)
+                # Compensate for phase attenuation during pyramid collapse;
+                # apply this in luminance after resizing so the gain is stable
+                # across processing resolutions and preserves the band frequency.
+                mag_y = original_y + 1.2 * (mag_y - original_y)
+                blended = matte_weight * mag_y + (1.0 - matte_weight) * original_y
+                yuv = cv2.cvtColor(crop, cv2.COLOR_BGR2YUV)
+                yuv[:, :, 0] = np.clip(blended, 0, 255).astype(np.uint8)
+                mag_f = orig_f.copy()
+                mag_f[cy0:cy1, cx0:cx1] = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
+                sbs = np.hstack([orig_f, mag_f])
+                sbs[:, orig_w - 1 : orig_w + 1] = (50, 50, 50)
+                cv2.rectangle(sbs, (16, 14), (160, 48), (15, 23, 42), -1)
+                cv2.putText(sbs, "Original", (24, 38), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.rectangle(sbs, (orig_w + 16, 14), (orig_w + 350, 48), (15, 23, 42), -1)
+                cv2.putText(sbs, label_text, (orig_w + 24, 38), font, 0.7, (0, 230, 255), 2, cv2.LINE_AA)
+                yield sbs
         del proc_lum
         _write_mp4_video(output_video_path, composite_generator(), fps, width=out_w, height=out_h)
 

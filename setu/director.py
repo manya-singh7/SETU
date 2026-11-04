@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import cv2
+import av
+from setu.video_io import iter_video_frames
 
 from setu.meta_client import MetaClient, get_meta_client
 
@@ -24,15 +26,16 @@ LANGUAGE_NAMES = {
 
 def _small_h264_copy(video_path: str | Path, output_path: str | Path) -> None:
     """Write at most 30 seconds at 5 fps, scaled to at most 480p, as H.264 MP4."""
-    capture = cv2.VideoCapture(str(video_path))
-    if not capture.isOpened():
-        raise ValueError("Could not open scan video")
+    with av.open(str(video_path)) as container:
+        fps = float(container.streams.video[0].average_rate or 0.0)
+    capture = iter_video_frames(video_path)
     try:
-        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
         if fps <= 0:
             raise ValueError("Could not determine scan video frame rate")
-        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        first = next(capture, None)
+        if first is None:
+            raise ValueError("Scan video contained no readable frames")
+        height, width = first.shape[:2]
         if width <= 0 or height <= 0:
             raise ValueError("Could not determine scan video dimensions")
         scale = min(1.0, 854.0 / width, 480.0 / height)
@@ -46,9 +49,9 @@ def _small_h264_copy(video_path: str | Path, output_path: str | Path) -> None:
         frame_interval = max(1, int(round(fps / 5.0)))
         max_frames = int(fps * 30)
         frame_index = 0
-        while frame_index < max_frames:
-            ok, frame = capture.read()
-            if not ok:
+        from itertools import chain
+        for frame in chain([first], capture):
+            if frame_index >= max_frames:
                 break
             if frame_index % frame_interval == 0:
                 if (frame.shape[1], frame.shape[0]) != (out_width, out_height):
@@ -59,7 +62,6 @@ def _small_h264_copy(video_path: str | Path, output_path: str | Path) -> None:
         if frame_index == 0 or not Path(output_path).is_file() or Path(output_path).stat().st_size == 0:
             raise ValueError("Scan video contained no readable frames")
     finally:
-        capture.release()
 
 
 def _message_content(response: Dict[str, Any]) -> str:

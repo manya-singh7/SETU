@@ -14,25 +14,20 @@ from setu.motion import track_motion
 from setu.segment import mask_to_bbox
 from setu.spectrum import compute_welch_peaks, determine_spectrum_verdict
 from setu.types import SegmentResult
+from setu.video_io import read_video_frame0
 
 MAX_INSTANCES = 16
 ROI_MARGIN_PX = 12
 
 
 def _read_first_frame(video_path: Union[str, os.PathLike[str]]) -> Tuple[np.ndarray, float]:
-    capture = cv2.VideoCapture(str(video_path))
-    try:
-        if not capture.isOpened():
-            raise ValueError(f"Could not open video: {video_path}")
-        ok, frame = capture.read()
-        if not ok or frame is None:
-            raise ValueError(f"Could not read frame 0 from video: {video_path}")
-        fps = float(capture.get(cv2.CAP_PROP_FPS))
-        if not math.isfinite(fps) or fps <= 0:
-            fps = 60.0
-        return frame, fps
-    finally:
-        capture.release()
+    import av
+    frame = read_video_frame0(video_path)
+    with av.open(str(video_path)) as container:
+        fps = float(container.streams.video[0].average_rate or 60.0)
+    if not math.isfinite(fps) or fps <= 0:
+        fps = 60.0
+    return frame, fps
 
 
 def _valid_mask(mask: Any, shape: Tuple[int, int], name: str) -> np.ndarray:

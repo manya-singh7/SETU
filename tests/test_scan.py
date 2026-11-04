@@ -15,7 +15,10 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 from types import ModuleType, SimpleNamespace
+import imageio_ffmpeg
+import cv2
 import numpy as np
 import pytest
 
@@ -23,6 +26,7 @@ from setu.meta_client import MetaClient
 from setu.osm import OverpassBridgeClient
 from setu.result import ScanResult
 from setu.scan import analyze_video
+from setu.segment import SegmentationOutput
 from setu.types import MotionResult
 from tests.synth import generate_synthetic_video
 
@@ -98,6 +102,7 @@ def test_analyze_video_synthetic_3hz7_usable(tmp_path: Path, mock_clients):
 
     # 4. Measurement peaks list populated
     assert len(result.measurement.peaks) >= 1
+
     p0 = result.measurement.peaks[0]
     assert abs(p0.frequency_hz - 3.70) <= 0.10
     assert p0.relative_power > 0.50
@@ -125,6 +130,69 @@ def test_analyze_video_synthetic_3hz7_usable(tmp_path: Path, mock_clients):
     assert parsed["measurement"]["dominant_frequency_hz"] == dom_f
     assert "psd" in parsed["measurement"]
     assert len(parsed["measurement"]["psd"]["freq_hz"]) > 0
+
+
+@pytest.mark.parametrize("rotation", [90, 270])
+def test_analyze_video_rotated_metadata_masks_track_target(tmp_path: Path, mock_clients, monkeypatch, rotation):
+    """Full pipeline keeps the known moving target mask aligned under MP4 display rotation."""
+    import setu.scan as scan_module
+    from setu.video_io import read_video_frame0
+
+    meta_cli, osm_cli = mock_clients
+    raw_path = tmp_path / "rotation_source.mp4"
+    video_path = tmp_path / f"rotation_{rotation}.mp4"
+    synth = generate_synthetic_video(
+        output_path=str(raw_path), fps=30, duration_sec=6, width=640, height=480,
+        freq_hz=3.7, amplitude_px=0.35, seed=29,
+    )
+    subprocess.run([
+        imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-display_rotation:v:0", str(rotation),
+        "-i", synth.video_path, "-c", "copy", str(video_path),
+    ], check=True, capture_output=True)
+
+    source_mask = np.zeros((480, 640), dtype=bool)
+    x, y, w, h = synth.target_bbox
+    source_mask[y:y + h, x:x + w] = True
+    source_background = np.zeros_like(source_mask)
+    bx, by, bw, bh = synth.background_bbox
+    source_background[by:by + bh, bx:bx + bw] = True
+    # FFmpeg's display_rotation option expresses counter-clockwise angles.
+    rotate = cv2.ROTATE_90_COUNTERCLOCKWISE if rotation == 90 else cv2.ROTATE_90_CLOCKWISE
+    expected_mask = cv2.rotate(source_mask.astype(np.uint8), rotate).astype(bool)
+    expected_background = cv2.rotate(source_background.astype(np.uint8), rotate).astype(bool)
+
+    class FixedSegmenter:
+        def segment(self, frame, **kwargs):
+            assert frame.shape[:2] == expected_mask.shape
+            return SegmentationOutput(
+                target_mask=expected_mask.copy(), background_mask=expected_background.copy(),
+                target_bbox=scan_module.mask_to_bbox(expected_mask),
+                background_bbox=scan_module.mask_to_bbox(expected_background),
+                method="manual", target_source="manual", background_source="manual",
+            )
+
+    monkeypatch.setattr(scan_module, "get_segmenter", lambda **kwargs: FixedSegmenter())
+    original_tracker = scan_module.track_motion
+    seen = {}
+
+    def checked_tracker(**kwargs):
+        mask = kwargs["segment_result"].target_masks[0]
+        frame = read_video_frame0(video_path)
+        assert mask.shape == frame.shape[:2]
+        assert np.array_equal(mask, expected_mask)
+        # The known pillar is brighter than the textured background in the source,
+        # so matching its transformed ROI verifies spatial alignment as well as shape.
+        assert float(frame[mask].mean()) > float(frame[~mask].mean())
+        seen["aligned"] = True
+        return original_tracker(**kwargs)
+
+    monkeypatch.setattr(scan_module, "track_motion", checked_tracker)
+    result = analyze_video(
+        path=str(video_path), lat=13.08, lon=80.27, meta_client=meta_cli,
+        osm_client=osm_cli, skip_osm=True,
+    )
+    assert result.status == "complete"
+    assert seen["aligned"]
 
 
 def test_analyze_video_uses_mock_sam_video_fixture_for_traffic(tmp_path: Path, mock_clients, monkeypatch, caplog):

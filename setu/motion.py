@@ -45,6 +45,7 @@ import cv2
 import numpy as np
 import numpy.typing as npt
 import av
+from setu.video_io import iter_video_frames
 
 from setu.types import MotionResult, SegmentResult
 
@@ -155,14 +156,13 @@ def track_motion(
     try:
         container = av.open(video_path)
         stream = container.streams.video[0]
-        stream.thread_type = "AUTO"
         fps = float(stream.average_rate or 60.0)
-        width, height = int(stream.width), int(stream.height)
-        decoded = container.decode(stream)
-        frame0_av = next(decoded, None)
-        if frame0_av is None:
+        container.close()
+        decoded = iter_video_frames(video_path, format="gray")
+        gray0 = next(decoded, None)
+        if gray0 is None:
             raise ValueError(f"Failed to read reference frame 0 from '{video_path}'")
-        gray0 = frame0_av.to_ndarray(format="gray")
+        height, width = gray0.shape[:2]
     except Exception as exc:
         raise ValueError(f"Could not open video file: '{video_path}'") from exc
     warnings: List[str] = []
@@ -292,8 +292,7 @@ def track_motion(
 
     bx, by, bw, bh = b_box if b_box is not None else (0, 0, 0, 0)
     try:
-      for frame_av in decoded:
-        gray_curr = frame_av.to_ndarray(format="gray")
+      for gray_curr in decoded:
         if gray_curr is None:
             break
 

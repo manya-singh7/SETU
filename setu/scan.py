@@ -74,6 +74,7 @@ from setu.spectrum import (
 )
 from setu.types import SegmentResult
 from setu.video_checks import check_video
+from setu.video_io import iter_video_frames
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +196,7 @@ def analyze_video(
     assessor: Optional[BaseAssessor] = None,
     quality_gate: Optional[QualityGate] = None,
     stage_timings: Optional[Dict[str, float]] = None,
+    skip_osm: bool = False,
 ) -> ScanResult:
     """Execute end-to-end vibration screening pipeline on a video file.
 
@@ -333,22 +335,10 @@ def analyze_video(
     target_pers_val = 1.0
     bg_pers_val = 1.0
     try:
-        cap = cv2.VideoCapture(video_path_str)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        total_frames = v_info.frame_count
         n_samples = min(60, max(10, total_frames))
         step = max(1, total_frames // n_samples)
-        sampled_frames: List[np.ndarray] = []
-        for i in range(total_frames):
-            if i % step == 0 and len(sampled_frames) < n_samples:
-                ret_s, f_s = cap.read()
-                if ret_s and f_s is not None:
-                    sampled_frames.append(f_s)
-                else:
-                    break
-            else:
-                if not cap.grab():
-                    break
-        cap.release()
+        sampled_frames = [f for i, f in enumerate(iter_video_frames(video_path_str)) if i % step == 0][:n_samples]
 
         if sampled_frames:
             t_pers = compute_persistence(
@@ -621,6 +611,7 @@ def analyze_video(
             assessor=assessor,
             quality_gate=quality_gate,
             osm_client=osm_client,
+            skip_osm=skip_osm,
         )
     except Exception as interp_exc:
         logger.warning("Stage 5 Interpretation exception: %s", interp_exc)

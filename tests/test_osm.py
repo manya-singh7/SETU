@@ -161,6 +161,8 @@ def test_overpass_timeout_handled_gracefully(monkeypatch):
     # Coordinates not in cache
     result = client.find_nearest_bridge(13.99999, 80.99999, radius_meters=150.0)
     assert result is None
+    assert client.timeout == 10
+    assert "timed out" in client.last_error.lower()
 
 
 def test_disk_caching(tmp_path, monkeypatch):

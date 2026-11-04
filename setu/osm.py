@@ -171,13 +171,14 @@ class OverpassBridgeClient:
     def __init__(
         self,
         endpoint_url: Optional[str] = None,
-        timeout: int = 20,
+        timeout: int = 10,
         cache_dir: str = "cache/osm",
         mode: Optional[str] = None,
         fixture_path: Optional[str] = None,
     ) -> None:
         self.endpoint_url = endpoint_url or settings.OVERPASS_API_URL
         self.timeout = timeout
+        self.last_error: Optional[str] = None
         self.cache_dir = cache_dir
         self.mode = mode.lower() if mode else None
         self.fixture_path = fixture_path or os.path.join(
@@ -387,6 +388,7 @@ out body geom;"""
         query = self.build_query(latitude, longitude, radius_meters)
 
         try:
+            self.last_error = None
             response = requests.post(
                 self.endpoint_url,
                 data={"data": query},
@@ -394,6 +396,7 @@ out body geom;"""
                 headers={"User-Agent": "SETU-Bridge-Client/0.1.0"},
             )
             if response.status_code != 200:
+                self.last_error = f"OpenStreetMap bridge lookup returned HTTP {response.status_code}."
                 logger.warning(
                     f"Overpass API returned status {response.status_code}: {response.text[:200]}"
                 )
@@ -407,9 +410,11 @@ out body geom;"""
             return bridge
 
         except (requests.exceptions.Timeout, requests.exceptions.RequestException) as exc:
+            self.last_error = f"OpenStreetMap bridge lookup unavailable: {exc}"
             logger.warning(f"Overpass API request failed or timed out: {exc}")
             return None
         except (json.JSONDecodeError, KeyError, ValueError) as exc:
+            self.last_error = f"OpenStreetMap bridge lookup response could not be read: {exc}"
             logger.warning(f"Failed to parse Overpass response: {exc}")
             return None
 

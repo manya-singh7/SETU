@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import tempfile
+from itertools import chain
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -16,6 +17,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from setu.meta_client import MetaClient, get_meta_client
+from setu.video_io import iter_video_frames
 
 logger = logging.getLogger(__name__)
 TRACK_FPS = 10.0
@@ -26,13 +28,16 @@ _OBJECT_BOX = re.compile(r"(?:^|,)\s*(\d+)\s*<\|box;([^|]+)\|>")
 
 
 def _prepare_video(source: str | Path, target: str | Path) -> int:
-    cap = cv2.VideoCapture(str(source))
-    if not cap.isOpened():
-        raise ValueError("Could not open traffic video")
+    import av
     try:
-        source_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0)
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        with av.open(str(source)) as container:
+            stream = container.streams.video[0]
+            source_fps = float(stream.average_rate or 0)
+        frames = iter_video_frames(source)
+        first = next(frames, None)
+        if first is None:
+            raise ValueError("Traffic video contained no readable frames")
+        height, width = first.shape[:2]
         if source_fps <= 0 or width <= 0 or height <= 0:
             raise ValueError("Could not determine traffic video dimensions or frame rate")
         scale = min(1.0, MAX_HEIGHT / height)
@@ -44,10 +49,7 @@ def _prepare_video(source: str | Path, target: str | Path) -> int:
         next_frame = 0.0
         count = 0
         index = 0
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
+        for index, frame in enumerate(chain([first], frames)):
             if index + 1e-9 >= next_frame:
                 if (frame.shape[1], frame.shape[0]) != out_size:
                     frame = cv2.resize(frame, out_size, interpolation=cv2.INTER_AREA)
@@ -59,8 +61,8 @@ def _prepare_video(source: str | Path, target: str | Path) -> int:
         if count == 0:
             raise ValueError("Traffic video contained no readable frames")
         return count
-    finally:
-        cap.release()
+    except Exception:
+        raise
 
 
 def _output_text(response: Dict[str, Any]) -> str:

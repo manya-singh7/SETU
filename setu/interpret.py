@@ -101,6 +101,7 @@ def interpret(
     assessor: Optional[BaseAssessor] = None,
     quality_gate: Optional[QualityGate] = None,
     osm_client: Optional[OverpassBridgeClient] = None,
+    skip_osm: bool = False,
 ) -> Dict[str, Any]:
     """Execute end-to-end interpretation of scan telemetry.
 
@@ -134,10 +135,11 @@ def interpret(
 
     # 2. OSM Bridge Lookup
     nearest_bridge: Optional[OSMBridgeInfo] = None
-    if gps is not None and isinstance(gps, (tuple, list)) and len(gps) >= 2:
+    c_osm = osm_client
+    if not skip_osm and gps is not None and isinstance(gps, (tuple, list)) and len(gps) >= 2:
         try:
             lat, lon = float(gps[0]), float(gps[1])
-            c_osm = osm_client or OverpassBridgeClient(mode="mock" if is_mock else None)
+            c_osm = c_osm or OverpassBridgeClient(mode="mock" if is_mock else None)
             nearest_bridge = c_osm.find_nearest_bridge(lat, lon, radius_meters=150.0)
         except Exception as exc:
             logger.warning(f"OSM lookup failed: {exc}")
@@ -146,8 +148,10 @@ def interpret(
     osm_result: Union[OSMBridgeInfo, str]
     if nearest_bridge is not None:
         osm_result = nearest_bridge
+    elif skip_osm:
+        osm_result = "OpenStreetMap bridge lookup skipped by request."
     else:
-        osm_result = NO_BRIDGE_WARNING
+        osm_result = getattr(c_osm, "last_error", None) or NO_BRIDGE_WARNING
 
     # 3. Quality Gate on Frame 0
     qgate = quality_gate or QualityGate(client=meta_cli)
