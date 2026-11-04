@@ -522,3 +522,66 @@ def test_motion_tracking_nan_inf_gives_failed_verdict(tmp_path, monkeypatch):
     assert motion_res.quality["verdict"] == "failed"
     assert "Motion tracking produced invalid values" in motion_res.quality["reasons"]
 
+
+def test_low_phase_confidence_rejects_unreliable_displacement(tmp_path, monkeypatch):
+    """Low-confidence phase peaks must not become a false motion measurement."""
+    video_path = str(tmp_path / "low_phase_confidence.mp4")
+    res = generate_synthetic_video(
+        output_path=video_path,
+        fps=30.0,
+        duration_sec=1.0,
+        amplitude_px=0.2,
+        camera_jitter=False,
+        seed=57,
+    )
+    monkeypatch.setattr("cv2.phaseCorrelate", lambda *args, **kwargs: ((20.0, -10.0), 0.01))
+    motion_res = track_motion(
+        video_path=video_path,
+        target_bbox=res.target_bbox,
+        background_bbox=res.background_bbox,
+        method="phase_correlation",
+    )
+    assert motion_res.verdict == "failed"
+    assert motion_res.quality["phase_tracking_unreliable"] is True
+    assert motion_res.quality["phase_response_median"] == pytest.approx(0.01)
+    assert np.sqrt(np.mean(motion_res.displacement**2)) <= 0.008
+    assert any("phase-correlation confidence was low" in reason for reason in motion_res.reasons)
+
+
+@pytest.mark.parametrize("amplitude_px", [0.1, 0.2])
+def test_full_resolution_target_preserves_far_bridge_sensitivity(tmp_path, amplitude_px):
+    """Background downscaling must preserve low-amplitude target frequency and verdict."""
+    from setu.spectrum import compute_welch_peaks
+
+    video_path = str(tmp_path / f"far_bridge_{amplitude_px:.1f}.mp4")
+    synth = generate_synthetic_video(
+        output_path=video_path,
+        fps=60.0,
+        duration_sec=6.0,
+        width=1920,
+        height=1080,
+        freq_hz=3.7,
+        amplitude_px=amplitude_px,
+        seed=137,
+    )
+    full = track_motion(
+        video_path, target_bbox=synth.target_bbox, background_bbox=synth.background_bbox,
+        max_processing_dimension=None,
+    )
+    background_scaled = track_motion(
+        video_path, target_bbox=synth.target_bbox, background_bbox=synth.background_bbox,
+        max_processing_dimension=960,
+    )
+    full_peak = compute_welch_peaks(
+        full.displacement, fps=full.fps, background_displacement=full.background_displacement,
+        active_segments_only=False,
+    )[0]
+    scaled_peak = compute_welch_peaks(
+        background_scaled.displacement, fps=background_scaled.fps,
+        background_displacement=background_scaled.background_displacement,
+        active_segments_only=False,
+    )[0]
+    assert background_scaled.verdict == full.verdict == "usable"
+    assert scaled_peak.verdict == full_peak.verdict
+    assert abs(scaled_peak.freq_hz - full_peak.freq_hz) < 0.02
+

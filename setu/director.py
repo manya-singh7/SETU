@@ -29,6 +29,8 @@ def _small_h264_copy(video_path: str | Path, output_path: str | Path) -> None:
     with av.open(str(video_path)) as container:
         fps = float(container.streams.video[0].average_rate or 0.0)
     capture = iter_video_frames(video_path)
+    writer = None
+    completed = False
     try:
         if fps <= 0:
             raise ValueError("Could not determine scan video frame rate")
@@ -59,9 +61,16 @@ def _small_h264_copy(video_path: str | Path, output_path: str | Path) -> None:
                 writer.write(frame)
             frame_index += 1
         writer.release()
+        writer = None
         if frame_index == 0 or not Path(output_path).is_file() or Path(output_path).stat().st_size == 0:
             raise ValueError("Scan video contained no readable frames")
+        completed = True
     finally:
+        capture.close()
+        if writer is not None:
+            writer.release()
+        if not completed:
+            Path(output_path).unlink(missing_ok=True)
 
 
 def _message_content(response: Dict[str, Any]) -> str:

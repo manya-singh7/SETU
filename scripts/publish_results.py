@@ -44,8 +44,13 @@ def _scan_output_names(result: dict[str, Any]) -> List[str]:
     return list(dict.fromkeys(names))
 
 
-def publish_scan(scan_folder: Path | str, name: str, root: Path = ROOT) -> List[Path]:
+def publish_scan(
+    scan_folder: Path | str,
+    name: str,
+    root: Optional[Path] = None,
+) -> List[Path]:
     """Copy a completed non-demo scan result and its declared output files."""
+    root = ROOT if root is None else root
     name = _validated_name(name)
     source = Path(scan_folder).expanduser().resolve()
     result_path = source / "result.json"
@@ -112,8 +117,13 @@ def _validation_index_entries(index: Any) -> List[str]:
     return names
 
 
-def publish_validation(validation_json: Path | str, name: str, root: Path = ROOT) -> List[Path]:
+def publish_validation(
+    validation_json: Path | str,
+    name: str,
+    root: Optional[Path] = None,
+) -> List[Path]:
     """Copy validation output JSON and register it once in the frontend index."""
+    root = ROOT if root is None else root
     name = _validated_name(name)
     source = Path(validation_json).expanduser().resolve()
     if not source.is_file():
@@ -138,8 +148,9 @@ def publish_validation(validation_json: Path | str, name: str, root: Path = ROOT
     return [destination.relative_to(Path(root).resolve()), index_path.relative_to(Path(root).resolve())]
 
 
-def list_published(root: Path = ROOT) -> tuple[List[str], List[str]]:
+def list_published(root: Optional[Path] = None) -> tuple[List[str], List[str]]:
     """Return published showcase and validation names."""
+    root = ROOT if root is None else root
     root = Path(root).resolve()
     scans_dir = root / "demo_scans"
     scans = sorted(

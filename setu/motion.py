@@ -133,6 +133,8 @@ def track_motion(
     max_corners_target: int = 100,
     noise_floor_rms: float = TRACKING_NOISE_FLOOR_RMS_PX,
     noise_factor: float = NOISE_FLOOR_FACTOR,
+    diagnostics: Optional[Dict[str, Any]] = None,
+    max_processing_dimension: Optional[int] = 960,
 ) -> MotionResult:
     """Track subpixel target motion cancelled against background micro-jitter.
 
@@ -149,6 +151,7 @@ def track_motion(
         axis: Motion projection axis ('auto', 'x', 'y'). 'auto' selects higher-variance axis.
         max_corners_bg: Maximum corner features to track in the background reference.
         max_corners_target: Maximum corner features for Lucas-Kanade target tracking.
+        max_processing_dimension: Background-processing dimension cap; target patches remain at source resolution.
 
     Returns:
         MotionResult containing 1D displacement time series, frame rate, and quality diagnostics.
@@ -159,13 +162,42 @@ def track_motion(
         fps = float(stream.average_rate or 60.0)
         container.close()
         decoded = iter_video_frames(video_path, format="gray")
-        gray0 = next(decoded, None)
-        if gray0 is None:
+        source_gray0 = next(decoded, None)
+        if source_gray0 is None:
             raise ValueError(f"Failed to read reference frame 0 from '{video_path}'")
-        height, width = gray0.shape[:2]
+        source_height, source_width = source_gray0.shape[:2]
+        processing_scale = (
+            min(1.0, float(max_processing_dimension) / max(source_height, source_width))
+            if max_processing_dimension is not None and max_processing_dimension > 0 else 1.0
+        )
+        width, height = source_width, source_height
+        work_width = max(1, int(round(source_width * processing_scale)))
+        work_height = max(1, int(round(source_height * processing_scale)))
+        scale_back = 1.0 / processing_scale
+
+        def resize_gray(frame: npt.NDArray[np.uint8]) -> npt.NDArray[np.uint8]:
+            if frame.shape[:2] == (work_height, work_width):
+                return frame
+            return cv2.resize(frame, (work_width, work_height), interpolation=cv2.INTER_AREA)
+
+        gray0 = source_gray0
+        gray0_work = resize_gray(source_gray0)
     except Exception as exc:
         raise ValueError(f"Could not open video file: '{video_path}'") from exc
     warnings: List[str] = []
+
+    def scaled_box(box: Optional[Tuple[int, int, int, int]]) -> Optional[Tuple[int, int, int, int]]:
+        if box is None or processing_scale == 1.0:
+            return box
+        x, y, box_width, box_height = box
+        return (
+            max(0, int(round(x * processing_scale))),
+            max(0, int(round(y * processing_scale))),
+            max(1, int(round(box_width * processing_scale))),
+            max(1, int(round(box_height * processing_scale))),
+        )
+
+    background_bbox = scaled_box(background_bbox)
 
     # 1. Establish frame 0 target and background masks
     has_background = True
@@ -175,6 +207,8 @@ def track_motion(
     if segment_result is not None:
         if len(segment_result.target_masks) > 0:
             target_mask0 = segment_result.target_masks[0].astype(np.uint8) * 255
+            if target_mask0.shape != (height, width):
+                target_mask0 = cv2.resize(target_mask0, (width, height), interpolation=cv2.INTER_NEAREST)
             t_box = target_bbox or _extract_bounding_box(target_mask0)
         else:
             t_box = target_bbox or (int(width * 0.4), int(height * 0.2), int(width * 0.2), int(height * 0.6))
@@ -184,10 +218,12 @@ def track_motion(
 
         if len(segment_result.background_masks) > 0 and np.any(segment_result.background_masks[0]):
             bg_mask0 = segment_result.background_masks[0].astype(np.uint8) * 255
+            if bg_mask0.shape != (work_height, work_width):
+                bg_mask0 = cv2.resize(bg_mask0, (work_width, work_height), interpolation=cv2.INTER_NEAREST)
             b_box = b_box or _extract_bounding_box(bg_mask0)
         elif b_box is not None and b_box[2] > 0 and b_box[3] > 0:
             bx, by, bw, bh = b_box
-            bg_mask0 = np.zeros((height, width), dtype=np.uint8)
+            bg_mask0 = np.zeros((work_height, work_width), dtype=np.uint8)
             bg_mask0[by : by + bh, bx : bx + bw] = 255
         else:
             has_background = False
@@ -199,7 +235,7 @@ def track_motion(
 
         if b_box is not None and b_box[2] > 0 and b_box[3] > 0:
             bx, by, bw, bh = b_box
-            bg_mask0 = np.zeros((height, width), dtype=np.uint8)
+            bg_mask0 = np.zeros((work_height, work_width), dtype=np.uint8)
             bg_mask0[by : by + bh, bx : bx + bw] = 255
         else:
             has_background = False
@@ -221,7 +257,7 @@ def track_motion(
         p_bg0 = None
     else:
         bx, by, bw, bh = b_box
-        bg_roi0 = gray0[by:by + bh, bx:bx + bw]
+        bg_roi0 = gray0_work[by:by + bh, bx:bx + bw]
         bg_mask_roi = bg_mask0[by:by + bh, bx:bx + bw]
         p_bg0 = cv2.goodFeaturesToTrack(
             bg_roi0,
@@ -288,6 +324,15 @@ def track_motion(
     camera_shifts_x: List[float] = [0.0]
     camera_shifts_y: List[float] = [0.0]
     background_displacement: List[float] = [0.0]
+    bg_correction_skipped_frames = 0
+    bg_feature_counts: List[int] = [int(len(p_bg0)) if p_bg0 is not None else 0]
+    affine_translations: List[Tuple[float, float]] = [(0.0, 0.0)]
+    phase_responses: List[float] = [1.0]
+    raw_phase_responses: List[float] = [1.0]
+    raw_dx_list: List[float] = [0.0]
+    raw_dy_list: List[float] = [0.0]
+    patch_shifts_history: List[List[Tuple[float, float]]] = [[(0.0, 0.0)] for _ in phase_patches] if method == "phase_correlation" else []
+    patch_responses_history: List[List[float]] = [[1.0] for _ in phase_patches] if method == "phase_correlation" else []
     M_prev = np.float32([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
 
     bx, by, bw, bh = b_box if b_box is not None else (0, 0, 0, 0)
@@ -295,6 +340,7 @@ def track_motion(
       for gray_curr in decoded:
         if gray_curr is None:
             break
+        gray_curr_work = resize_gray(gray_curr)
 
         total_frames_count += 1
 
@@ -308,8 +354,8 @@ def track_motion(
         if has_background and p_bg0 is not None:
             # A. Track background features from frame 0 to current frame
             p_bg_curr, st_bg, _ = cv2.calcOpticalFlowPyrLK(
-                gray0[by:by + bh, bx:bx + bw],
-                gray_curr[by:by + bh, bx:bx + bw],
+                gray0_work[by:by + bh, bx:bx + bw],
+                gray_curr_work[by:by + bh, bx:bx + bw],
                 p_bg0,
                 None,
                 winSize=(21, 21),
@@ -322,11 +368,13 @@ def track_motion(
             good_bg_curr = p_bg_curr[st_bg_flat]
             good_bg0 = good_bg0 + np.array([bx, by], dtype=np.float32)
             good_bg_curr = good_bg_curr + np.array([bx, by], dtype=np.float32)
+            bg_feature_counts.append(int(len(good_bg_curr)))
 
             # B. Estimate affine warp matrix to align current frame to frame 0
-            if len(good_bg_curr) >= 4:
+            if len(good_bg_curr) >= 10:
                 M, inliers = cv2.estimateAffinePartial2D(
-                    good_bg_curr, good_bg0, method=cv2.RANSAC, ransacReprojThreshold=2.0
+                    good_bg_curr, good_bg0, method=cv2.RANSAC,
+                    ransacReprojThreshold=max(0.5, 2.0 * processing_scale),
                 )
                 if M is None:
                     M = M_prev.copy()
@@ -335,7 +383,7 @@ def track_motion(
                     inlier_ratio = (
                         float(np.sum(inliers)) / float(len(good_bg_curr)) if inliers is not None else 0.0
                     )
-                    if trans_jump > 3.0 or inlier_ratio < 0.25:
+                    if trans_jump > max(0.5, 3.0 * processing_scale) or inlier_ratio < 0.25:
                         warnings.append(
                             f"Frame stabilization jump ({trans_jump:.1f}px) or low inlier ratio ({inlier_ratio:.2f}); "
                             "applying temporal continuity."
@@ -345,26 +393,17 @@ def track_motion(
                         M_prev = M.copy()
             else:
                 M = M_prev.copy()
-                warnings.append("Insufficient tracked background points in frame; maintaining prior alignment.")
+                bg_correction_skipped_frames += 1
 
             # Record camera motion translation from M
             camera_shifts_x.append(float(M[0, 2]))
             camera_shifts_y.append(float(M[1, 2]))
+            affine_translations.append((float(M[0, 2]), float(M[1, 2])))
 
-            # C. Warp current frame to frame 0 reference coordinate system
-            roi_M = M.copy()
-            # Output coordinates are ROI-local, while source coordinates remain
-            # full-frame coordinates: translate the destination by the ROI origin.
-            roi_M[:, 2] -= np.array([tx, ty], dtype=roi_M.dtype)
-            warped_curr = cv2.warpAffine(
-                gray_curr,
-                roi_M,
-                (tw, th),
-                flags=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_REFLECT,
-            )
+            M_target = M.copy()
+            M_target[:, 2] *= scale_back
 
-            # D. Calculate background residual error after stabilization
+            # C. Calculate background residual error after stabilization
             if len(good_bg_curr) > 0 and M is not None:
                 pts_reshaped = good_bg_curr.reshape(-1, 2)
                 # Apply M to current background points
@@ -380,27 +419,59 @@ def track_motion(
                 background_displacement.append(0.0)
         else:
             # Skip camera stabilization: use unwarped frame and record zero camera shifts
-            warped_curr = gray_curr[ty : ty + th, tx : tx + tw]
+            M_target = M_prev.copy()
+            M_target[:, 2] *= scale_back
             camera_shifts_x.append(0.0)
             camera_shifts_y.append(0.0)
+            bg_feature_counts.append(0)
+            affine_translations.append((0.0, 0.0))
             bg_residuals.append(0.0)
             background_displacement.append(0.0)
 
         # E. Measure target motion using FIXED frame 0 mask
         if method == "phase_correlation":
             shifts = []
+            responses = []
+            raw_shifts = []
+            raw_responses = []
             for (px, py, pw, ph), reference, window in zip(phase_patches, phase_references, phase_windows):
-                current_patch = warped_curr[py : py + ph, px : px + pw].astype(np.float32)
-                shift, _ = cv2.phaseCorrelate(reference, current_patch, window)
+                patch_matrix = M_target.copy()
+                patch_matrix[:, 2] -= np.array([tx + px, ty + py], dtype=patch_matrix.dtype)
+                current_patch = cv2.warpAffine(
+                    gray_curr, patch_matrix, (pw, ph), flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REFLECT,
+                ).astype(np.float32)
+                shift, response = cv2.phaseCorrelate(reference, current_patch, window)
                 shifts.append(shift)
+                responses.append(float(response))
+                raw_patch = gray_curr[ty + py : ty + py + ph, tx + px : tx + px + pw].astype(np.float32)
+                raw_shift, raw_response = cv2.phaseCorrelate(reference, raw_patch, window)
+                raw_shifts.append(raw_shift)
+                raw_responses.append(float(raw_response))
+            for patch_index, (shift, response) in enumerate(zip(shifts, responses)):
+                patch_shifts_history[patch_index].append((float(shift[0]), float(shift[1])))
+                patch_responses_history[patch_index].append(float(response))
             dx_step, dy_step = np.median(np.asarray(shifts, dtype=np.float32), axis=0)
             dx_raw_list.append(float(dx_step))
             dy_raw_list.append(float(dy_step))
+            phase_responses.append(float(np.median(responses)) if responses else 0.0)
+            raw_step = np.median(np.asarray(raw_shifts, dtype=np.float32), axis=0)
+            raw_dx_list.append(float(raw_step[0]))
+            raw_dy_list.append(float(raw_step[1]))
+            raw_phase_responses.append(float(np.median(raw_responses)) if raw_responses else 0.0)
         else:
-            # Lucas-Kanade on stabilized target features
+            # Track target features in the same reference coordinates used by
+            # phase correlation. M maps current-frame coordinates to frame 0.
+            aligned_full = (
+                cv2.warpAffine(
+                    gray_curr, M_target, (width, height), flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REFLECT,
+                )
+                if has_background else gray_curr
+            )
             p_tgt_curr, st_tgt, _ = cv2.calcOpticalFlowPyrLK(
                 gray0,
-                warped_curr if not has_background else gray_curr,
+                aligned_full,
                 p_tgt0,
                 None,
                 winSize=(15, 15),
@@ -421,12 +492,44 @@ def track_motion(
 
             dx_raw_list.append(dx_step)
             dy_raw_list.append(dy_step)
+            raw_dx_list.append(dx_step)
+            raw_dy_list.append(dy_step)
+            phase_responses.append(float("nan"))
+            raw_phase_responses.append(float("nan"))
 
     finally:
         container.close()
 
+    if bg_correction_skipped_frames:
+        warnings.append(
+            f"Camera correction held at the prior alignment for {bg_correction_skipped_frames} frames "
+            "because fewer than 10 background features tracked."
+        )
+
+    scale_back = 1.0 / processing_scale
     dx_arr = np.array(dx_raw_list, dtype=np.float64)
     dy_arr = np.array(dy_raw_list, dtype=np.float64)
+    unfiltered_dx_arr = dx_arr.copy()
+    unfiltered_dy_arr = dy_arr.copy()
+    phase_outlier_frames = np.zeros(len(dx_arr), dtype=bool)
+    if method == "phase_correlation" and len(dx_arr) > 2:
+        response_arr = np.asarray(phase_responses, dtype=np.float64)
+        for axis_values in (dx_arr, dy_arr):
+            jump_frames = np.flatnonzero(
+                (response_arr[1:] < 0.15)
+                & (np.abs(np.diff(axis_values)) > 3.0)
+            ) + 1
+            phase_outlier_frames[jump_frames] = True
+        valid_frames = ~phase_outlier_frames & np.isfinite(dx_arr) & np.isfinite(dy_arr)
+        valid_frames[0] = False  # Frame 0 is the reference, not a valid phase estimate.
+        if np.any(valid_frames):
+            sample_indices = np.arange(len(dx_arr))
+            dx_arr = np.interp(sample_indices, sample_indices[valid_frames], dx_arr[valid_frames])
+            dy_arr = np.interp(sample_indices, sample_indices[valid_frames], dy_arr[valid_frames])
+    bg_residuals = [value * scale_back for value in bg_residuals]
+    camera_shifts_x = [value * scale_back for value in camera_shifts_x]
+    camera_shifts_y = [value * scale_back for value in camera_shifts_y]
+    background_displacement = [value * scale_back for value in background_displacement]
 
     # 5. Determine dominant motion axis
     var_x = float(np.var(dx_arr))
@@ -434,10 +537,32 @@ def track_motion(
 
     if axis == "x":
         displacement = dx_arr
+        raw_measurement = unfiltered_dx_arr
     elif axis == "y":
         displacement = dy_arr
+        raw_measurement = unfiltered_dy_arr
     else:
         displacement = dx_arr if var_x >= var_y else dy_arr
+        raw_measurement = unfiltered_dx_arr if var_x >= var_y else unfiltered_dy_arr
+
+    measured_displacement = raw_measurement.copy()
+    clipped_frame_ratio = float(clipped_frames_count / max(total_frames_count, 1))
+    clipping_detected = bool(clipped_frame_ratio >= CLIPPING_FRAME_FRACTION)
+    phase_response_median = (
+        float(np.nanmedian(phase_responses[1:]))
+        if method == "phase_correlation" and len(phase_responses) > 1 else None
+    )
+    phase_tracking_unreliable = bool(
+        phase_response_median is not None
+        and phase_response_median < 0.15
+        and float(np.std(measured_displacement)) > max(noise_floor_rms * noise_factor, 0.05)
+        and not clipping_detected
+    )
+    if phase_tracking_unreliable:
+        # A low-confidence phase peak does not establish physical movement.
+        # Keep the noisy estimates in diagnostics, but do not pass them into
+        # the modal analysis as if they were measured displacement.
+        displacement = np.zeros_like(measured_displacement)
 
     # 6. Quality diagnostics
     bg_residual_px = float(np.mean(bg_residuals))
@@ -455,7 +580,7 @@ def track_motion(
 
     # Check if camera motion is substantially larger than target structural motion
     cam_rms = float(np.sqrt(np.mean(np.array(camera_shifts_x) ** 2 + np.array(camera_shifts_y) ** 2)))
-    if is_valid_disp and cam_rms > 5.0 * max(disp_std, 0.05):
+    if is_valid_disp and not phase_tracking_unreliable and cam_rms > 5.0 * max(disp_std, 0.05):
         warnings.append(
             f"Camera micro-jitter motion (RMS: {cam_rms:.2f} px) is significantly larger than "
             f"target structural displacement (RMS: {disp_std:.3f} px). Subpixel accuracy may be degraded."
@@ -463,13 +588,11 @@ def track_motion(
 
     if bg_residual_px > 0.08:
         warnings.append(
-            f"Elevated background stabilization residual ({bg_residual_px:.3f} px). "
-            "High-amplitude ground or mount vibration detected."
+            f"Elevated background stabilization residual ({bg_residual_px:.3f} px); "
+            "camera stabilization confidence is reduced."
         )
 
     # Clipping detection evaluation
-    clipped_frame_ratio = float(clipped_frames_count / max(total_frames_count, 1))
-    clipping_detected = bool(clipped_frame_ratio >= CLIPPING_FRAME_FRACTION)
     if clipping_detected:
         warnings.append(
             f"Target mask pixel saturation/clipping detected in {clipped_frame_ratio * 100:.1f}% of frames "
@@ -479,11 +602,21 @@ def track_motion(
 
     # Three-level verdict determination
     reasons: List[str] = []
+    if phase_tracking_unreliable:
+        reasons.append(
+            f"No measurable motion above tracking noise: phase-correlation confidence was low "
+            f"(median response {phase_response_median:.3f}); noisy estimates were rejected."
+        )
     if not has_background:
         reasons.append("unverified: no stationary background in frame")
+    if bg_correction_skipped_frames:
+        reasons.append(
+            f"camera correction held at the prior alignment for {bg_correction_skipped_frames} frames "
+            "because fewer than 10 background features tracked"
+        )
     if clipping_detected:
         reasons.append("target mask pixel saturation/clipping detected (saturation reduces sub-pixel accuracy)")
-    if is_valid_disp and cam_rms > 5.0 * max(disp_std, 0.05):
+    if is_valid_disp and not phase_tracking_unreliable and cam_rms > 5.0 * max(disp_std, 0.05):
         reasons.append(
             f"camera micro-jitter motion ({cam_rms:.2f} px) significantly exceeds target motion ({disp_std:.3f} px)"
         )
@@ -495,9 +628,10 @@ def track_motion(
     if not is_valid_disp:
         verdict: Literal["usable", "weak", "failed"] = "failed"
         reasons.insert(0, "Motion tracking produced invalid values")
-    elif disp_rms <= min_motion_thresh:
+    elif disp_rms <= min_motion_thresh or phase_tracking_unreliable:
         verdict = "failed"
-        reasons.insert(0, "No measurable motion above tracking noise")
+        if not phase_tracking_unreliable:
+            reasons.insert(0, "No measurable motion above tracking noise")
     elif len(reasons) > 0:
         verdict = "weak"
     else:
@@ -521,6 +655,10 @@ def track_motion(
         "displacement_rms_px": round(disp_rms, 6),
         "noise_floor_rms_px": round(noise_floor_rms, 6),
         "min_motion_threshold_px": round(min_motion_thresh, 6),
+        "phase_response_median": round(phase_response_median, 6) if phase_response_median is not None else None,
+        "phase_tracking_unreliable": phase_tracking_unreliable,
+        "background_correction_skipped_frames": bg_correction_skipped_frames,
+        "processing_scale": processing_scale,
     }
 
     motion_result = MotionResult(
@@ -533,6 +671,33 @@ def track_motion(
         reasons=reasons,
     )
     motion_result.background_displacement = np.asarray(background_displacement, dtype=np.float64)
+
+    if diagnostics is not None:
+        diagnostics.update({
+            "target_dx_stabilized_px": np.asarray(dx_arr, dtype=np.float64),
+            "target_dy_stabilized_px": np.asarray(dy_arr, dtype=np.float64),
+            "target_dx_raw_px": np.asarray(raw_dx_list, dtype=np.float64),
+            "target_dy_raw_px": np.asarray(raw_dy_list, dtype=np.float64),
+            "camera_translation_x_px": np.asarray(camera_shifts_x, dtype=np.float64),
+            "camera_translation_y_px": np.asarray(camera_shifts_y, dtype=np.float64),
+            "background_features_tracked": np.asarray(bg_feature_counts, dtype=np.int32),
+            "phase_response": np.asarray(phase_responses, dtype=np.float64),
+            "raw_phase_response": np.asarray(raw_phase_responses, dtype=np.float64),
+            "patch_shifts_px": np.asarray(patch_shifts_history, dtype=np.float64),
+            "patch_phase_response": np.asarray(patch_responses_history, dtype=np.float64),
+            "target_displacement_px": np.asarray(measured_displacement, dtype=np.float64),
+            "accepted_displacement_px": np.asarray(displacement, dtype=np.float64),
+            "phase_outlier_rejected": phase_outlier_frames.astype(np.uint8),
+            "phase_patch_boxes_source_px": np.asarray([
+                (
+                    int(tx + px),
+                    int(ty + py),
+                    int(pw),
+                    int(ph),
+                )
+                for px, py, pw, ph in phase_patches
+            ], dtype=np.int32) if method == "phase_correlation" else np.empty((0, 4), dtype=np.int32),
+        })
 
     return motion_result
 
