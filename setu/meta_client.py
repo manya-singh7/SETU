@@ -15,6 +15,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import time
 from typing import Any, Dict, List, Optional, Union
 import requests
 
@@ -181,7 +182,7 @@ class MetaClient:
         }
 
         try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+            resp = self._post_with_retries(url, headers=headers, json=payload, timeout=self.timeout)
             if resp.status_code != 200:
                 raise MetaAPIError(
                     f"Meta API responded with HTTP {resp.status_code}: {resp.text[:300]}"
@@ -195,6 +196,27 @@ class MetaClient:
         self._record_live_usage(payload.get("model", self.model), usage)
 
         return data
+
+    @staticmethod
+    def _is_retryable_network_error(exc: requests.exceptions.RequestException) -> bool:
+        """Only retry transient connection reset and timeout failures."""
+        return isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout))
+
+    def _post_with_retries(self, url: str, **kwargs: Any) -> requests.Response:
+        """POST with an initial attempt and up to three transient-failure retries."""
+        for attempt in range(4):
+            try:
+                return requests.post(url, **kwargs)
+            except requests.exceptions.RequestException as exc:
+                if not self._is_retryable_network_error(exc) or attempt == 3:
+                    raise
+                delay = 0.25 * (2 ** attempt)
+                logger.warning(
+                    "Meta API connection failed (%s); retrying attempt %d/3 in %.2fs.",
+                    exc, attempt + 1, delay,
+                )
+                time.sleep(delay)
+        raise AssertionError("unreachable")
 
     def chat_completion(
         self,
@@ -524,7 +546,7 @@ class MetaClient:
         }
 
         try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+            resp = self._post_with_retries(url, headers=headers, json=payload, timeout=self.timeout)
             if resp.status_code != 200:
                 raise MetaAPIError(
                     f"Meta SAM API responded with HTTP {resp.status_code}: {resp.text[:300]}"
@@ -612,7 +634,7 @@ class MetaClient:
         }
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json", "User-Agent": "SETU-Civil-Telemetry/0.2.0"}
         try:
-            resp = requests.post(f"{self.base_url.rstrip('/')}/responses", headers=headers, json=payload, timeout=self.timeout)
+            resp = self._post_with_retries(f"{self.base_url.rstrip('/')}/responses", headers=headers, json=payload, timeout=self.timeout)
             if resp.status_code != 200:
                 raise MetaAPIError(f"Meta SAM video API responded with HTTP {resp.status_code}: {resp.text[:300]}")
             data = resp.json()

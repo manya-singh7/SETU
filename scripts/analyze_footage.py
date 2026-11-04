@@ -54,10 +54,9 @@ def load_prompts_config(folder_path: Path) -> Dict[str, Any]:
             data = json.load(f)
             if isinstance(data, dict):
                 return data
-            return {}
+            raise ValueError(f"{prompts_file} must contain a JSON object.")
     except Exception as exc:
-        print(f"[WARNING] Failed to parse {prompts_file}: {exc}. Using default prompts.")
-        return {}
+        raise ValueError(f"Failed to parse {prompts_file}: {exc}") from exc
 
 
 def resolve_video_prompts(
@@ -192,6 +191,7 @@ def analyze_footage_folder(
     magnify: bool = False,
     is_demo: bool = False,
     skip_osm: bool = False,
+    skip_start_seconds: float = 5.0,
 ) -> List[Dict[str, Any]]:
     """Scan and process all video recordings in the specified folder.
 
@@ -270,6 +270,7 @@ def analyze_footage_folder(
                             "frequency_ci": scan_res.measurement.frequency_ci_hz,
                         },
                         output_png=comp_plot,
+                        skip_start_seconds=skip_start_seconds,
                     )
                     accel_freq_str = f"{comp_res.accelerometer_peak_hz:.2f} Hz"
                     agree_label = "AGREE" if comp_res.is_agreement else "DISAGREE"
@@ -353,16 +354,22 @@ def main() -> int:
         help="Run in demo mode.",
     )
     parser.add_argument("--skip-osm", action="store_true", help="Skip live OpenStreetMap bridge lookup.")
+    parser.add_argument("--skip-start", type=float, default=5.0, metavar="SECONDS", help="Ignore the first seconds of paired phyphox recordings (default: 5).")
 
     args = parser.parse_args()
 
-    analyze_footage_folder(
-        folder_path=args.folder,
-        results_dir=args.results_dir,
-        magnify=args.magnify,
-        is_demo=args.demo,
-        skip_osm=args.skip_osm,
-    )
+    try:
+        analyze_footage_folder(
+            folder_path=args.folder,
+            results_dir=args.results_dir,
+            magnify=args.magnify,
+            is_demo=args.demo,
+            skip_osm=args.skip_osm,
+            skip_start_seconds=args.skip_start,
+        )
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 2
     return 0
 
 

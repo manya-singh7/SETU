@@ -218,3 +218,38 @@ def test_sam_video_budget_cap_checks_estimated_video_cost(tmp_path, monkeypatch)
     monkeypatch.setattr(requests, "post", lambda *_a, **_kw: pytest.fail("over budget must not call network"))
     with pytest.raises(BudgetExceededError):
         client.track_video(video, "car", frame_count=1000)
+
+
+def test_meta_api_calls_retry_timeout_and_connection_errors(tmp_path, monkeypatch, caplog):
+    """Muse, SAM image, and SAM video requests retry transient network failures three times."""
+    import time
+
+    monkeypatch.setattr(time, "sleep", lambda _delay: None)
+    client = MetaClient(
+        api_key="test-key", mode="live", budget_cap=5.0,
+        usage_log_path=str(tmp_path / "usage.jsonl"),
+    )
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+    responses = {"calls": 0}
+    successful = {
+        "status_code": 200,
+        "json": {"choices": [{"message": {"content": "ok"}}], "usage": {}},
+    }
+
+    def flaky_post(*_args, **_kwargs):
+        responses["calls"] += 1
+        if responses["calls"] % 4 != 0:
+            if responses["calls"] % 2:
+                raise requests.exceptions.Timeout("read timed out")
+            raise requests.exceptions.ConnectionError("connection reset")
+        result = MagicMock(status_code=successful["status_code"])
+        result.json.return_value = successful["json"]
+        return result
+
+    monkeypatch.setattr(requests, "post", flaky_post)
+    client.chat_completion([{"role": "user", "content": "hello"}])
+    client.segment_image("aW1hZ2U=", "pillar")
+    client.track_video(video, "car", frame_count=1)
+    assert responses["calls"] == 12
+    assert sum("retrying attempt" in rec.message for rec in caplog.records) == 9

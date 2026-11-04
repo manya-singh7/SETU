@@ -133,6 +133,21 @@ def test_load_phyphox_csv_error_handling(tmp_path: Path):
         load_phyphox_csv(invalid_csv)
 
 
+def test_compare_phyphox_skip_start_uses_entire_remaining_recording(tmp_path: Path):
+    """Start-up disturbance is excluded while the full longer recording is retained."""
+    fs = 100.0
+    t = np.arange(0.0, 15.0, 1.0 / fs)
+    y = np.where(t < 5.0, 4.0 * np.sin(2 * np.pi * 3.0 * t), 0.2 * np.sin(2 * np.pi * 8.0 * t))
+    csv_path = tmp_path / "long_phyphox.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["Time (s)", "Acceleration y (m/s^2)"])
+        writer.writerows(zip(t, y))
+
+    result = compare_phyphox_to_camera(csv_path, 8.0, skip_start_seconds=5.0)
+    assert np.isclose(result.accelerometer_peak_hz, 8.0, atol=0.1)
+
+
 # ---------------------------------------------------------------------------
 # Welch PSD & Peak Extraction Tests
 # ---------------------------------------------------------------------------

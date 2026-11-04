@@ -940,10 +940,24 @@ def compare_phyphox_to_camera(
     tolerance_abs_hz: float = DEFAULT_TOLERANCE_ABS_HZ,
     min_freq_hz: float = DEFAULT_MIN_FREQ_HZ,
     max_freq_hz: float = DEFAULT_MAX_FREQ_HZ,
+    skip_start_seconds: float = 5.0,
 ) -> ComparisonResult:
     """End-to-end execution: load phyphox CSV, compute PSDs and CI, compare against camera, and plot."""
     # 1. Load Phyphox CSV
     time_arr, axes_dict, fs = load_phyphox_csv(phyphox_csv)
+
+    if not np.isfinite(skip_start_seconds) or skip_start_seconds < 0:
+        raise ValueError("skip_start_seconds must be a finite non-negative number.")
+    if skip_start_seconds > 0:
+        keep = time_arr >= time_arr[0] + skip_start_seconds
+        time_arr = time_arr[keep]
+        axes_dict = {axis: values[keep] for axis, values in axes_dict.items()}
+        if len(time_arr) < 10:
+            raise ValueError("Phyphox recording has fewer than 10 samples after --skip-start trimming.")
+        intervals = np.diff(time_arr)
+        intervals = intervals[intervals > 0]
+        if len(intervals):
+            fs = float(1.0 / np.median(intervals))
 
     # 2. Compute PSD for all axes and select dominant peak in band
     dom_axis, dom_spectrum, all_spectra = find_dominant_accelerometer_peak(
@@ -1058,6 +1072,10 @@ def main() -> int:
         help="Destination path for the comparison PNG spectrum plot.",
     )
     parser.add_argument(
+        "--skip-start", type=float, default=5.0, metavar="SECONDS",
+        help="Ignore the first seconds of the phyphox recording (default: 5). The remaining recording is used in full.",
+    )
+    parser.add_argument(
         "--json",
         dest="json_out",
         metavar="OUT.json",
@@ -1088,6 +1106,7 @@ def main() -> int:
             output_png=args.out,
             tolerance_rel_pct=args.tolerance_rel,
             tolerance_abs_hz=args.tolerance_abs,
+            skip_start_seconds=args.skip_start,
         )
         if args.json_out:
             json_path = Path(args.json_out)

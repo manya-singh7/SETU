@@ -28,6 +28,7 @@ import math
 import os
 from pathlib import Path
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 import cv2
@@ -418,10 +419,12 @@ def compute_persistence(
     correlation_threshold: float = 0.70,
     min_persistence_ratio: float = 0.85,
     sample_stride: Optional[int] = None,
+    search_radius_px: int = 40,
 ) -> Dict[str, Any]:
     """Verify that a frame-0 mask/bounding box remains valid across a video sequence.
 
-    Computes normalized cross-correlation (NCC) of each frame's patch against Frame 0.
+    Computes normalized cross-correlation (NCC) against Frame 0, searching nearby
+    positions so handheld camera translation does not look like target loss.
 
     Threshold justification:
       - Normal civil structural vibration involves subpixel to micro-pixel motion (< 1-2 px),
@@ -499,8 +502,26 @@ def compute_persistence(
     lowest_idx: Optional[int] = None
 
     for i in range(0, n_frames, stride):
-        curr_gray = _to_gray(frames[i])[y1:y2, x1:x2]
-        score = compute_patch_ncc(ref_gray, curr_gray)
+        curr_gray = _to_gray(frames[i])
+        # Search around the original location for the target patch. A missing
+        # full-sized search candidate means the target has moved out of frame.
+        sx1 = max(0, x1 - max(0, int(search_radius_px)))
+        sy1 = max(0, y1 - max(0, int(search_radius_px)))
+        sx2 = min(W, x2 + max(0, int(search_radius_px)))
+        sy2 = min(H, y2 + max(0, int(search_radius_px)))
+        search = curr_gray[sy1:sy2, sx1:sx2]
+        if search.shape[0] < ref_gray.shape[0] or search.shape[1] < ref_gray.shape[1]:
+            score = 0.0
+        elif float(np.std(ref_gray)) < 1e-3:
+            # CCOEFF_NORMED is undefined for a constant template. Preserve the
+            # existing flat-patch behavior with the best local mean match.
+            result = cv2.matchTemplate(search, ref_gray, cv2.TM_SQDIFF_NORMED)
+            best = cv2.minMaxLoc(result)[0]
+            score = 1.0 - float(best) if np.isfinite(best) else 0.0
+        else:
+            result = cv2.matchTemplate(search, ref_gray, cv2.TM_CCOEFF_NORMED)
+            _, best, _, _ = cv2.minMaxLoc(result)
+            score = float(best) if np.isfinite(best) else 0.0
         total_checked += 1
         if score >= correlation_threshold:
             valid_frames += 1
@@ -937,6 +958,7 @@ class MetaSAM31Segmenter(BaseSegmenter):
         self.fallback_background_prompts = (
             list(fallback_background_prompts) if fallback_background_prompts is not None else ["building", "ground", "trees"]
         )
+        self._last_api_failure_kind = "unavailable"
 
     def _call_api_endpoint(
         self,
@@ -946,6 +968,7 @@ class MetaSAM31Segmenter(BaseSegmenter):
         fallback_background_prompts: Optional[Sequence[str]] = None,
     ) -> Optional[SegmentationOutput]:
         """Call Meta SAM 3.1 Model API endpoint via MetaClient."""
+        self._last_api_failure_kind = "unavailable"
         client = self.meta_client or get_meta_client()
         if client.mode == "live" and not client.api_key:
             return None
@@ -966,7 +989,7 @@ class MetaSAM31Segmenter(BaseSegmenter):
             target_instances = parse_sam_grammar(target_resp, frame.shape[:2])
 
             if not target_instances:
-                logger.warning("SAM 3.1 returned no target instances for prompt '%s'.", t_prompt)
+                self._last_api_failure_kind = "no_instances"
                 return None
 
             # Return largest/most central instance as target, keeping all in metadata
@@ -997,10 +1020,20 @@ class MetaSAM31Segmenter(BaseSegmenter):
             matched_bg_prompt: Optional[str] = None
             background_prompts_attempted: List[Dict[str, Any]] = []
 
-            for p_idx, p_cand in enumerate(candidate_prompts):
+            def call_background_prompt(p_cand: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
                 try:
-                    bg_resp = client.segment_image(image_b64, prompt=p_cand, model=self.model_name)
-                    cand_instances = parse_sam_grammar(bg_resp, frame.shape[:2])
+                    response = client.segment_image(image_b64, prompt=p_cand, model=self.model_name)
+                    return parse_sam_grammar(response, frame.shape[:2]), None
+                except Exception as error:
+                    return [], str(error)
+
+            # Background candidates are independent API requests. Run them together,
+            # then preserve sequential semantics by selecting the first match in prompt order.
+            with ThreadPoolExecutor(max_workers=len(candidate_prompts)) as pool:
+                candidate_results = list(pool.map(call_background_prompt, candidate_prompts))
+
+            for p_idx, (p_cand, (cand_instances, error)) in enumerate(zip(candidate_prompts, candidate_results)):
+                if error is None:
                     matched = len(cand_instances) > 0
                     background_prompts_attempted.append({
                         "prompt": p_cand,
@@ -1017,17 +1050,16 @@ class MetaSAM31Segmenter(BaseSegmenter):
                         len(cand_instances),
                         SAM_COST_PER_IMAGE,
                     )
-                    if matched:
+                    if matched and matched_bg_prompt is None:
                         bg_instances = cand_instances
                         matched_bg_prompt = p_cand
-                        break
-                except Exception as bg_err:
-                    logger.debug("Background SAM call for '%s' failed (%s).", p_cand, bg_err)
+                else:
+                    logger.debug("Background SAM call for '%s' failed (%s).", p_cand, error)
                     background_prompts_attempted.append({
                         "prompt": p_cand,
                         "attempt": p_idx + 1,
                         "matched": False,
-                        "error": str(bg_err),
+                        "error": error,
                         "cost": 0.0,
                     })
 
@@ -1183,13 +1215,18 @@ class MetaSAM31Segmenter(BaseSegmenter):
                 return api_res
 
         if self.raise_on_failure:
+            if self._last_api_failure_kind == "no_instances":
+                raise RuntimeError(f"SAM found no instances of '{target_prompt}'; using fallback")
             raise RuntimeError(
                 f"Real Meta SAM 3.1 model/API not reachable and raise_on_failure=True."
             )
 
-        logger.warning(
-            "Real Meta SAM 3.1 API/model not reachable; using offline heuristic fallback. Output method flagged as 'fallback'."
-        )
+        if self._last_api_failure_kind == "no_instances":
+            logger.warning("SAM found no instances of '%s'; using fallback", target_prompt)
+        else:
+            logger.warning(
+                "Real Meta SAM 3.1 API/model not reachable; using offline heuristic fallback. Output method flagged as 'fallback'."
+            )
         return self._heuristic_semantic_segmentation(frame, target_prompt, background_prompt)
 
 

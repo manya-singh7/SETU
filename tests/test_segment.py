@@ -217,9 +217,23 @@ def test_sam31_offline_never_labels_as_sam(synthetic_frame: np.ndarray):
 def test_sam31_raise_on_failure(synthetic_frame: np.ndarray):
     """Verify MetaSAM31Segmenter raises RuntimeError when raise_on_failure=True and real SAM unreachable."""
     client = MetaClient(mode="live", api_key="")
+    client.api_key = ""  # Explicitly simulate an unconfigured client even if settings provide a key.
     sam = MetaSAM31Segmenter(meta_client=client, raise_on_failure=True)
     with pytest.raises(RuntimeError, match="Real Meta SAM 3.1 model/API not reachable"):
         sam.segment(synthetic_frame)
+
+
+def test_sam_no_instances_log_does_not_claim_network_unreachable(synthetic_frame: np.ndarray, caplog):
+    client = MagicMock()
+    client.mode = "mock"
+    client.segment_image.return_value = {"output": [{"content": [{"type": "output_text", "text": ""}]}]}
+    sam = MetaSAM31Segmenter(meta_client=client)
+
+    result = sam.segment(synthetic_frame, target_prompt="rob_arch3")
+
+    assert result.method == "fallback"
+    assert "SAM found no instances of 'rob_arch3'; using fallback" in caplog.text
+    assert "not reachable" not in caplog.text
 
 
 def test_sam31_text_prompt_specialization(synthetic_frame: np.ndarray):
@@ -701,6 +715,19 @@ def test_persistence_static_video_passes():
     assert len(validation["errors"]) == 0
 
 
+def test_persistence_handheld_translation_jitter_passes():
+    """Several-pixel camera shake should not be mistaken for target loss."""
+    base = _create_textured_video(num_frames=1, occlude_count=0)[0]
+    shifts = [(0, 0), (8, -5), (-7, 6), (12, 4), (-10, -8), (5, 11)]
+    frames = [
+        cv2.warpAffine(base, np.float32([[1, 0, dx], [0, 1, dy]]), (base.shape[1], base.shape[0]))
+        for dx, dy in shifts
+    ]
+    result = ManualSegmenter(target_bbox=(60, 30, 40, 60)).segment_video(frames, fps=30.0)
+    assert result.metadata["target_persistence"]["passed"] is True
+    assert result.metadata["target_persistence"]["fraction_valid"] == 1.0
+
+
 def test_persistence_occluded_video_fails():
     """Verify that target occlusion for 30% of frames fails persistence and marks segmentation failed."""
     # 20 frames, last 6 frames occluded (6/20 = 30% occlusion, 70% valid)
@@ -741,8 +768,8 @@ def test_persistence_raise_on_failure_raises_runtime_error():
 # Background Prompt Fallback Tests
 # ---------------------------------------------------------------------------
 
-def test_background_prompt_fallback_stops_at_first_match(synthetic_frame: np.ndarray):
-    """Verify background prompt fallback tries candidates in order and stops at first match."""
+def test_background_prompt_fallback_runs_in_parallel_and_keeps_priority(synthetic_frame: np.ndarray):
+    """Run fallback requests together while choosing the first matching prompt in configured order."""
     # Target prompt response
     target_resp = {
         "output": [{
@@ -768,8 +795,17 @@ def test_background_prompt_fallback_stops_at_first_match(synthetic_frame: np.nda
 
     mock_client = MagicMock()
     mock_client.mode = "mock"
-    # Target, primary bg (empty), fallback 1 (matched). Fallback 2 ("trees") should NOT be called.
-    mock_client.segment_image.side_effect = [target_resp, empty_bg_resp, building_bg_resp]
+    # The target call is first; all three background candidates are submitted concurrently.
+    def segment_response(_image_b64, *, prompt, model):
+        if prompt == "concrete column":
+            return target_resp
+        if prompt == "sky reference":
+            return empty_bg_resp
+        if prompt == "building":
+            return building_bg_resp
+        return empty_bg_resp
+
+    mock_client.segment_image.side_effect = segment_response
 
     sam = MetaSAM31Segmenter(meta_client=mock_client)
     out = sam.segment(
@@ -779,7 +815,7 @@ def test_background_prompt_fallback_stops_at_first_match(synthetic_frame: np.nda
         fallback_background_prompts=["building", "trees"],
     )
 
-    # Primary failed, fallback 1 matched -> stops, so only 2 background attempts
+    # All candidates are attempted, but the first successful candidate by prompt order wins.
     assert out.method == "sam"
     assert out.target_source == "sam"
     assert out.background_source == "sam"
@@ -788,7 +824,7 @@ def test_background_prompt_fallback_stops_at_first_match(synthetic_frame: np.nda
     assert out.metadata["matched_background_prompt"] == "building"
 
     attempts = out.metadata["background_prompts_attempted"]
-    assert len(attempts) == 2
+    assert len(attempts) == 3
     assert attempts[0]["prompt"] == "sky reference"
     assert attempts[0]["matched"] is False
     assert attempts[0]["cost"] == 0.0025
@@ -797,9 +833,9 @@ def test_background_prompt_fallback_stops_at_first_match(synthetic_frame: np.nda
     assert attempts[1]["matched"] is True
     assert attempts[1]["cost"] == 0.0025
 
-    assert out.metadata["background_sam_cost"] == 0.0050
-    # Assert client was called exactly 3 times (1 target + 2 background)
-    assert mock_client.segment_image.call_count == 3
+    assert attempts[2]["prompt"] == "trees"
+    assert out.metadata["background_sam_cost"] == 0.0075
+    assert mock_client.segment_image.call_count == 4
 
 
 def test_background_prompt_fallback_exhaustion_never_hardcoded_box(synthetic_frame: np.ndarray):

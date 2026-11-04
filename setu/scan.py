@@ -27,6 +27,7 @@ import logging
 import os
 from pathlib import Path
 import time
+from threading import Thread
 from typing import Any, Dict, List, Optional, Tuple, Union
 import uuid
 
@@ -466,6 +467,18 @@ def analyze_video(
     bg_disp = getattr(motion_result, "background_displacement", None)
     t_motion = time.perf_counter() - t_stage3_start
 
+    # Traffic is an optional feature with independent inputs. Start it while the
+    # spectrum, interpretation, and other optional features are being prepared.
+    traffic_state: Dict[str, Any] = {}
+    def _run_traffic() -> None:
+        try:
+            from setu.traffic import track_traffic
+            traffic_state["result"] = track_traffic(video_path_str, meta_client=meta_client)
+        except Exception as exc:
+            traffic_state["error"] = exc
+    traffic_thread = Thread(target=_run_traffic, name="setu-traffic", daemon=True)
+    traffic_thread.start()
+
     # -------------------------------------------------------------------------
     # STAGE 4: Power Spectral Density & Dominant Resonant Frequency
     # -------------------------------------------------------------------------
@@ -861,10 +874,13 @@ def analyze_video(
                 device_check_info = DeviceCheckInfo(note=str(exc))
                 _feature_warning(feature_warnings, "device check", exc)
 
+    traffic_thread.join()
     try:
-        from setu.traffic import track_traffic
-
-        traffic_result = track_traffic(video_path_str, meta_client=meta_client)
+        if "error" in traffic_state:
+            raise traffic_state["error"]
+        traffic_result = traffic_state.get("result")
+        if traffic_result is None:
+            raise RuntimeError("Traffic tracking returned no result.")
         if isinstance(traffic_result, dict):
             raw_events = traffic_result.get("events", [])
             response_plot = traffic_result.get("response_plot")
